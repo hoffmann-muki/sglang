@@ -1145,12 +1145,14 @@ class Scheduler(
                     model_config.spec_hidden_size
                     if self.spec_algorithm.is_eagle()
                     or self.spec_algorithm.is_standalone()
+                    or self.spec_algorithm.is_tli()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
                     if self.spec_algorithm.is_eagle()
                     or self.spec_algorithm.is_standalone()
+                    or self.spec_algorithm.is_tli()
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),

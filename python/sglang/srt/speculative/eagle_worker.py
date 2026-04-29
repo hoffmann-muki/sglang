@@ -201,9 +201,9 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
+        # Always keep draft model CUDA graphs disabled; only the target model
+        # should capture graphs in this code path.
+        self.draft_model_runner.server_args.disable_cuda_graph = True
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -845,8 +845,9 @@ class EAGLEWorker(TpModelWorker):
             # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
             # rope kernel needs cache_loc to be contiguous.
             if (
-                self.server_args.speculative_algorithm == "STANDALONE"
-                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+                self.server_args.speculative_algorithm in ("STANDALONE", "TLI")
+                and self.model_config.hf_config.architectures[0]
+                == "GptOssForCausalLM"
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]

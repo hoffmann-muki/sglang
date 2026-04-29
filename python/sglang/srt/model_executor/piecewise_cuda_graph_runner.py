@@ -835,6 +835,7 @@ class PiecewiseCudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_tli()
         ):
             from sglang.srt.speculative.eagle_utils import EagleVerifyInput
 
