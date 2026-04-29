@@ -151,9 +151,33 @@ class TLIWorker(StandaloneWorker):
 
         intersection_ids = self.vocab_mapping.intersection_draft_ids
         full_vocab_size = self.vocab_mapping.draft_vocab_size
-        pruned_weight = lm_head.weight.data[intersection_ids].clone()
+        
+        tp_size = getattr(self.draft_model_runner.tp_group, "world_size", 1)
+        if tp_size > 1:
+            if not hasattr(lm_head, "shard_indices"):
+                logger.warning("Draft LM head is tensor parallel but missing shard_indices; skipping LM head pruning.")
+                return
+                
+            start_idx = lm_head.shard_indices.org_vocab_start_index
+            end_idx = lm_head.shard_indices.org_vocab_end_index
+            
+            # Keep only the intersection IDs that fall into this rank's partition
+            mask = (intersection_ids >= start_idx) & (intersection_ids < end_idx)
+            local_ids = intersection_ids[mask]
+            
+            # Map global intersection IDs to indices within the local weight tensor
+            intersection_ids_local = local_ids - start_idx
+            
+            # The pruned reindex head must output the local pad length for all_gather to work
+            full_vocab_size = lm_head.weight.data.shape[0]
+            reindex_ids = intersection_ids_local
+        else:
+            reindex_ids = intersection_ids
+            intersection_ids_local = intersection_ids
+            
+        pruned_weight = lm_head.weight.data[intersection_ids_local].clone()
         pruned_bias = (
-            lm_head.bias.data[intersection_ids].clone()
+            lm_head.bias.data[intersection_ids_local].clone()
             if getattr(lm_head, "bias", None) is not None
             else None
         )
@@ -161,7 +185,7 @@ class TLIWorker(StandaloneWorker):
         pruned_head = _PrunedReindexLMHead(
             pruned_weight=pruned_weight,
             pruned_bias=pruned_bias,
-            intersection_ids=intersection_ids,
+            intersection_ids=reindex_ids,
             full_vocab_size=full_vocab_size,
             use_fp32=getattr(server_args, "enable_fp32_lm_head", False),
         )
