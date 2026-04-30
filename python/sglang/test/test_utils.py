@@ -120,9 +120,9 @@ DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
 
 # TLI (Token-Level Intersection) speculative decoding models
-DEFAULT_TARGET_MODEL_TLI = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL_TLI = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_CROSS_FAMILY_DRAFT_MODEL_TLI = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_TARGET_MODEL_TLI = "/pscratch/sd/h/hmuki/models/google/gemma-7b-it"
+DEFAULT_DRAFT_MODEL_TLI = "/pscratch/sd/h/hmuki/models/google/gemma-3-1b-it"
+DEFAULT_CROSS_FAMILY_DRAFT_MODEL_TLI = "/pscratch/sd/h/hmuki/models/meta-llama/Llama-3.2-1B-Instruct"  # Cross-family draft for TLI (LLaMA -> Gemma)
 
 # N-gram speculative decoding models
 DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
