@@ -25,8 +25,8 @@ GSM_DATASET_PATH = None
 
 COMMON_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
-    "8",
+    "--tp",
+    "4",
     "--speculative-algorithm",
     "TLI",
     "--speculative-num-steps",
@@ -37,6 +37,13 @@ COMMON_SERVER_ARGS = [
     "1",
     "--mem-fraction-static",
     "0.7",
+    "--disable-cuda-graph",
+    "--disable-piecewise-cuda-graph",
+    "--log-requests",
+    "--log-requests-level",
+    "3",
+    "--log-requests-format",
+    "json",
 ]
 
 
