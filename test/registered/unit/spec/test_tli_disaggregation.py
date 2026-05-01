@@ -16,6 +16,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
+_TEST_TLI_SERVICE_PORT = 32001
+
 
 class TestTLIDisaggregation(CustomTestCase):
     def _server_args(self, **kwargs):
@@ -23,7 +25,7 @@ class TestTLIDisaggregation(CustomTestCase):
             host="127.0.0.1",
             tli_disaggregation_role="draft",
             tli_service_host=None,
-            tli_service_port=32001,
+            tli_service_port=_TEST_TLI_SERVICE_PORT,
             tli_grpc_use_tls=False,
             tli_grpc_keyfile=None,
             tli_grpc_certfile=None,
@@ -35,7 +37,7 @@ class TestTLIDisaggregation(CustomTestCase):
     def test_draft_service_bind_addr_defaults_to_server_host(self):
         self.assertEqual(
             tli_draft_service_bind_addr(self._server_args()),
-            ("127.0.0.1", 32001),
+            ("127.0.0.1", _TEST_TLI_SERVICE_PORT),
         )
 
     def test_unimplemented_handler_fails_closed(self):
@@ -63,7 +65,7 @@ class TestTLIDisaggregation(CustomTestCase):
             server = asyncio.run(callback(None, None, None))
 
         self.assertEqual(server.kwargs["host"], "127.0.0.1")
-        self.assertEqual(server.kwargs["port"], 32001)
+        self.assertEqual(server.kwargs["port"], _TEST_TLI_SERVICE_PORT)
         self.assertIs(
             server.kwargs["request_handler"],
             tli_disaggregation.unimplemented_tli_draft_handler,

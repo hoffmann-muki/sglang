@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 from sglang.srt.speculative.tli_grpc_transport import serve_tli_speculative_service
 from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
 
 logger = logging.getLogger(__name__)
+
+TLIDraftHandler = Callable[
+    [TLIDraftRequest], TLIDraftResponse | Awaitable[TLIDraftResponse]
+]
 
 
 class TLIDraftExecutionNotWiredError(RuntimeError):
@@ -85,7 +89,7 @@ async def unimplemented_tli_draft_handler(
 def make_tli_service_ready_callback(
     server_args,
     *,
-    request_handler: Callable[[TLIDraftRequest], TLIDraftResponse] | None = None,
+    request_handler: TLIDraftHandler | None = None,
 ):
     """Create the gRPC launch hook used by the disaggregated draft node.
 

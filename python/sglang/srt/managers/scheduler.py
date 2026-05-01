@@ -1065,8 +1065,16 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if (
+            self.draft_worker is None
+            or self.spec_algorithm.is_ngram()
+            or (
+                self.spec_algorithm.is_tli()
+                and self.server_args.tli_disaggregation_role == "target"
+            )
+        ):
             draft_token_to_kv_pool = None
+            model_config = self.model_config
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]

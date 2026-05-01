@@ -66,6 +66,10 @@ class _FakeDraftRequest:
     request_id: str = ""
     verified_id: _FakeTensorData | None = None
     hidden_states: _FakeTensorData | None = None
+    request_ids: list[str] = field(default_factory=list)
+    input_ids: _FakeTensorData | None = None
+    tp_rank: int = 0
+    tp_size: int = 1
     mode: str = "decode"
     capture_hidden_mode: int = 0
     topk: int = 1
@@ -137,6 +141,10 @@ class TestTLIGRPCTransport(CustomTestCase):
             mode="decode",
             verified_id=torch.tensor([0, 2, 1]),
             hidden_states=torch.zeros(3, 4),
+            request_ids=["rid-0", "rid-1"],
+            input_ids=torch.tensor([0, 1, 2]),
+            tp_rank=1,
+            tp_size=3,
             topk=2,
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
@@ -153,6 +161,10 @@ class TestTLIGRPCTransport(CustomTestCase):
 
         self.assertEqual(decoded.request_id, "req-1")
         self.assertEqual(decoded.verified_id.tolist(), [0, 0, 1])
+        self.assertEqual(decoded.request_ids, ["rid-0", "rid-1"])
+        self.assertEqual(decoded.input_ids.tolist(), [0, 1, 0])
+        self.assertEqual(decoded.tp_rank, 1)
+        self.assertEqual(decoded.tp_size, 3)
         self.assertEqual(decoded.accept_length_cpu, [1, 2, 3])
 
     def test_response_proto_translation(self):

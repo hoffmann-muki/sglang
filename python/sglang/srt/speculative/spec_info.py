@@ -120,6 +120,11 @@ class SpeculativeAlgorithm(Enum):
                     "Disable overlap with --disable-overlap-schedule."
                 )
 
+            if getattr(server_args, "tli_disaggregation_role", "none") == "target":
+                from sglang.srt.speculative.remote_tli_worker import RemoteTLIWorker
+
+                return RemoteTLIWorker
+
             from sglang.srt.speculative.tli_worker import TLIWorker
 
             return TLIWorker

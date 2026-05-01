@@ -56,6 +56,7 @@ class TestTLIProtocol(CustomTestCase):
             mode="decode",
             verified_id=torch.tensor([0, 2, 1]),
             hidden_states=torch.zeros(3, 4),
+            input_ids=torch.tensor([0, 1, 2]),
             topk=2,
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
@@ -67,6 +68,7 @@ class TestTLIProtocol(CustomTestCase):
 
         self.assertEqual(translated.request_id, "req-1")
         self.assertEqual(translated.verified_id.tolist(), [0, 0, 1])
+        self.assertEqual(translated.input_ids.tolist(), [0, 1, 0])
         self.assertEqual(translated.topk, 2)
         self.assertEqual(translated.speculative_num_steps, 3)
         self.assertEqual(translated.speculative_num_draft_tokens, 4)

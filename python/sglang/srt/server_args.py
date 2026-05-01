@@ -3742,23 +3742,19 @@ class ServerArgs:
                 )
             return
 
-        # Target role is parsed and validated so launch commands are explicit,
-        # but the remote target worker is not yet safe to enable. Without this
-        # guard, the scheduler would instantiate the colocated TLIWorker and
-        # silently load the draft model locally, which is exactly the behavior
-        # this mode is meant to avoid.
+        # Keep target and draft role-only options disjoint so a misconfigured
+        # launch cannot accidentally look like a valid colocated setup.
         if self.speculative_algorithm != "TLI":
             raise ValueError("TLI target role requires --speculative-algorithm TLI.")
         if self.tli_draft_server_addr is None:
             raise ValueError(
                 "TLI target role requires --tli-draft-server-addr host:port."
             )
-        raise ValueError(
-            "TLI target disaggregation is configured, but the remote target "
-            "speculative worker is not wired yet. Refusing to fall back to the "
-            "colocated TLIWorker because that would load the draft model on the "
-            "target node and hide a deployment bug."
-        )
+        if self.tli_service_host is not None or self.tli_service_port is not None:
+            raise ValueError(
+                "--tli-service-host/--tli-service-port are only valid on the "
+                "TLI draft node."
+            )
 
     def _handle_load_format(self):
         if (
@@ -5589,10 +5585,9 @@ class ServerArgs:
             choices=["none", "target", "draft"],
             default=ServerArgs.tli_disaggregation_role,
             help=(
-                "Role for experimental disaggregated TLI. 'draft' starts the "
-                "TLI DraftForward gRPC service. 'target' is reserved for the "
-                "remote target worker path and currently fails fast instead of "
-                "falling back to colocated draft execution."
+                "Role for experimental disaggregated TLI. 'target' serves the "
+                "target model and calls a remote draft service. 'draft' serves "
+                "the draft model and starts the TLI DraftForward gRPC service."
             ),
         )
         parser.add_argument(
@@ -5631,7 +5626,7 @@ class ServerArgs:
             default=ServerArgs.tli_target_model_path,
             help=(
                 "Draft role only. Target model/tokenizer path used by future "
-                "draft-side TLI translation setup."
+                "draft-side TLI translation and execution setup."
             ),
         )
         parser.add_argument(

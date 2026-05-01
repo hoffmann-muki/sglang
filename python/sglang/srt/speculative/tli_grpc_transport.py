@@ -7,7 +7,7 @@ import ctypes
 import inspect
 import logging
 from importlib import import_module
-from typing import Callable
+from typing import Awaitable, Callable
 
 import torch
 
@@ -16,6 +16,10 @@ from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftRespons
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 
 logger = logging.getLogger(__name__)
+
+TLIDraftHandler = Callable[
+    [TLIDraftRequest], TLIDraftResponse | Awaitable[TLIDraftResponse]
+]
 
 _DTYPE_TO_STR = {
     torch.float16: "float16",
@@ -175,7 +179,13 @@ def draft_request_to_proto(
         speculative_num_draft_tokens=request.speculative_num_draft_tokens,
         num_tokens_per_req=request.num_tokens_per_req,
         num_tokens_for_logprob_per_req=request.num_tokens_for_logprob_per_req,
+        tp_rank=request.tp_rank,
+        tp_size=request.tp_size,
     )
+    if request.request_ids is not None:
+        message.request_ids.extend(list(request.request_ids))
+    if request.input_ids is not None:
+        message.input_ids = tensor_to_proto_tensor(request.input_ids, proto_module)
     if request.accept_length is not None:
         message.accept_length = tensor_to_proto_tensor(
             request.accept_length, proto_module
@@ -211,6 +221,18 @@ def draft_request_from_proto(
         request_id=proto_request.request_id,
         verified_id=tensor_from_proto_tensor(proto_request.verified_id),
         hidden_states=tensor_from_proto_tensor(proto_request.hidden_states),
+        request_ids=(
+            list(proto_request.request_ids)
+            if len(getattr(proto_request, "request_ids", [])) > 0
+            else None
+        ),
+        input_ids=(
+            tensor_from_proto_tensor(proto_request.input_ids)
+            if _message_has_field(proto_request, "input_ids")
+            else None
+        ),
+        tp_rank=int(getattr(proto_request, "tp_rank", 0)),
+        tp_size=int(getattr(proto_request, "tp_size", 1) or 1),
         mode=proto_request.mode or "decode",
         capture_hidden_mode=_capture_hidden_mode_from_proto(
             proto_request.capture_hidden_mode
@@ -330,7 +352,7 @@ class TliSpeculativeServiceAdapter:
 
     def __init__(
         self,
-        request_handler: Callable[[TLIDraftRequest], TLIDraftResponse],
+        request_handler: TLIDraftHandler,
         *,
         translator: TLITokenTranslator | None = None,
         proto_module=None,
@@ -432,11 +454,61 @@ class TliSpeculativeClient:
         await self._channel.close()
 
 
+class TliSpeculativeBlockingClient:
+    """Blocking client helper for scheduler/model-worker code paths."""
+
+    def __init__(
+        self,
+        target: str,
+        *,
+        translator: TLITokenTranslator | None = None,
+        channel_credentials=None,
+        options=None,
+    ):
+        import grpc
+
+        _, sglang_pb2_grpc = _import_proto_modules()
+
+        self.translator = translator
+        self._channel = (
+            grpc.secure_channel(target, channel_credentials, options=options)
+            if channel_credentials is not None
+            else grpc.insecure_channel(target, options=options)
+        )
+        self._stub = sglang_pb2_grpc.TliSpeculativeServiceStub(self._channel)
+
+    def draft_forward(
+        self,
+        request: TLIDraftRequest,
+        *,
+        timeout: float | None = None,
+        translate_request_to_draft_vocab: bool = True,
+        translate_response_to_target_vocab: bool = True,
+    ) -> TLIDraftResponse:
+        if self.translator is not None and translate_request_to_draft_vocab:
+            request = request.to_draft_vocab(self.translator)
+
+        proto_request = draft_request_to_proto(
+            request,
+            proto_module=None,
+            translator=None,
+            translate_to_draft_vocab=False,
+        )
+        proto_response = self._stub.DraftForward(proto_request, timeout=timeout)
+        response = draft_response_from_proto(proto_response)
+        if self.translator is not None and translate_response_to_target_vocab:
+            response = response.to_target_vocab(self.translator)
+        return response
+
+    def close(self):
+        self._channel.close()
+
+
 async def serve_tli_speculative_service(
     *,
     host: str,
     port: int,
-    request_handler: Callable[[TLIDraftRequest], TLIDraftResponse],
+    request_handler: TLIDraftHandler,
     translator: TLITokenTranslator | None = None,
     translate_requests_to_draft_vocab: bool = False,
     translate_responses_to_target_vocab: bool = False,

@@ -88,6 +88,10 @@ message TliDraftRequest {
   TensorData seq_lens_for_draft_extend = 13;
   TensorData seq_lens_for_draft_extend_cpu = 14;
   TensorData mm_input_embeds = 15;
+  repeated string request_ids = 16;
+  TensorData input_ids = 17;
+  int32 tp_rank = 18;
+  int32 tp_size = 19;
 }
 
 message TliDraftResponse {
