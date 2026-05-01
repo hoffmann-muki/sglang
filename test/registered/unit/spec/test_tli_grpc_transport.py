@@ -194,6 +194,7 @@ class TestTLIGRPCTransport(CustomTestCase):
         adapter = TliSpeculativeServiceAdapter(
             handler,
             translator=self.translator,
+            proto_module=_FAKE_PROTO,
             translate_requests_to_draft_vocab=False,
             translate_responses_to_target_vocab=False,
         )

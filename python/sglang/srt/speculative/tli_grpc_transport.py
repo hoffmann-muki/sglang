@@ -104,7 +104,11 @@ def _tensor_from_bytes(
     data: bytes,
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
-    tensor = torch.frombuffer(data, dtype=_str_to_dtype(dtype)).reshape(list(shape))
+    # `torch.frombuffer` warns on immutable bytes objects; copy into a writable
+    # bytearray first since we immediately clone anyway.
+    tensor = torch.frombuffer(
+        bytearray(data), dtype=_str_to_dtype(dtype)
+    ).reshape(list(shape))
     tensor = tensor.clone()
     if device != "cpu" and device != torch.device("cpu"):
         tensor = tensor.to(device)
@@ -334,11 +338,13 @@ class TliSpeculativeServiceAdapter:
         request_handler: Callable[[TLIDraftRequest], TLIDraftResponse],
         *,
         translator: TLITokenTranslator | None = None,
+        proto_module=None,
         translate_requests_to_draft_vocab: bool = False,
         translate_responses_to_target_vocab: bool = False,
     ):
         self.request_handler = request_handler
         self.translator = translator
+        self.proto_module = proto_module
         self.translate_requests_to_draft_vocab = translate_requests_to_draft_vocab
         self.translate_responses_to_target_vocab = (
             translate_responses_to_target_vocab
@@ -360,7 +366,7 @@ class TliSpeculativeServiceAdapter:
                 )
             if self.translator is not None and self.translate_responses_to_target_vocab:
                 response = response.to_target_vocab(self.translator)
-            return draft_response_to_proto(response)
+            return draft_response_to_proto(response, proto_module=self.proto_module)
         except Exception as exc:
             logger.exception("TLI DraftForward RPC failed: %s", exc)
             if context is not None:
@@ -368,7 +374,7 @@ class TliSpeculativeServiceAdapter:
 
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(str(exc))
-            return _empty_draft_response()
+            return _empty_draft_response(proto_module=self.proto_module)
 
 
 def add_tli_speculative_service_to_server(servicer, server):
@@ -377,8 +383,8 @@ def add_tli_speculative_service_to_server(servicer, server):
     sglang_pb2_grpc.add_TliSpeculativeServiceServicer_to_server(servicer, server)
 
 
-def _empty_draft_response():
-    sglang_pb2, _ = _import_proto_modules()
+def _empty_draft_response(proto_module=None):
+    sglang_pb2 = _resolve_proto_module(proto_module)
     return sglang_pb2.TliDraftResponse()
 
 
@@ -453,6 +459,7 @@ async def serve_tli_speculative_service(
     servicer = TliSpeculativeServiceAdapter(
         request_handler=request_handler,
         translator=translator,
+        proto_module=None,
         translate_requests_to_draft_vocab=translate_requests_to_draft_vocab,
         translate_responses_to_target_vocab=translate_responses_to_target_vocab,
     )
