@@ -66,7 +66,8 @@ class TestTLIDisaggregation(CustomTestCase):
 
         self.assertEqual(server.kwargs["host"], "127.0.0.1")
         self.assertEqual(server.kwargs["port"], _TEST_TLI_SERVICE_PORT)
-        self.assertIs(
+        self.assertTrue(callable(server.kwargs["request_handler"]))
+        self.assertIsNot(
             server.kwargs["request_handler"],
             tli_disaggregation.unimplemented_tli_draft_handler,
         )

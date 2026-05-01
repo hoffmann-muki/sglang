@@ -68,6 +68,7 @@ class RemoteTLIWorker(EAGLEWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.active_request_ids: set[str] = set()
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
@@ -121,8 +122,7 @@ class RemoteTLIWorker(EAGLEWorker):
         raise RuntimeError("RemoteTLIWorker does not own a local draft model runner.")
 
     def clear_cache_pool(self):
-        # Draft cache is owned by the remote draft server.
-        pass
+        self._release_request_ids(sorted(self.active_request_ids))
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
         constrained_logits = self.vocab_mapping.constrain_draft_logits(
@@ -133,7 +133,9 @@ class RemoteTLIWorker(EAGLEWorker):
         draft_input.hidden_states = logits_output.hidden_states
 
     def _request_ids(self, batch) -> list[str]:
-        return [req.rid for req in batch.reqs]
+        request_ids = [req.rid for req in batch.reqs]
+        self.active_request_ids.update(request_ids)
+        return request_ids
 
     def _batch_request_id(self, batch, mode: str) -> str:
         return f"{mode}:{','.join(self._request_ids(batch))}"
@@ -156,6 +158,26 @@ class RemoteTLIWorker(EAGLEWorker):
         draft_input.topk_p = response.next_topk_p.to(self.device)
         draft_input.topk_index = response.next_topk_index.to(self.device)
         draft_input.hidden_states = response.next_hidden_states.to(self.device)
+
+    def _release_request_ids(self, request_ids: list[str]) -> None:
+        if not request_ids:
+            return
+        release_request = TLIDraftRequest(
+            request_id=f"release:{','.join(request_ids)}",
+            request_ids=request_ids,
+            verified_id=torch.empty((0,), dtype=torch.int64),
+            hidden_states=torch.empty((0,), dtype=self.model_config.dtype),
+            mode="release",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+        self.client.draft_forward(
+            release_request,
+            timeout=self.server_args.tli_rpc_timeout,
+            translate_request_to_draft_vocab=False,
+            translate_response_to_target_vocab=False,
+        )
+        self.active_request_ids.difference_update(request_ids)
 
     def forward_batch_generation(self, batch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -194,12 +216,15 @@ class RemoteTLIWorker(EAGLEWorker):
                 accepted = verify_output.accept_length_per_req_cpu[idx]
                 req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
+        finished_request_ids = [req.rid for req in batch.reqs if req.finished()]
+
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
         if (
             self.server_args.enable_dp_attention
             or batch.spec_info.verified_id.numel() > 0
         ):
             self.forward_draft_extend_after_decode(batch)
+        self._release_request_ids(finished_request_ids)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(

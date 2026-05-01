@@ -136,6 +136,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    TLIDraftForwardReqInput,
+    TLIDraftForwardReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -1328,6 +1330,7 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
+                (TLIDraftForwardReqInput, self.handle_tli_draft_forward),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
@@ -3251,6 +3254,8 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
+            if hasattr(self, "tli_draft_executor"):
+                self.tli_draft_executor.clear()
 
             if empty_cache:
                 torch.cuda.empty_cache()
@@ -3290,6 +3295,32 @@ class Scheduler(
         ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def handle_tli_draft_forward(
+        self, recv_req: TLIDraftForwardReqInput
+    ) -> TLIDraftForwardReqOutput:
+        try:
+            if not hasattr(self, "tli_draft_executor"):
+                from sglang.srt.speculative.tli_draft_executor import (
+                    TLIDraftSchedulerExecutor,
+                )
+
+                self.tli_draft_executor = TLIDraftSchedulerExecutor(self)
+            response = self.tli_draft_executor.handle(recv_req.request)
+            return TLIDraftForwardReqOutput(
+                success=True,
+                message="",
+                response=response,
+                tp_rank=recv_req.request.tp_rank,
+            )
+        except Exception as exc:
+            logger.exception("TLI draft forward failed: %s", exc)
+            return TLIDraftForwardReqOutput(
+                success=False,
+                message=str(exc),
+                response=None,
+                tp_rank=recv_req.request.tp_rank,
+            )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

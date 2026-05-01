@@ -13,7 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 if TYPE_CHECKING:
     from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 
-TLIDraftMode = Literal["extend", "decode", "extend_after_decode"]
+TLIDraftMode = Literal["extend", "decode", "extend_after_decode", "release"]
 
 
 @dataclass(slots=True)

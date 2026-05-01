@@ -38,6 +38,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
 from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
@@ -1624,6 +1625,19 @@ class SlowDownReqInput(BaseReq):
 @dataclass
 class SlowDownReqOutput(BaseReq):
     pass
+
+
+@dataclass
+class TLIDraftForwardReqInput(BaseReq):
+    request: TLIDraftRequest
+
+
+@dataclass
+class TLIDraftForwardReqOutput(BaseReq):
+    success: bool
+    message: str
+    response: Optional[TLIDraftResponse] = None
+    tp_rank: int = 0
 
 
 @dataclass

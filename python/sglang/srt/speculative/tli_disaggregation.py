@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from sglang.srt.managers.io_struct import TLIDraftForwardReqInput
 from sglang.srt.speculative.tli_grpc_transport import serve_tli_speculative_service
 from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
 
@@ -86,6 +87,35 @@ async def unimplemented_tli_draft_handler(
     )
 
 
+async def scheduler_backed_tli_draft_handler(
+    request_manager,
+    request: TLIDraftRequest,
+    timeout: float | None = None,
+) -> TLIDraftResponse:
+    results = await request_manager.send_communicator_req(
+        TLIDraftForwardReqInput(request=request),
+        "tli_draft_forward_communicator",
+        timeout=timeout,
+    )
+    if not results:
+        raise RuntimeError("TLI DraftForward received no scheduler response.")
+
+    failures = [result for result in results if not result.success]
+    if failures:
+        messages = " | ".join(result.message for result in failures)
+        raise RuntimeError(f"TLI DraftForward failed on draft scheduler: {messages}")
+
+    for result in results:
+        if result.tp_rank == request.tp_rank and result.response is not None:
+            return result.response
+
+    for result in results:
+        if result.response is not None:
+            return result.response
+
+    raise RuntimeError("TLI DraftForward scheduler response did not include a payload.")
+
+
 def make_tli_service_ready_callback(
     server_args,
     *,
@@ -101,10 +131,18 @@ def make_tli_service_ready_callback(
         return None
 
     async def _on_ready(request_manager, srv_args, sched_info):
-        del request_manager, srv_args, sched_info
+        del srv_args, sched_info
 
         host, port = tli_draft_service_bind_addr(server_args)
-        handler = request_handler or unimplemented_tli_draft_handler
+        handler = request_handler
+        if handler is None:
+            async def handler(request: TLIDraftRequest) -> TLIDraftResponse:
+                return await scheduler_backed_tli_draft_handler(
+                    request_manager,
+                    request,
+                    timeout=server_args.tli_rpc_timeout,
+                )
+
         credentials = build_tli_server_credentials(server_args)
         server = await serve_tli_speculative_service(
             host=host,
@@ -121,9 +159,9 @@ def make_tli_service_ready_callback(
         )
         if request_handler is None:
             logger.warning(
-                "TLI DraftForward service is running with a fail-closed "
-                "placeholder handler. Wire the scheduler-backed draft executor "
-                "before sending production traffic."
+                "TLI DraftForward service is using the scheduler-backed handler. "
+                "Draft model execution remains fail-closed until the scheduler "
+                "executor supports SGLang batch/KV reconstruction."
             )
         return server
 
