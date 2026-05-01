@@ -7,18 +7,13 @@ import ctypes
 import inspect
 import logging
 from importlib import import_module
-from dataclasses import dataclass
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Callable
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
-
-if TYPE_CHECKING:
-    from grpc import aio as grpc_aio
-    from google.protobuf.message import Message
 
 logger = logging.getLogger(__name__)
 
@@ -374,18 +369,13 @@ class TliSpeculativeServiceAdapter:
 
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(str(exc))
-            return _empty_draft_response(proto_module=self.proto_module)
+            raise
 
 
 def add_tli_speculative_service_to_server(servicer, server):
     """Register the TLI gRPC service on a grpc.aio.Server or grpc.Server."""
     _, sglang_pb2_grpc = _import_proto_modules()
     sglang_pb2_grpc.add_TliSpeculativeServiceServicer_to_server(servicer, server)
-
-
-def _empty_draft_response(proto_module=None):
-    sglang_pb2 = _resolve_proto_module(proto_module)
-    return sglang_pb2.TliDraftResponse()
 
 
 class TliSpeculativeClient:

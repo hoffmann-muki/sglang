@@ -217,6 +217,27 @@ class TestTLIGRPCTransport(CustomTestCase):
         )
         self.assertEqual(response.draft_token_ids.tolist(), [0, 1, 0])
 
+    def test_service_adapter_failure_raises(self):
+        async def handler(_request):
+            raise RuntimeError("boom")
+
+        adapter = TliSpeculativeServiceAdapter(
+            handler,
+            proto_module=_FAKE_PROTO,
+        )
+
+        proto_request = draft_request_to_proto(
+            TLIDraftRequest(
+                request_id="req-err",
+                mode="decode",
+                verified_id=torch.tensor([0]),
+                hidden_states=torch.zeros(1, 2),
+            ),
+            proto_module=_FAKE_PROTO,
+        )
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            asyncio.run(adapter.DraftForward(proto_request, _FakeContext()))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

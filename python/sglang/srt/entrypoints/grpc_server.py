@@ -152,8 +152,13 @@ def _add_admin_routes(app, request_manager):
     app.router.add_post("/stop_profile", stop_profile_handler)
 
 
-async def serve_grpc(server_args, model_info=None):
-    """Start the standalone gRPC server with integrated scheduler."""
+async def serve_grpc(server_args, model_info=None, on_tli_service_ready=None):
+    """Start the standalone gRPC server with integrated scheduler.
+
+    `on_tli_service_ready` is the disaggregated-TLI hook: future launchers can
+    provide an async callback that starts the TLI gRPC server after the request
+    manager becomes available.
+    """
     try:
         from smg_grpc_servicer.sglang.server import serve_grpc as _serve_grpc
     except ImportError as e:
@@ -166,6 +171,7 @@ async def serve_grpc(server_args, model_info=None):
 
     sidecar_app = web.Application()
     sidecar_runner = None
+    tli_runner = None
     sidecar_port = (
         server_args.grpc_http_sidecar_port
         if server_args.grpc_http_sidecar_port is not None
@@ -191,7 +197,7 @@ async def serve_grpc(server_args, model_info=None):
             )
 
     async def _on_request_manager_ready(request_manager, srv_args, sched_info):
-        nonlocal sidecar_runner
+        nonlocal sidecar_runner, tli_runner
         try:
             _add_admin_routes(sidecar_app, request_manager)
         except Exception as e:
@@ -219,6 +225,14 @@ async def serve_grpc(server_args, model_info=None):
                 e,
                 exc_info=True,
             )
+        if on_tli_service_ready is not None:
+            try:
+                tli_runner = await on_tli_service_ready(
+                    request_manager, srv_args, sched_info
+                )
+            except Exception:
+                logger.exception("Failed to start TLI gRPC service.")
+                raise
 
     try:
         await _serve_grpc(
@@ -233,5 +247,13 @@ async def serve_grpc(server_args, model_info=None):
             except Exception as e:
                 logger.exception(
                     "Failed to cleanly shut down HTTP sidecar server: %s",
+                    e,
+                )
+        if tli_runner is not None:
+            try:
+                await tli_runner.stop(grace=0)
+            except Exception as e:
+                logger.exception(
+                    "Failed to cleanly shut down TLI gRPC server: %s",
                     e,
                 )
