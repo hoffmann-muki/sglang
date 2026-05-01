@@ -521,6 +521,16 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    tli_disaggregation_role: Literal["none", "target", "draft"] = "none"
+    tli_draft_server_addr: Optional[str] = None
+    tli_service_host: Optional[str] = None
+    tli_service_port: Optional[int] = None
+    tli_rpc_timeout: Optional[float] = None
+    tli_target_model_path: Optional[str] = None
+    tli_grpc_use_tls: bool = False
+    tli_grpc_certfile: Optional[str] = None
+    tli_grpc_keyfile: Optional[str] = None
+    tli_grpc_ca_certs: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -862,6 +872,9 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+
+        # Handle experimental TLI target/draft disaggregation.
+        self._handle_tli_disaggregation()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3628,6 +3641,125 @@ class ServerArgs:
                 )
                 self.speculative_adaptive = False
 
+    def _handle_tli_disaggregation(self):
+        if self.tli_disaggregation_role == "none":
+            tli_fields = (
+                self.tli_draft_server_addr,
+                self.tli_service_host,
+                self.tli_service_port,
+                self.tli_rpc_timeout,
+                self.tli_target_model_path,
+                self.tli_grpc_certfile,
+                self.tli_grpc_keyfile,
+                self.tli_grpc_ca_certs,
+            )
+            if any(value is not None for value in tli_fields) or self.tli_grpc_use_tls:
+                raise ValueError(
+                    "TLI disaggregation options require "
+                    "--tli-disaggregation-role target|draft."
+                )
+            return
+
+        if self.tli_disaggregation_role not in ("target", "draft"):
+            raise ValueError(
+                f"Invalid tli_disaggregation_role={self.tli_disaggregation_role!r}"
+            )
+
+        if not self.grpc_mode:
+            raise ValueError(
+                "TLI disaggregation currently uses the gRPC launch path. "
+                "Set --grpc-mode with --tli-disaggregation-role."
+            )
+
+        if self.encoder_only or self.language_only:
+            raise ValueError(
+                "TLI target/draft disaggregation cannot be combined with "
+                "encoder-only or language-only disaggregation modes."
+            )
+
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "TLI target/draft disaggregation cannot be combined with PD "
+                "--disaggregation-mode prefill/decode."
+            )
+
+        if self.tli_rpc_timeout is not None and self.tli_rpc_timeout <= 0:
+            raise ValueError("--tli-rpc-timeout must be positive when set.")
+
+        tls_paths = (
+            self.tli_grpc_certfile,
+            self.tli_grpc_keyfile,
+            self.tli_grpc_ca_certs,
+        )
+        if any(path is not None for path in tls_paths) and not self.tli_grpc_use_tls:
+            raise ValueError(
+                "TLI gRPC certificate options require --tli-grpc-use-tls."
+            )
+        if self.tli_grpc_use_tls:
+            if bool(self.tli_grpc_certfile) != bool(self.tli_grpc_keyfile):
+                raise ValueError(
+                    "--tli-grpc-certfile and --tli-grpc-keyfile must be set together."
+                )
+            for path in tls_paths:
+                if path is not None and not os.path.exists(path):
+                    raise ValueError(f"TLI gRPC TLS file does not exist: {path}")
+
+        if self.tli_disaggregation_role == "draft":
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "A TLI draft node serves the draft model directly and must not "
+                    "also enable --speculative-algorithm. The colocated TLI worker "
+                    "would try to load a second draft model."
+                )
+            if self.speculative_draft_model_path is not None:
+                raise ValueError(
+                    "Do not set --speculative-draft-model-path on a TLI draft node. "
+                    "Use --model-path for the draft model."
+                )
+            if self.tli_draft_server_addr is not None:
+                raise ValueError(
+                    "--tli-draft-server-addr is only valid on the TLI target node."
+                )
+            if self.tli_service_port is None:
+                raise ValueError(
+                    "TLI draft role requires --tli-service-port so the "
+                    "DraftForward RPC never accidentally binds the main serving port."
+                )
+            if self.tli_service_port <= 0:
+                raise ValueError("--tli-service-port must be positive.")
+            if self.tli_target_model_path is None:
+                raise ValueError(
+                    "TLI draft role requires --tli-target-model-path so the "
+                    "draft node can initialize target/draft token translation "
+                    "when the scheduler-backed handler is wired."
+                )
+            if self.tli_grpc_use_tls and (
+                self.tli_grpc_certfile is None or self.tli_grpc_keyfile is None
+            ):
+                raise ValueError(
+                    "TLI draft role with TLS requires --tli-grpc-certfile and "
+                    "--tli-grpc-keyfile."
+                )
+            return
+
+        # Target role is parsed and validated so launch commands are explicit,
+        # but the remote target worker is not yet safe to enable. Without this
+        # guard, the scheduler would instantiate the colocated TLIWorker and
+        # silently load the draft model locally, which is exactly the behavior
+        # this mode is meant to avoid.
+        if self.speculative_algorithm != "TLI":
+            raise ValueError("TLI target role requires --speculative-algorithm TLI.")
+        if self.tli_draft_server_addr is None:
+            raise ValueError(
+                "TLI target role requires --tli-draft-server-addr host:port."
+            )
+        raise ValueError(
+            "TLI target disaggregation is configured, but the remote target "
+            "speculative worker is not wired yet. Refusing to fall back to the "
+            "colocated TLIWorker because that would load the draft model on the "
+            "target node and hide a deployment bug."
+        )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -5450,6 +5582,85 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--tli-disaggregation-role",
+            type=str,
+            choices=["none", "target", "draft"],
+            default=ServerArgs.tli_disaggregation_role,
+            help=(
+                "Role for experimental disaggregated TLI. 'draft' starts the "
+                "TLI DraftForward gRPC service. 'target' is reserved for the "
+                "remote target worker path and currently fails fast instead of "
+                "falling back to colocated draft execution."
+            ),
+        )
+        parser.add_argument(
+            "--tli-draft-server-addr",
+            type=str,
+            default=ServerArgs.tli_draft_server_addr,
+            help=(
+                "Target role only. Draft server gRPC address in host:port form "
+                "for the TLI DraftForward RPC."
+            ),
+        )
+        parser.add_argument(
+            "--tli-service-host",
+            type=str,
+            default=ServerArgs.tli_service_host,
+            help=(
+                "Draft role only. Host/interface for the TLI DraftForward gRPC "
+                "service. Defaults to --host."
+            ),
+        )
+        parser.add_argument(
+            "--tli-service-port",
+            type=int,
+            default=ServerArgs.tli_service_port,
+            help="Draft role only. Port for the TLI DraftForward gRPC service.",
+        )
+        parser.add_argument(
+            "--tli-rpc-timeout",
+            type=float,
+            default=ServerArgs.tli_rpc_timeout,
+            help="Optional timeout in seconds for target-to-draft TLI RPC calls.",
+        )
+        parser.add_argument(
+            "--tli-target-model-path",
+            type=str,
+            default=ServerArgs.tli_target_model_path,
+            help=(
+                "Draft role only. Target model/tokenizer path used by future "
+                "draft-side TLI translation setup."
+            ),
+        )
+        parser.add_argument(
+            "--tli-grpc-use-tls",
+            action="store_true",
+            help=(
+                "Use TLS for the TLI gRPC transport. Provide --tli-grpc-ca-certs "
+                "on the target side and --tli-grpc-certfile/--tli-grpc-keyfile "
+                "on the draft side. If CA certs are provided on the draft side, "
+                "client certificate authentication is required."
+            ),
+        )
+        parser.add_argument(
+            "--tli-grpc-certfile",
+            type=str,
+            default=ServerArgs.tli_grpc_certfile,
+            help="Certificate chain for TLI gRPC TLS/mTLS.",
+        )
+        parser.add_argument(
+            "--tli-grpc-keyfile",
+            type=str,
+            default=ServerArgs.tli_grpc_keyfile,
+            help="Private key for TLI gRPC TLS/mTLS.",
+        )
+        parser.add_argument(
+            "--tli-grpc-ca-certs",
+            type=str,
+            default=ServerArgs.tli_grpc_ca_certs,
+            help="CA certificate bundle for TLI gRPC TLS/mTLS.",
         )
 
         # Speculative decoding (ngram)
