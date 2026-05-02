@@ -13,7 +13,6 @@ from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
-    release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -47,6 +46,8 @@ class TLIDraftExecutorNotReadyError(RuntimeError):
 
 @dataclass
 class TLIDraftRequestState:
+    """Per-request draft KV and speculative state."""
+
     request_id: str
     tp_rank: int
     req: Req
@@ -111,17 +112,21 @@ class TLIDraftSchedulerExecutor:
         raise ValueError(f"Unsupported TLI draft mode: {request.mode!r}")
 
     def release(
-        self, request_ids: list[str], tp_rank: int, *, cache_prefix: bool = True
+        self, request_ids: list[str], tp_rank: int, *, cache_prefix: bool = False
     ) -> None:
+        if cache_prefix:
+            raise TLIDraftExecutorNotReadyError(
+                "Draft-side release does not insert prefixes into the radix cache. "
+                "The draft executor only frees its owned KV and request slots."
+            )
         for request_id in request_ids:
             state = self.states.pop((request_id, tp_rank), None)
-            if state is not None and state.req.req_pool_idx is not None:
-                release_kv_cache(state.req, self.tree_cache, is_insert=cache_prefix)
+            if state is not None:
+                self._release_request_state(state)
 
     def clear(self) -> None:
         for state in list(self.states.values()):
-            if state.req.req_pool_idx is not None:
-                release_kv_cache(state.req, self.tree_cache, is_insert=False)
+            self._release_request_state(state)
         self.states.clear()
 
     def _validate_request(self, request: TLIDraftRequest) -> None:
@@ -246,9 +251,8 @@ class TLIDraftSchedulerExecutor:
         try:
             logits_output = self.model_runner.forward(forward_batch).logits_output
         except Exception:
-            for req in batch.reqs:
-                if req.req_pool_idx is not None:
-                    release_kv_cache(req, self.tree_cache, is_insert=False)
+            for state in self._states_from_batch(batch, request_ids):
+                self._release_request_state(state)
             raise
         maybe_detect_nan(logits_output.next_token_logits, "tli_draft_extend")
         self._capture_for_decode(logits_output, forward_batch.spec_info)
@@ -284,8 +288,8 @@ class TLIDraftSchedulerExecutor:
         self, request: TLIDraftRequest
     ) -> TLIDraftResponse:
         request_ids = request.request_ids or [request.request_id]
-        batch, states, new_seq_lens, extend_lens = (
-            self._build_extend_after_decode_batch(request, request_ids)
+        batch, states, new_seq_lens = self._build_extend_after_decode_batch(
+            request, request_ids
         )
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -309,12 +313,7 @@ class TLIDraftSchedulerExecutor:
             raise
         maybe_detect_nan(logits_output.next_token_logits, "tli_draft_extend_after_decode")
         self._capture_for_decode(logits_output, forward_batch.spec_info)
-        self._commit_extend_after_decode_state(
-            request,
-            states,
-            new_seq_lens,
-            extend_lens,
-        )
+        self._commit_extend_after_decode_state(states, new_seq_lens)
         self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
         return self._state_response(request, forward_batch.spec_info)
@@ -430,7 +429,7 @@ class TLIDraftSchedulerExecutor:
 
     def _build_extend_after_decode_batch(
         self, request: TLIDraftRequest, request_ids: list[str]
-    ) -> tuple[ScheduleBatch, list[TLIDraftRequestState], list[int], list[int]]:
+    ) -> tuple[ScheduleBatch, list[TLIDraftRequestState], list[int]]:
         states = self._states_for_request(request, request_ids)
         if request.accept_length_cpu is None:
             if request.accept_length is None:
@@ -485,22 +484,14 @@ class TLIDraftSchedulerExecutor:
             batch,
             self._speculative_num_steps,
         )
-        return batch, states, new_seq_lens, extend_lens
+        return batch, states, new_seq_lens
 
     def _commit_extend_after_decode_state(
         self,
-        request: TLIDraftRequest,
         states: list[TLIDraftRequestState],
         new_seq_lens: list[int],
-        extend_lens: list[int],
     ) -> None:
-        for i, (state, new_seq_len) in enumerate(zip(states, new_seq_lens)):
-            self._append_output_ids_for_committed_extend(
-                state,
-                request.verified_id,
-                extend_lens,
-                i,
-            )
+        for state, new_seq_len in zip(states, new_seq_lens):
             state.req.kv_committed_len = new_seq_len
             state.req.kv_allocated_len = new_seq_len
             state.seq_len = new_seq_len
@@ -705,17 +696,6 @@ class TLIDraftSchedulerExecutor:
         spec_info.positions = batch.seq_lens.repeat_interleave(self._topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
-    def _append_output_ids_for_committed_extend(
-        self,
-        state: TLIDraftRequestState,
-        verified_id: torch.Tensor,
-        extend_lens: list[int],
-        state_index: int,
-    ) -> None:
-        start = sum(extend_lens[:state_index])
-        end = start + extend_lens[state_index]
-        state.req.output_ids.extend(verified_id[start:end].to("cpu").tolist())
-
     def _draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -817,14 +797,13 @@ class TLIDraftSchedulerExecutor:
 
     @staticmethod
     def _assert_state_kv_invariant(state: TLIDraftRequestState) -> None:
-        req_seq_len = len(state.req.origin_input_ids) + len(state.req.output_ids)
         if state.req.req_pool_idx is None:
             raise RuntimeError(f"TLI draft state {state.request_id!r} has no req slot.")
-        if req_seq_len != state.seq_len:
+        if state.seq_len < len(state.req.origin_input_ids):
             raise RuntimeError(
-                "TLI draft request token history length does not match KV length: "
-                f"request_id={state.request_id!r}, tokens={req_seq_len}, "
-                f"kv={state.seq_len}"
+                "TLI draft request sequence length regressed below its prompt "
+                f"length: request_id={state.request_id!r}, seq_len={state.seq_len}, "
+                f"prompt_len={len(state.req.origin_input_ids)}"
             )
         if (
             state.req.kv_committed_len != state.seq_len
@@ -836,6 +815,51 @@ class TLIDraftSchedulerExecutor:
                 f"committed={state.req.kv_committed_len}, "
                 f"allocated={state.req.kv_allocated_len}"
             )
+
+    def _release_request_state(self, state: TLIDraftRequestState) -> None:
+        req = state.req
+        req_pool_idx = req.req_pool_idx
+        if req_pool_idx is None:
+            return
+        if req.kv_committed_len != state.seq_len or req.kv_allocated_len != state.seq_len:
+            raise RuntimeError(
+                "TLI draft release saw mismatched KV accounting: "
+                f"request_id={state.request_id!r}, seq_len={state.seq_len}, "
+                f"committed={req.kv_committed_len}, allocated={req.kv_allocated_len}"
+            )
+
+        if req.mamba_pool_idx is not None and hasattr(
+            self.req_to_token_pool, "free_mamba_cache"
+        ):
+            self.req_to_token_pool.free_mamba_cache(req)
+
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req_pool_idx, : req.kv_allocated_len
+        ]
+        self.token_to_kv_pool_allocator.free(kv_indices)
+        self.req_to_token_pool.free(req)
+        req.kv_committed_len = 0
+        req.kv_allocated_len = 0
+
+    def _states_from_batch(
+        self, batch: ScheduleBatch, request_ids: list[str]
+    ) -> list[TLIDraftRequestState]:
+        if len(request_ids) != len(batch.reqs):
+            raise ValueError("TLI draft state/request batch size mismatch.")
+        states: list[TLIDraftRequestState] = []
+        for i, request_id in enumerate(request_ids):
+            state = self.states.get((request_id, self.tp_rank))
+            if state is None:
+                state = TLIDraftRequestState(
+                    request_id=request_id,
+                    tp_rank=self.tp_rank,
+                    req=batch.reqs[i],
+                    seq_len=int(batch.seq_lens_cpu[i].item()),
+                )
+            else:
+                state.seq_len = int(batch.seq_lens_cpu[i].item())
+            states.append(state)
+        return states
 
     def _states_for_request(
         self, request: TLIDraftRequest, request_ids: list[str]
