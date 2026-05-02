@@ -41,7 +41,12 @@ class TLIDraftRequest:
     mm_input_embeds: Optional[torch.Tensor] = None
 
     def to_draft_vocab(self, translator: TLITokenTranslator) -> TLIDraftRequest:
-        """Translate target-vocab token ids into draft-vocab token ids."""
+        """Translate token-id payloads into draft vocabulary.
+
+        Only fields that represent vocabulary IDs are translated here. Structural
+        metadata such as TP rank, request ordering, lengths, and hidden states
+        intentionally remain unchanged.
+        """
         return replace(
             self,
             verified_id=translator.translate_target_to_draft_ids(self.verified_id),
@@ -67,7 +72,12 @@ class TLIDraftResponse:
     next_topk_index: Optional[torch.Tensor] = None
 
     def to_target_vocab(self, translator: TLITokenTranslator) -> TLIDraftResponse:
-        """Translate draft-vocab token ids into target-vocab token ids."""
+        """Translate token-id payloads back into target vocabulary.
+
+        ``parent_list`` and ``top_scores_index`` are structural indices and are
+        not vocab-dependent. ``draft_token_ids`` is the token-bearing payload that
+        must be translated.
+        """
         return replace(
             self,
             draft_token_ids=translator.translate_draft_to_target_ids(

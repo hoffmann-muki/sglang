@@ -151,8 +151,8 @@ class RemoteTLIWorker(EAGLEWorker):
         self.active_request_ids.update(request_ids)
         return request_ids
 
-    def _batch_request_id(self, batch, mode: str) -> str:
-        return f"{mode}:{','.join(self._request_ids(batch))}"
+    def _batch_request_id(self, request_ids: list[str], mode: str) -> str:
+        return f"{mode}:{','.join(request_ids)}"
 
     def _draft_extend_input_ids(self, batch) -> torch.Tensor:
         """Return the full current token prefix for draft-side KV reconstruction."""
@@ -262,6 +262,7 @@ class RemoteTLIWorker(EAGLEWorker):
         seq_lens_cpu,
         mm_input_embeds=None,
     ):
+        request_ids = self._request_ids(batch)
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
@@ -270,8 +271,8 @@ class RemoteTLIWorker(EAGLEWorker):
         )
         batch.return_hidden_states = False
         request = TLIDraftRequest(
-            request_id=self._batch_request_id(batch, "extend"),
-            request_ids=self._request_ids(batch),
+            request_id=self._batch_request_id(request_ids, "extend"),
+            request_ids=request_ids,
             input_ids=self._draft_extend_input_ids(batch),
             verified_id=next_token_ids,
             hidden_states=hidden_states,
@@ -308,14 +309,15 @@ class RemoteTLIWorker(EAGLEWorker):
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
+        request_ids = self._request_ids(batch)
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 spec_info.verified_id.to(torch.int64)
             )
 
         request = TLIDraftRequest(
-            request_id=self._batch_request_id(batch, "decode"),
-            request_ids=self._request_ids(batch),
+            request_id=self._batch_request_id(request_ids, "decode"),
+            request_ids=request_ids,
             verified_id=spec_info.verified_id,
             hidden_states=spec_info.hidden_states,
             mode="decode",
@@ -375,7 +377,7 @@ class RemoteTLIWorker(EAGLEWorker):
         assert isinstance(spec_info, EagleDraftInput)
         request_ids = self._request_ids_for_spec_info(batch, spec_info)
         request = TLIDraftRequest(
-            request_id=f"extend_after_decode:{','.join(request_ids)}",
+            request_id=self._batch_request_id(request_ids, "extend_after_decode"),
             request_ids=request_ids,
             verified_id=spec_info.verified_id,
             hidden_states=spec_info.hidden_states,
