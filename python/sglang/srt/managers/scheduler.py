@@ -3300,6 +3300,14 @@ class Scheduler(
         self, recv_req: TLIDraftForwardReqInput
     ) -> TLIDraftForwardReqOutput:
         try:
+            local_tp_rank = getattr(self.tp_worker, "tp_rank", recv_req.request.tp_rank)
+            if local_tp_rank != recv_req.request.tp_rank:
+                return TLIDraftForwardReqOutput(
+                    success=True,
+                    message="",
+                    response=None,
+                    tp_rank=local_tp_rank,
+                )
             if not hasattr(self, "tli_draft_executor"):
                 from sglang.srt.speculative.tli_draft_executor import (
                     TLIDraftSchedulerExecutor,

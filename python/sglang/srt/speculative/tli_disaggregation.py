@@ -124,8 +124,8 @@ def make_tli_service_ready_callback(
     """Create the gRPC launch hook used by the disaggregated draft node.
 
     The normal SGLang gRPC launcher calls this hook once the request manager is
-    ready. Today this starts the typed TLI DraftForward service and installs a
-    fail-closed handler until the scheduler-backed draft executor is available.
+    ready. This starts the typed TLI DraftForward service and routes RPCs through
+    the scheduler-backed draft executor.
     """
     if not tli_draft_service_enabled(server_args):
         return None
@@ -157,12 +157,6 @@ def make_tli_service_ready_callback(
             port,
             scheme,
         )
-        if request_handler is None:
-            logger.warning(
-                "TLI DraftForward service is using the scheduler-backed handler. "
-                "Draft model execution remains fail-closed until the scheduler "
-                "executor supports SGLang batch/KV reconstruction."
-            )
         return server
 
     return _on_ready

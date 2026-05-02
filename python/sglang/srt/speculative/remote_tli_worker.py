@@ -9,6 +9,7 @@ local draft model.
 from __future__ import annotations
 
 import logging
+from itertools import chain
 from typing import Optional
 
 import torch
@@ -137,8 +138,26 @@ class RemoteTLIWorker(EAGLEWorker):
         self.active_request_ids.update(request_ids)
         return request_ids
 
+    def _request_ids_for_spec_info(self, batch, spec_info: EagleDraftInput) -> list[str]:
+        req_pool_indices = spec_info.req_pool_indices_for_draft_extend
+        if req_pool_indices is None or len(req_pool_indices) == len(batch.reqs):
+            return self._request_ids(batch)
+
+        req_by_pool_idx = {req.req_pool_idx: req.rid for req in batch.reqs}
+        request_ids = [
+            req_by_pool_idx[int(req_pool_idx)]
+            for req_pool_idx in req_pool_indices.to("cpu").tolist()
+        ]
+        self.active_request_ids.update(request_ids)
+        return request_ids
+
     def _batch_request_id(self, batch, mode: str) -> str:
         return f"{mode}:{','.join(self._request_ids(batch))}"
+
+    def _draft_extend_input_ids(self, batch) -> torch.Tensor:
+        """Return the full current token prefix for draft-side KV reconstruction."""
+        full_input_ids = list(chain.from_iterable(req.fill_ids for req in batch.reqs))
+        return torch.tensor(full_input_ids, dtype=torch.int64, device=self.device)
 
     def _apply_next_draft_state(
         self,
@@ -253,7 +272,7 @@ class RemoteTLIWorker(EAGLEWorker):
         request = TLIDraftRequest(
             request_id=self._batch_request_id(batch, "extend"),
             request_ids=self._request_ids(batch),
-            input_ids=batch.input_ids,
+            input_ids=self._draft_extend_input_ids(batch),
             verified_id=next_token_ids,
             hidden_states=hidden_states,
             mode="extend",
@@ -354,9 +373,10 @@ class RemoteTLIWorker(EAGLEWorker):
     def forward_draft_extend_after_decode(self, batch):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
+        request_ids = self._request_ids_for_spec_info(batch, spec_info)
         request = TLIDraftRequest(
-            request_id=self._batch_request_id(batch, "extend_after_decode"),
-            request_ids=self._request_ids(batch),
+            request_id=f"extend_after_decode:{','.join(request_ids)}",
+            request_ids=request_ids,
             verified_id=spec_info.verified_id,
             hidden_states=spec_info.hidden_states,
             mode="extend_after_decode",
