@@ -12,6 +12,7 @@ is set.
 
 import json
 import logging
+import inspect
 import time
 
 from aiohttp import web
@@ -20,6 +21,59 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+
+def _call_serve_grpc_compat(
+    serve_grpc_fn,
+    server_args,
+    model_info=None,
+    on_request_manager_ready=None,
+):
+    """Call the external gRPC launcher with the callback name it supports.
+
+    The smg-grpc-servicer API has changed across versions. TLI needs a hook that
+    runs once the request manager is ready, so we try the likely callback names
+    in a stable order and fail with a clear message if none are supported.
+    """
+    base_kwargs = {"model_info": model_info}
+    if on_request_manager_ready is None:
+        return serve_grpc_fn(server_args, **base_kwargs)
+
+    candidates = (
+        "on_request_manager_ready",
+        "on_request_manager_ready_callback",
+        "request_manager_ready_callback",
+        "request_manager_ready",
+        "on_ready",
+    )
+    signature = inspect.signature(serve_grpc_fn)
+    params = signature.parameters
+    accepts_var_kw = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+    if accepts_var_kw:
+        return serve_grpc_fn(
+            server_args,
+            on_request_manager_ready=on_request_manager_ready,
+            **base_kwargs,
+        )
+
+    for candidate in candidates:
+        if candidate in params:
+            return serve_grpc_fn(
+                server_args,
+                **base_kwargs,
+                **{candidate: on_request_manager_ready},
+            )
+
+    raise TypeError(
+        "The installed smg-grpc-servicer serve_grpc() does not expose a request-"
+        "manager-ready callback hook. TLI disaggregated draft startup requires a "
+        "package version that supports one of: "
+        + ", ".join(candidates)
+        + ". Installed signature: "
+        + str(signature)
+    )
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -235,9 +289,10 @@ async def serve_grpc(server_args, model_info=None, on_tli_service_ready=None):
                 raise
 
     try:
-        await _serve_grpc(
+        await _call_serve_grpc_compat(
+            _serve_grpc,
             server_args,
-            model_info,
+            model_info=model_info,
             on_request_manager_ready=_on_request_manager_ready,
         )
     finally:
