@@ -37,7 +37,7 @@ from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftRespons
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
 from sglang.srt.utils import next_power_of_2
-from sglang.srt.utils.hf_transformers_utils import get_config, get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 class TLIDraftExecutorNotReadyError(RuntimeError):
@@ -187,31 +187,27 @@ class TLIDraftSchedulerExecutor:
     def _translator_or_create(self) -> TLITokenTranslator:
         if self._translator is not None:
             return self._translator
-        if self.server_args.tli_target_model_path is None:
+        target_tokenizer_path = self.server_args.tli_target_tokenizer_path
+        if target_tokenizer_path is None:
             raise ValueError(
-                "Draft role requires --tli-target-model-path to constrain TLI "
+                "Draft role requires --tli-target-tokenizer-path to constrain TLI "
                 "draft logits to the target/draft vocabulary intersection."
             )
 
         target_tokenizer = get_tokenizer(
-            self.server_args.tli_target_model_path,
+            target_tokenizer_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
+            tokenizer_backend=self.server_args.tokenizer_backend,
         )
         draft_tokenizer = get_tokenizer(
-            self.server_args.tokenizer_path or self.server_args.model_path,
+            self.server_args.tokenizer_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
             trust_remote_code=self.server_args.trust_remote_code,
             tokenizer_revision=self.server_args.revision,
             tokenizer_backend=self.server_args.tokenizer_backend,
         )
-        target_config = get_config(
-            self.server_args.tli_target_model_path,
-            trust_remote_code=self.server_args.trust_remote_code,
-        )
-        target_vocab_size = getattr(target_config, "vocab_size", None)
-        if target_vocab_size is None:
-            target_vocab_size = len(target_tokenizer.get_vocab())
+        target_vocab_size = len(target_tokenizer.get_vocab())
 
         self._translator = TLITokenTranslator(
             target_tokenizer=target_tokenizer,

@@ -99,20 +99,23 @@ class TLIWorker(StandaloneWorker):
 
         self.hot_token_id = None
 
-        target_tokenizer_path = server_args.tokenizer_path or server_args.model_path
-        draft_tokenizer_path = server_args.speculative_draft_model_path
+        target_tokenizer_path = server_args.tokenizer_path
+        draft_tokenizer_path = server_args.tli_draft_tokenizer_path
+        if draft_tokenizer_path is None:
+            raise ValueError("TLIWorker requires --tli-draft-tokenizer-path.")
 
         target_tokenizer = get_tokenizer(
             target_tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
             tokenizer_revision=server_args.revision,
+            tokenizer_backend=server_args.tokenizer_backend,
         )
         draft_tokenizer = get_tokenizer(
             draft_tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
-            tokenizer_revision=server_args.speculative_draft_model_revision,
+            tokenizer_backend=server_args.tokenizer_backend,
         )
 
         self.vocab_mapping = VocabMapping(

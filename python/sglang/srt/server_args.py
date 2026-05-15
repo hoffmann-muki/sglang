@@ -523,10 +523,12 @@ class ServerArgs:
     speculative_adaptive_config: Optional[str] = None
     tli_disaggregation_role: Literal["none", "target", "draft"] = "none"
     tli_draft_server_addr: Optional[str] = None
+    tli_draft_tokenizer_path: Optional[str] = None
+    tli_draft_tp_size: Optional[int] = None
     tli_service_host: Optional[str] = None
     tli_service_port: Optional[int] = None
     tli_rpc_timeout: Optional[float] = None
-    tli_target_model_path: Optional[str] = None
+    tli_target_tokenizer_path: Optional[str] = None
     tli_grpc_use_tls: bool = False
     tli_grpc_certfile: Optional[str] = None
     tli_grpc_keyfile: Optional[str] = None
@@ -1145,6 +1147,16 @@ class ServerArgs:
             ignore_patterns=["*.bin", "*.safetensors"],
             revision=self.revision,
         )
+        if self.tli_draft_tokenizer_path:
+            self.tli_draft_tokenizer_path = _resolve_or_download(
+                self.tli_draft_tokenizer_path,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+        if self.tli_target_tokenizer_path:
+            self.tli_target_tokenizer_path = _resolve_or_download(
+                self.tli_target_tokenizer_path,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
         if self.speculative_draft_model_path:
             self.speculative_draft_model_path = _resolve_or_download(
                 self.speculative_draft_model_path,
@@ -3574,11 +3586,15 @@ class ServerArgs:
             if self.enable_dp_attention:
                 raise ValueError("TLI speculative decoding does not support dp attention.")
 
-            if self.speculative_draft_model_path is None:
+            if self.tli_draft_tokenizer_path is None:
                 raise ValueError(
-                    "TLI speculative decoding requires setting "
-                    "--speculative-draft-model-path to a model with a different "
-                    "but overlapping vocabulary."
+                    "TLI speculative decoding requires --tli-draft-tokenizer-path "
+                    "so the target side can translate into the draft vocabulary."
+                )
+            if self.speculative_draft_model_path is not None:
+                raise ValueError(
+                    "--speculative-draft-model-path is not used by TLI speculative "
+                    "decoding. Use --tli-draft-tokenizer-path instead."
                 )
 
             if self.max_running_requests is None:
@@ -3645,10 +3661,12 @@ class ServerArgs:
         if self.tli_disaggregation_role == "none":
             tli_fields = (
                 self.tli_draft_server_addr,
+                self.tli_draft_tokenizer_path,
+                self.tli_draft_tp_size,
                 self.tli_service_host,
                 self.tli_service_port,
                 self.tli_rpc_timeout,
-                self.tli_target_model_path,
+                self.tli_target_tokenizer_path,
                 self.tli_grpc_certfile,
                 self.tli_grpc_keyfile,
                 self.tli_grpc_ca_certs,
@@ -3716,6 +3734,10 @@ class ServerArgs:
                     "Do not set --speculative-draft-model-path on a TLI draft node. "
                     "Use --model-path for the draft model."
                 )
+            if self.tli_draft_tp_size is not None:
+                raise ValueError(
+                    "--tli-draft-tp-size is only valid on the TLI target node."
+                )
             if self.tli_draft_server_addr is not None:
                 raise ValueError(
                     "--tli-draft-server-addr is only valid on the TLI target node."
@@ -3727,11 +3749,10 @@ class ServerArgs:
                 )
             if self.tli_service_port <= 0:
                 raise ValueError("--tli-service-port must be positive.")
-            if self.tli_target_model_path is None:
+            if self.tli_target_tokenizer_path is None:
                 raise ValueError(
-                    "TLI draft role requires --tli-target-model-path so the "
-                    "draft node can initialize target/draft token translation "
-                    "when the scheduler-backed handler is wired."
+                    "TLI draft role requires --tli-target-tokenizer-path so the "
+                    "draft node can initialize target/draft token translation."
                 )
             if self.tli_grpc_use_tls and (
                 self.tli_grpc_certfile is None or self.tli_grpc_keyfile is None
@@ -3750,10 +3771,23 @@ class ServerArgs:
             raise ValueError(
                 "TLI target role requires --tli-draft-server-addr host:port."
             )
+        if self.tli_draft_tokenizer_path is None:
+            raise ValueError(
+                "TLI target role requires --tli-draft-tokenizer-path so the "
+                "target node can translate into the draft vocabulary."
+            )
         if self.tli_service_host is not None or self.tli_service_port is not None:
             raise ValueError(
                 "--tli-service-host/--tli-service-port are only valid on the "
                 "TLI draft node."
+            )
+        if self.tli_draft_tp_size is None:
+            self.tli_draft_tp_size = self.tp_size
+        elif self.tli_draft_tp_size not in (1, self.tp_size):
+            raise ValueError(
+                "--tli-draft-tp-size currently supports either 1 for an "
+                "asymmetric draft node or the target --tp size for the "
+                "existing symmetric TLI path."
             )
 
     def _handle_load_format(self):
@@ -5600,6 +5634,23 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
+            "--tli-draft-tokenizer-path",
+            type=str,
+            default=ServerArgs.tli_draft_tokenizer_path,
+            help="Target/TLI role only. Tokenizer path for the draft model.",
+        )
+        parser.add_argument(
+            "--tli-draft-tp-size",
+            type=int,
+            default=ServerArgs.tli_draft_tp_size,
+            help=(
+                "Target role only. Tensor-parallel size of the remote draft "
+                "node. Use 1 for the asymmetric disaggregated setup. If "
+                "omitted, defaults to the target --tp size for the existing "
+                "symmetric TLI path."
+            ),
+        )
+        parser.add_argument(
             "--tli-service-host",
             type=str,
             default=ServerArgs.tli_service_host,
@@ -5621,13 +5672,10 @@ class ServerArgs:
             help="Optional timeout in seconds for target-to-draft TLI RPC calls.",
         )
         parser.add_argument(
-            "--tli-target-model-path",
+            "--tli-target-tokenizer-path",
             type=str,
-            default=ServerArgs.tli_target_model_path,
-            help=(
-                "Draft role only. Target model/tokenizer path used by future "
-                "draft-side TLI translation and execution setup."
-            ),
+            default=ServerArgs.tli_target_tokenizer_path,
+            help="Draft role only. Tokenizer path for the target model.",
         )
         parser.add_argument(
             "--tli-grpc-use-tls",

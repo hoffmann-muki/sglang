@@ -48,6 +48,59 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestTLIDisaggregationServerArgs(unittest.TestCase):
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_target_defaults_draft_tp_size_to_target_tp_size(self, _mock_resolve):
+        server_args = ServerArgs(
+            model_path="dummy",
+            grpc_mode=True,
+            tli_disaggregation_role="target",
+            speculative_algorithm="TLI",
+            tli_draft_server_addr="127.0.0.1:31000",
+            tli_draft_tokenizer_path="draft-tokenizer",
+            tp_size=4,
+        )
+        self.assertEqual(server_args.tli_draft_tp_size, 4)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_target_accepts_asymmetric_draft_tp_size_one(self, _mock_resolve):
+        server_args = ServerArgs(
+            model_path="dummy",
+            grpc_mode=True,
+            tli_disaggregation_role="target",
+            speculative_algorithm="TLI",
+            tli_draft_server_addr="127.0.0.1:31000",
+            tli_draft_tokenizer_path="draft-tokenizer",
+            tli_draft_tp_size=1,
+            tp_size=4,
+        )
+        self.assertEqual(server_args.tli_draft_tp_size, 1)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_target_rejects_unsupported_draft_tp_size(self, _mock_resolve):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                grpc_mode=True,
+                tli_disaggregation_role="target",
+                speculative_algorithm="TLI",
+                tli_draft_server_addr="127.0.0.1:31000",
+                tli_draft_tokenizer_path="draft-tokenizer",
+                tli_draft_tp_size=2,
+                tp_size=4,
+            )
+        self.assertIn("tli-draft-tp-size", str(context.exception))
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

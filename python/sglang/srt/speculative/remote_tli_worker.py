@@ -9,6 +9,8 @@ local draft model.
 from __future__ import annotations
 
 import logging
+import traceback
+from dataclasses import dataclass
 from itertools import chain
 from typing import Optional
 
@@ -25,13 +27,25 @@ from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import fast_topk
-from sglang.srt.speculative.tli_disaggregation import build_tli_channel_credentials
+from sglang.srt.speculative.tli_disaggregation import (
+    build_tli_channel_credentials,
+)
 from sglang.srt.speculative.tli_grpc_transport import TliSpeculativeBlockingClient
 from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
-from sglang.srt.utils.hf_transformers_utils import get_config, get_tokenizer
+from sglang.srt.utils.common import broadcast_pyobj
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _BroadcastedDraftResult:
+    """Target-side wrapper used to fan a rank-0 draft RPC result out to TP ranks."""
+
+    ok: bool
+    response: TLIDraftResponse | None = None
+    error: str | None = None
 
 
 class RemoteTLIWorker(EAGLEWorker):
@@ -70,6 +84,7 @@ class RemoteTLIWorker(EAGLEWorker):
             target_worker.get_memory_pool()
         )
         self.active_request_ids: set[str] = set()
+        self.remote_draft_tp_size = server_args.tli_draft_tp_size or self.tp_size
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
@@ -78,28 +93,26 @@ class RemoteTLIWorker(EAGLEWorker):
         if server_args.tli_draft_server_addr is None:
             raise ValueError("RemoteTLIWorker requires --tli-draft-server-addr.")
 
-        target_tokenizer_path = server_args.tokenizer_path or server_args.model_path
-        draft_tokenizer_path = server_args.speculative_draft_model_path
+        target_tokenizer_path = server_args.tokenizer_path
+        draft_tokenizer_path = server_args.tli_draft_tokenizer_path
+        if draft_tokenizer_path is None:
+            raise ValueError(
+                "RemoteTLIWorker requires --tli-draft-tokenizer-path."
+            )
         target_tokenizer = get_tokenizer(
             target_tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
             tokenizer_revision=server_args.revision,
+            tokenizer_backend=server_args.tokenizer_backend,
         )
         draft_tokenizer = get_tokenizer(
             draft_tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
-            tokenizer_revision=server_args.speculative_draft_model_revision,
+            tokenizer_backend=server_args.tokenizer_backend,
         )
-        draft_config = get_config(
-            draft_tokenizer_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.speculative_draft_model_revision,
-        )
-        draft_vocab_size = getattr(draft_config, "vocab_size", None)
-        if draft_vocab_size is None:
-            draft_vocab_size = len(draft_tokenizer.get_vocab())
+        draft_vocab_size = len(draft_tokenizer.get_vocab())
 
         self.vocab_mapping = TLITokenTranslator(
             target_tokenizer=target_tokenizer,
@@ -114,8 +127,11 @@ class RemoteTLIWorker(EAGLEWorker):
             channel_credentials=build_tli_channel_credentials(server_args),
         )
         logger.info(
-            "RemoteTLIWorker initialized; draft RPC target=%s",
+            "RemoteTLIWorker initialized; draft RPC target=%s draft_tp_size=%d "
+            "mode=%s",
             server_args.tli_draft_server_addr,
+            self.remote_draft_tp_size,
+            "asymmetric" if self.uses_rank0_broadcast else "symmetric",
         )
 
     @property
@@ -154,6 +170,72 @@ class RemoteTLIWorker(EAGLEWorker):
     def _batch_request_id(self, request_ids: list[str], mode: str) -> str:
         return f"{mode}:{','.join(request_ids)}"
 
+    @property
+    def uses_rank0_broadcast(self) -> bool:
+        return self.tp_size > 1 and self.remote_draft_tp_size == 1
+
+    def _draft_tp_rank(self) -> int:
+        return 0 if self.uses_rank0_broadcast else self.tp_rank
+
+    def _draft_tp_size(self) -> int:
+        return 1 if self.uses_rank0_broadcast else self.tp_size
+
+    def _run_rank0_broadcasted_draft_forward(
+        self,
+        request: TLIDraftRequest,
+        *,
+        timeout: float | None,
+        translate_request_to_draft_vocab: bool,
+        translate_response_to_target_vocab: bool,
+    ) -> TLIDraftResponse:
+        if not self.uses_rank0_broadcast:
+            return self.client.draft_forward(
+                request,
+                timeout=timeout,
+                translate_request_to_draft_vocab=translate_request_to_draft_vocab,
+                translate_response_to_target_vocab=translate_response_to_target_vocab,
+            )
+
+        world_group = self.target_worker.world_group
+        is_root = world_group.is_first_rank
+        payload: list[_BroadcastedDraftResult]
+        if is_root:
+            try:
+                response = self.client.draft_forward(
+                    request,
+                    timeout=timeout,
+                    translate_request_to_draft_vocab=translate_request_to_draft_vocab,
+                    translate_response_to_target_vocab=translate_response_to_target_vocab,
+                )
+                payload = [_BroadcastedDraftResult(ok=True, response=response)]
+            except Exception:
+                logger.exception("TLI DraftForward RPC failed on target root rank.")
+                payload = [
+                    _BroadcastedDraftResult(
+                        ok=False,
+                        error=traceback.format_exc(),
+                    )
+                ]
+        else:
+            payload = []
+
+        broadcasted = broadcast_pyobj(
+            payload,
+            world_group.rank,
+            world_group.cpu_group,
+            src=world_group.first_rank,
+        )[0]
+        if not broadcasted.ok:
+            raise RuntimeError(
+                "TLI DraftForward RPC failed on the target root rank:\n"
+                f"{broadcasted.error}"
+            )
+        if broadcasted.response is None:
+            raise RuntimeError(
+                "TLI DraftForward RPC succeeded but returned no response payload."
+            )
+        return broadcasted.response
+
     def _draft_extend_input_ids(self, batch) -> torch.Tensor:
         """Return the full current token prefix for draft-side KV reconstruction."""
         full_input_ids = list(chain.from_iterable(req.fill_ids for req in batch.reqs))
@@ -187,10 +269,10 @@ class RemoteTLIWorker(EAGLEWorker):
             verified_id=torch.empty((0,), dtype=torch.int64),
             hidden_states=torch.empty((0,), dtype=self.model_config.dtype),
             mode="release",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self._draft_tp_rank(),
+            tp_size=self._draft_tp_size(),
         )
-        self.client.draft_forward(
+        self._run_rank0_broadcasted_draft_forward(
             release_request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=False,
@@ -277,8 +359,8 @@ class RemoteTLIWorker(EAGLEWorker):
             verified_id=next_token_ids,
             hidden_states=hidden_states,
             mode="extend",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self._draft_tp_rank(),
+            tp_size=self._draft_tp_size(),
             capture_hidden_mode=CaptureHiddenMode.LAST,
             topk=self.topk,
             speculative_num_steps=self.speculative_num_steps,
@@ -287,7 +369,7 @@ class RemoteTLIWorker(EAGLEWorker):
             seq_lens_for_draft_extend_cpu=seq_lens_cpu,
             mm_input_embeds=mm_input_embeds,
         )
-        response = self.client.draft_forward(
+        response = self._run_rank0_broadcasted_draft_forward(
             request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=True,
@@ -321,8 +403,8 @@ class RemoteTLIWorker(EAGLEWorker):
             verified_id=spec_info.verified_id,
             hidden_states=spec_info.hidden_states,
             mode="decode",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self._draft_tp_rank(),
+            tp_size=self._draft_tp_size(),
             capture_hidden_mode=CaptureHiddenMode.LAST,
             topk=self.topk,
             speculative_num_steps=self.speculative_num_steps,
@@ -330,7 +412,7 @@ class RemoteTLIWorker(EAGLEWorker):
             num_tokens_per_req=self.topk,
             num_tokens_for_logprob_per_req=self.topk,
         )
-        response = self.client.draft_forward(
+        response = self._run_rank0_broadcasted_draft_forward(
             request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=True,
@@ -382,8 +464,8 @@ class RemoteTLIWorker(EAGLEWorker):
             verified_id=spec_info.verified_id,
             hidden_states=spec_info.hidden_states,
             mode="extend_after_decode",
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            tp_rank=self._draft_tp_rank(),
+            tp_size=self._draft_tp_size(),
             capture_hidden_mode=CaptureHiddenMode.LAST,
             topk=self.topk,
             speculative_num_steps=self.speculative_num_steps,
@@ -395,7 +477,7 @@ class RemoteTLIWorker(EAGLEWorker):
             if spec_info.accept_length is not None
             else None,
         )
-        response = self.client.draft_forward(
+        response = self._run_rank0_broadcasted_draft_forward(
             request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=True,
