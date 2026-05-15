@@ -304,7 +304,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## TLI target/draft disaggregation
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--tli-disaggregation-role` | Role for disaggregated TLI. `target` runs the verification side and `draft` runs the draft-side gRPC service. | `none` | `none`, `target`, `draft` |
+| `--tli-disaggregation-role` | Role for disaggregated TLI. `target` runs the verification side and `draft` runs the draft model on the gRPC serving path while also starting the TLI DraftForward sidecar. | `none` | `none`, `target`, `draft` |
 | `--tli-draft-server-addr` | Target-side address of the draft gRPC service, formatted as `host:port`. | `None` | Type: str |
 | `--tli-draft-tokenizer-path` | Tokenizer path for the draft model. Required on the target node so target tokens can be translated into draft tokens. | `None` | Type: str |
 | `--tli-draft-tp-size` | Tensor-parallel size of the remote draft node. Use `1` for the asymmetric disaggregated setup; if omitted, the target defaults to its own `--tp` for the existing symmetric TLI path. | `None` | Type: int |

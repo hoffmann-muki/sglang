@@ -1,79 +1,25 @@
-"""
-Thin gRPC server wrapper — delegates to smg-grpc-servicer package.
+"""Thin gRPC server wrapper — delegates to smg-grpc-servicer package.
 
-A lightweight HTTP sidecar is started alongside the gRPC server to expose:
-- /metrics (Prometheus, when --enable-metrics is set)
-- /start_profile, /stop_profile (profiling control)
-
-The sidecar is started on --grpc-http-sidecar-port (default: --port + 1)
-once the gRPC request manager is ready, regardless of whether --enable-metrics
-is set.
+The wrapper keeps the serving node on the gRPC launch path and starts the TLI
+DraftForward sidecar independently once the request manager becomes visible in
+the launcher runtime.
 """
 
+import asyncio
 import json
 import logging
-import inspect
 import time
 
 from aiohttp import web
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.speculative.tli_disaggregation import (
+    start_tli_draft_service,
+    tli_draft_service_enabled,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _call_serve_grpc_compat(
-    serve_grpc_fn,
-    server_args,
-    model_info=None,
-    on_request_manager_ready=None,
-):
-    """Call the external gRPC launcher with the callback name it supports.
-
-    The smg-grpc-servicer API has changed across versions. TLI needs a hook that
-    runs once the request manager is ready, so we try the likely callback names
-    in a stable order and fail with a clear message if none are supported.
-    """
-    base_kwargs = {"model_info": model_info}
-    if on_request_manager_ready is None:
-        return serve_grpc_fn(server_args, **base_kwargs)
-
-    candidates = (
-        "on_request_manager_ready",
-        "on_request_manager_ready_callback",
-        "request_manager_ready_callback",
-        "request_manager_ready",
-        "on_ready",
-    )
-    signature = inspect.signature(serve_grpc_fn)
-    params = signature.parameters
-    accepts_var_kw = any(
-        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
-    )
-    if accepts_var_kw:
-        return serve_grpc_fn(
-            server_args,
-            on_request_manager_ready=on_request_manager_ready,
-            **base_kwargs,
-        )
-
-    for candidate in candidates:
-        if candidate in params:
-            return serve_grpc_fn(
-                server_args,
-                **base_kwargs,
-                **{candidate: on_request_manager_ready},
-            )
-
-    raise TypeError(
-        "The installed smg-grpc-servicer serve_grpc() does not expose a request-"
-        "manager-ready callback hook. TLI disaggregated draft startup requires a "
-        "package version that supports one of: "
-        + ", ".join(candidates)
-        + ". Installed signature: "
-        + str(signature)
-    )
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -206,15 +152,134 @@ def _add_admin_routes(app, request_manager):
     app.router.add_post("/stop_profile", stop_profile_handler)
 
 
-async def serve_grpc(server_args, model_info=None, on_tli_service_ready=None):
-    """Start the standalone gRPC server with integrated scheduler.
+def _request_manager_candidate(obj, seen: set[int]) -> object | None:
+    if obj is None:
+        return None
+    obj_id = id(obj)
+    if obj_id in seen:
+        return None
+    seen.add(obj_id)
 
-    `on_tli_service_ready` is the disaggregated-TLI hook: future launchers can
-    provide an async callback that starts the TLI gRPC server after the request
-    manager becomes available.
+    if hasattr(obj, "send_communicator_req"):
+        return obj
+
+    for attr_name in (
+        "request_manager",
+        "_request_manager",
+        "server_state",
+        "state",
+        "app",
+        "servicer",
+    ):
+        if hasattr(obj, attr_name):
+            candidate = _request_manager_candidate(getattr(obj, attr_name), seen)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _discover_request_manager(module) -> object | None:
+    seen: set[int] = set()
+    for value in vars(module).values():
+        candidate = _request_manager_candidate(value, seen)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+async def _wait_for_request_manager(module, timeout_s: float = 120.0):
+    deadline = time.monotonic() + timeout_s
+    while True:
+        request_manager = _discover_request_manager(module)
+        if request_manager is not None:
+            return request_manager
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for the gRPC request manager to become "
+                "visible so the TLI DraftForward sidecar can start."
+            )
+        await asyncio.sleep(0.2)
+
+
+async def _start_smg_sidecars_when_ready(
+    server_args,
+    serve_grpc_module,
+    sidecar_app,
+    sidecar_host,
+    sidecar_port,
+):
+    try:
+        request_manager = await _wait_for_request_manager(serve_grpc_module)
+    except TimeoutError:
+        if tli_draft_service_enabled(server_args):
+            raise
+        logger.warning(
+            "Could not locate the gRPC request manager; skipping the HTTP "
+            "sidecar for this non-TLI launch."
+        )
+        return None, None
+    logger.info("Discovered gRPC request manager; starting gRPC sidecar.")
+    try:
+        _add_admin_routes(sidecar_app, request_manager)
+    except Exception as e:
+        logger.error(
+            "Failed to set up admin routes: %s. Continuing without admin endpoints.",
+            e,
+            exc_info=True,
+        )
+
+    sidecar_runner = None
+    try:
+        sidecar_runner = await _start_sidecar_server(
+            sidecar_host, sidecar_port, sidecar_app
+        )
+    except OSError as e:
+        logger.error(
+            "Failed to start HTTP sidecar server: %s. "
+            "Continuing without metrics/profile endpoints.",
+            e,
+            exc_info=True,
+        )
+    except Exception as e:
+        logger.error(
+            "Unexpected error starting HTTP sidecar server: %s. "
+            "Continuing without metrics/profile endpoints.",
+            e,
+            exc_info=True,
+        )
+
+    try:
+        if tli_draft_service_enabled(server_args):
+            try:
+                tli_runner = await start_tli_draft_service(
+                    request_manager, server_args
+                )
+            except Exception:
+                if sidecar_runner is not None:
+                    try:
+                        await sidecar_runner.cleanup()
+                    except Exception:
+                        logger.exception(
+                            "Failed to cleanly shut down HTTP sidecar server after TLI startup failure."
+                        )
+                raise
+        return sidecar_runner, tli_runner
+    except asyncio.CancelledError:
+        if sidecar_runner is not None:
+            try:
+                await sidecar_runner.cleanup()
+            except Exception:
+                logger.exception(
+                    "Failed to cleanly shut down HTTP sidecar server after cancellation."
+                )
+        raise
+
+
+async def serve_grpc(server_args, model_info=None):
+    """Start the standalone gRPC server with integrated scheduler.
     """
     try:
-        from smg_grpc_servicer.sglang.server import serve_grpc as _serve_grpc
+        from smg_grpc_servicer.sglang import server as smg_grpc_server
     except ImportError as e:
         raise ImportError(
             "gRPC mode requires the smg-grpc-servicer package. "
@@ -225,7 +290,9 @@ async def serve_grpc(server_args, model_info=None, on_tli_service_ready=None):
 
     sidecar_app = web.Application()
     sidecar_runner = None
+    grpc_task = None
     tli_runner = None
+    sidecar_task = None
     sidecar_port = (
         server_args.grpc_http_sidecar_port
         if server_args.grpc_http_sidecar_port is not None
@@ -250,65 +317,95 @@ async def serve_grpc(server_args, model_info=None, on_tli_service_ready=None):
                 exc_info=True,
             )
 
-    async def _on_request_manager_ready(request_manager, srv_args, sched_info):
+    def _capture_sidecar_result(task):
         nonlocal sidecar_runner, tli_runner
+        if task.cancelled():
+            return
         try:
-            _add_admin_routes(sidecar_app, request_manager)
-        except Exception as e:
-            logger.error(
-                "Failed to set up admin routes: %s. "
-                "Continuing without admin endpoints.",
-                e,
-                exc_info=True,
-            )
-        try:
-            sidecar_runner = await _start_sidecar_server(
-                server_args.host, sidecar_port, sidecar_app
-            )
-        except OSError as e:
-            logger.error(
-                "Failed to start HTTP sidecar server: %s. "
-                "Continuing without metrics/profile endpoints.",
-                e,
-                exc_info=True,
-            )
-        except Exception as e:
-            logger.error(
-                "Unexpected error starting HTTP sidecar server: %s. "
-                "Continuing without metrics/profile endpoints.",
-                e,
-                exc_info=True,
-            )
-        if on_tli_service_ready is not None:
-            try:
-                tli_runner = await on_tli_service_ready(
-                    request_manager, srv_args, sched_info
-                )
-            except Exception:
-                logger.exception("Failed to start TLI gRPC service.")
-                raise
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.error("gRPC sidecar startup failed: %s", exc)
+            return
+        result = task.result()
+        if result is None:
+            return
+        sidecar_runner, tli_result = result
+        if tli_result is not None:
+            tli_runner = tli_result
 
     try:
-        await _call_serve_grpc_compat(
-            _serve_grpc,
-            server_args,
-            model_info=model_info,
-            on_request_manager_ready=_on_request_manager_ready,
+        grpc_task = asyncio.create_task(
+            smg_grpc_server.serve_grpc(server_args, model_info=model_info)
         )
-    finally:
-        if sidecar_runner is not None:
-            try:
-                await sidecar_runner.cleanup()
-            except Exception as e:
-                logger.exception(
-                    "Failed to cleanly shut down HTTP sidecar server: %s",
-                    e,
+        sidecar_task = asyncio.create_task(
+            _start_smg_sidecars_when_ready(
+                server_args,
+                smg_grpc_server,
+                sidecar_app,
+                server_args.host,
+                sidecar_port,
+            )
+        )
+        sidecar_task.add_done_callback(_capture_sidecar_result)
+        if tli_draft_service_enabled(server_args):
+            while True:
+                done, _ = await asyncio.wait(
+                    {grpc_task, sidecar_task},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+
+                if grpc_task in done:
+                    exc = grpc_task.exception()
+                    if exc is not None:
+                        raise exc
+                    break
+
+                if sidecar_task in done:
+                    exc = sidecar_task.exception()
+                    if exc is not None:
+                        raise exc
+                    sidecar_runner, tli_runner = sidecar_task.result()
+                    break
+
+            if not grpc_task.done():
+                await grpc_task
+        else:
+            await grpc_task
+    finally:
+        if grpc_task is not None and not grpc_task.done():
+            grpc_task.cancel()
+            try:
+                await grpc_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("gRPC server shutdown raised an exception.")
+        if sidecar_task is not None:
+            if not sidecar_task.done():
+                sidecar_task.cancel()
+                try:
+                    await sidecar_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Sidecar startup failed.")
+            elif not sidecar_task.cancelled() and sidecar_task.exception() is None:
+                sidecar_runner, tli_runner = sidecar_task.result()
         if tli_runner is not None:
             try:
                 await tli_runner.stop(grace=0)
             except Exception as e:
                 logger.exception(
                     "Failed to cleanly shut down TLI gRPC server: %s",
+                    e,
+                )
+        if sidecar_runner is not None:
+            try:
+                await sidecar_runner.cleanup()
+            except Exception as e:
+                logger.exception(
+                    "Failed to cleanly shut down HTTP sidecar server: %s",
                     e,
                 )

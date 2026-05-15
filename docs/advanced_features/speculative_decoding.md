@@ -342,6 +342,7 @@ TLI extends standalone speculative decoding to draft models whose tokenizer diff
 
 - Requires `--tli-draft-tokenizer-path` on the target node and `--tli-target-tokenizer-path` on the draft node.
 - For disaggregated deployment, the target node may set `--tli-draft-tp-size 1` to use a single-rank draft service while keeping a multi-rank target.
+- The draft node uses the gRPC serving path and starts the TLI DraftForward sidecar independently of the removed smg-grpc-servicer callback hook.
 - Does not support `--enable-dp-attention`.
 - Does not support SpecV2 / the overlap scheduler.
 - Requires `--speculative-eagle-topk 1`.
@@ -364,7 +365,6 @@ python3 -m sglang.launch_server \
 
 # Target node
 python3 -m sglang.launch_server \
-    --grpc-mode \
     --host 0.0.0.0 \
     --port 30000 \
     --model-path meta-llama/Llama-3.1-8B-Instruct \

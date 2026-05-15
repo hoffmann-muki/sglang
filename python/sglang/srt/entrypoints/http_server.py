@@ -285,6 +285,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    warmup_thread = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -397,7 +398,8 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
-        warmup_thread.join()
+        if warmup_thread is not None:
+            warmup_thread.join()
 
 
 # Fast API

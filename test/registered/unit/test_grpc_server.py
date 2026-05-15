@@ -1,7 +1,12 @@
+import asyncio
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
-from sglang.srt.entrypoints.grpc_server import _call_serve_grpc_compat
+from sglang.srt.entrypoints.grpc_server import (
+    _discover_request_manager,
+    _start_smg_sidecars_when_ready,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -9,40 +14,72 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
+class _RequestManager:
+    async def send_communicator_req(self, *args, **kwargs):
+        return []
+
+
 class TestGrpcServerCompat(CustomTestCase):
-    def test_compat_uses_supported_callback_name(self):
-        seen = {}
-
-        def fake_serve_grpc(server_args, model_info=None, request_manager_ready=None):
-            seen["server_args"] = server_args
-            seen["model_info"] = model_info
-            seen["request_manager_ready"] = request_manager_ready
-            return "ok"
-
-        callback = lambda *args: args  # noqa: E731
-        result = _call_serve_grpc_compat(
-            fake_serve_grpc,
-            SimpleNamespace(),
-            model_info={"x": 1},
-            on_request_manager_ready=callback,
+    def test_discover_request_manager_finds_nested_object(self):
+        request_manager = _RequestManager()
+        module = SimpleNamespace(
+            unrelated=object(),
+            wrapper=SimpleNamespace(state=SimpleNamespace(request_manager=request_manager)),
         )
 
-        self.assertEqual(result, "ok")
-        self.assertIs(seen["request_manager_ready"], callback)
+        self.assertIs(_discover_request_manager(module), request_manager)
 
-    def test_compat_passes_through_when_no_callback_requested(self):
-        seen = {}
+    def test_start_smg_sidecars_when_ready_starts_both_sidecars(self):
+        request_manager = _RequestManager()
+        module = ModuleType("fake_smg_module")
+        module.request_manager = request_manager
 
-        def fake_serve_grpc(server_args, model_info=None):
-            seen["server_args"] = server_args
-            seen["model_info"] = model_info
-            return "ok"
+        started = {}
 
-        result = _call_serve_grpc_compat(fake_serve_grpc, SimpleNamespace())
+        async def fake_wait_for_request_manager(_module, timeout_s=120.0):
+            self.assertIs(_module, module)
+            self.assertEqual(timeout_s, 120.0)
+            return request_manager
 
-        self.assertEqual(result, "ok")
-        self.assertIsNotNone(seen["server_args"])
-        self.assertIsNone(seen["model_info"])
+        async def fake_start_sidecar_server(host, port, app):
+            started["sidecar"] = (host, port, app)
+            return SimpleNamespace(cleanup=lambda: None)
+
+        async def fake_start_tli_draft_service(source, server_args, request_handler=None):
+            started["tli"] = (source, server_args, request_handler)
+            return SimpleNamespace(stop=lambda grace=0: None)
+
+        with patch(
+            "sglang.srt.entrypoints.grpc_server._wait_for_request_manager",
+            fake_wait_for_request_manager,
+        ), patch(
+            "sglang.srt.entrypoints.grpc_server._start_sidecar_server",
+            fake_start_sidecar_server,
+        ), patch(
+            "sglang.srt.entrypoints.grpc_server.start_tli_draft_service",
+            fake_start_tli_draft_service,
+        ):
+            sidecar_runner, tli_runner = asyncio.run(
+                _start_smg_sidecars_when_ready(
+                    SimpleNamespace(
+                        host="127.0.0.1",
+                        tli_disaggregation_role="draft",
+                        tli_service_port=32001,
+                    ),
+                    module,
+                    SimpleNamespace(router=SimpleNamespace(add_get=lambda *args, **kwargs: None, add_post=lambda *args, **kwargs: None)),
+                    "127.0.0.1",
+                    30001,
+                )
+            )
+
+        self.assertIn("sidecar", started)
+        self.assertIn("tli", started)
+        self.assertEqual(started["sidecar"][0], "127.0.0.1")
+        self.assertEqual(started["sidecar"][1], 30001)
+        self.assertIs(started["tli"][0], request_manager)
+        self.assertIsNotNone(sidecar_runner)
+        self.assertIsNotNone(tli_runner)
 
 
 if __name__ == "__main__":

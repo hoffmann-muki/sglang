@@ -3683,12 +3683,6 @@ class ServerArgs:
                 f"Invalid tli_disaggregation_role={self.tli_disaggregation_role!r}"
             )
 
-        if not self.grpc_mode:
-            raise ValueError(
-                "TLI disaggregation currently uses the gRPC launch path. "
-                "Set --grpc-mode with --tli-disaggregation-role."
-            )
-
         if self.encoder_only or self.language_only:
             raise ValueError(
                 "TLI target/draft disaggregation cannot be combined with "
@@ -3723,6 +3717,12 @@ class ServerArgs:
                     raise ValueError(f"TLI gRPC TLS file does not exist: {path}")
 
         if self.tli_disaggregation_role == "draft":
+            if not self.grpc_mode:
+                raise ValueError(
+                    "TLI draft role requires --grpc-mode so the draft model can "
+                    "start its gRPC serving path and launch the DraftForward "
+                    "sidecar independently."
+                )
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "A TLI draft node serves the draft model directly and must not "
@@ -5621,7 +5621,8 @@ class ServerArgs:
             help=(
                 "Role for experimental disaggregated TLI. 'target' serves the "
                 "target model and calls a remote draft service. 'draft' serves "
-                "the draft model and starts the TLI DraftForward gRPC service."
+                "the draft model and starts the TLI DraftForward service from "
+                "the gRPC serving path."
             ),
         )
         parser.add_argument(
@@ -5655,7 +5656,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.tli_service_host,
             help=(
-                "Draft role only. Host/interface for the TLI DraftForward gRPC "
+                "Draft role only. Host/interface for the TLI DraftForward "
                 "service. Defaults to --host."
             ),
         )
@@ -5663,7 +5664,7 @@ class ServerArgs:
             "--tli-service-port",
             type=int,
             default=ServerArgs.tli_service_port,
-            help="Draft role only. Port for the TLI DraftForward gRPC service.",
+            help="Draft role only. Port for the TLI DraftForward service.",
         )
         parser.add_argument(
             "--tli-rpc-timeout",

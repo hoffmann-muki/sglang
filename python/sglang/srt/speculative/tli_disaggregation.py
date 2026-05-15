@@ -87,16 +87,38 @@ async def unimplemented_tli_draft_handler(
     )
 
 
-async def scheduler_backed_tli_draft_handler(
-    request_manager,
+async def tokenizer_manager_backed_tli_draft_handler(
+    tokenizer_manager,
     request: TLIDraftRequest,
     timeout: float | None = None,
 ) -> TLIDraftResponse:
-    results = await request_manager.send_communicator_req(
-        TLIDraftForwardReqInput(request=request),
-        "tli_draft_forward_communicator",
+    """Bridge DraftForward RPCs into the local scheduler communicator."""
+    return await _draft_forward_via_request_source(
+        tokenizer_manager,
+        request,
         timeout=timeout,
     )
+
+
+async def _draft_forward_via_request_source(
+    request_source,
+    request: TLIDraftRequest,
+    timeout: float | None = None,
+) -> TLIDraftResponse:
+    communicator = getattr(request_source, "tli_draft_forward_communicator", None)
+    if communicator is not None:
+        results = await communicator(TLIDraftForwardReqInput(request=request))
+    elif hasattr(request_source, "send_communicator_req"):
+        results = await request_source.send_communicator_req(
+            TLIDraftForwardReqInput(request=request),
+            "tli_draft_forward_communicator",
+            timeout=timeout,
+        )
+    else:
+        raise RuntimeError(
+            "TLI draft request source does not expose a compatible communicator."
+        )
+
     if not results:
         raise RuntimeError("TLI DraftForward received no scheduler response.")
 
@@ -124,50 +146,41 @@ async def scheduler_backed_tli_draft_handler(
     return response
 
 
-def make_tli_service_ready_callback(
+async def start_tli_draft_service(
+    request_source,
     server_args,
     *,
     request_handler: TLIDraftHandler | None = None,
 ):
-    """Create the gRPC launch hook used by the disaggregated draft node.
-
-    The normal SGLang gRPC launcher calls this hook once the request manager is
-    ready. This starts the typed TLI DraftForward service and routes RPCs through
-    the scheduler-backed draft executor.
-    """
+    """Start the draft-side TLI gRPC sidecar from the serving runtime."""
     if not tli_draft_service_enabled(server_args):
         return None
 
-    async def _on_ready(request_manager, srv_args, sched_info):
-        del srv_args, sched_info
+    host, port = tli_draft_service_bind_addr(server_args)
+    handler = request_handler
+    if handler is None:
 
-        host, port = tli_draft_service_bind_addr(server_args)
-        handler = request_handler
-        if handler is None:
+        async def _default_handler(request: TLIDraftRequest) -> TLIDraftResponse:
+            return await _draft_forward_via_request_source(
+                request_source,
+                request,
+                timeout=server_args.tli_rpc_timeout,
+            )
 
-            async def _default_handler(request: TLIDraftRequest) -> TLIDraftResponse:
-                return await scheduler_backed_tli_draft_handler(
-                    request_manager,
-                    request,
-                    timeout=server_args.tli_rpc_timeout,
-                )
+        handler = _default_handler
 
-            handler = _default_handler
-
-        credentials = build_tli_server_credentials(server_args)
-        server = await serve_tli_speculative_service(
-            host=host,
-            port=port,
-            request_handler=handler,
-            server_credentials=credentials,
-        )
-        scheme = "mTLS/TLS" if credentials is not None else "insecure"
-        logger.info(
-            "TLI DraftForward gRPC service started on %s:%d (%s).",
-            host,
-            port,
-            scheme,
-        )
-        return server
-
-    return _on_ready
+    credentials = build_tli_server_credentials(server_args)
+    server = await serve_tli_speculative_service(
+        host=host,
+        port=port,
+        request_handler=handler,
+        server_credentials=credentials,
+    )
+    scheme = "mTLS/TLS" if credentials is not None else "insecure"
+    logger.info(
+        "TLI DraftForward service started on %s:%d (%s).",
+        host,
+        port,
+        scheme,
+    )
+    return server
