@@ -39,12 +39,12 @@ _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 def _import_proto_modules():
     candidates = (
         (
-            "smg_grpc_proto.sglang_pb2",
-            "smg_grpc_proto.sglang_pb2_grpc",
-        ),
-        (
             "sglang.runtime.v1.sglang_pb2",
             "sglang.runtime.v1.sglang_pb2_grpc",
+        ),
+        (
+            "smg_grpc_proto.sglang_pb2",
+            "smg_grpc_proto.sglang_pb2_grpc",
         ),
         (
             "sglang.srt.grpc.sglang_pb2",
