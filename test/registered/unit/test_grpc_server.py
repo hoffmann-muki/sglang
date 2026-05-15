@@ -1,10 +1,10 @@
 import asyncio
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.grpc_server import (
-    _discover_request_manager,
+    _install_request_manager_capture,
     _start_smg_sidecars_when_ready,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,26 +20,29 @@ class _RequestManager:
 
 
 class TestGrpcServerCompat(CustomTestCase):
-    def test_discover_request_manager_finds_nested_object(self):
-        request_manager = _RequestManager()
-        module = SimpleNamespace(
-            unrelated=object(),
-            wrapper=SimpleNamespace(state=SimpleNamespace(request_manager=request_manager)),
-        )
+    def test_install_request_manager_capture_resolves_on_constructor(self):
+        class _GrpcRequestManager(_RequestManager):
+            pass
 
-        self.assertIs(_discover_request_manager(module), request_manager)
+        async def run_test():
+            request_manager = None
+            with patch(
+                "sglang.srt.entrypoints.grpc_server._iter_request_manager_classes",
+                return_value=[_GrpcRequestManager],
+            ):
+                future, restore = _install_request_manager_capture(SimpleNamespace())
+                try:
+                    request_manager = _GrpcRequestManager()
+                    self.assertIs(await future, request_manager)
+                finally:
+                    restore()
+
+        asyncio.run(run_test())
 
     def test_start_smg_sidecars_when_ready_starts_both_sidecars(self):
         request_manager = _RequestManager()
-        module = ModuleType("fake_smg_module")
-        module.request_manager = request_manager
 
         started = {}
-
-        async def fake_wait_for_request_manager(_module, timeout_s=120.0):
-            self.assertIs(_module, module)
-            self.assertEqual(timeout_s, 120.0)
-            return request_manager
 
         async def fake_start_sidecar_server(host, port, app):
             started["sidecar"] = (host, port, app)
@@ -49,29 +52,30 @@ class TestGrpcServerCompat(CustomTestCase):
             started["tli"] = (source, server_args, request_handler)
             return SimpleNamespace(stop=lambda grace=0: None)
 
-        with patch(
-            "sglang.srt.entrypoints.grpc_server._wait_for_request_manager",
-            fake_wait_for_request_manager,
-        ), patch(
-            "sglang.srt.entrypoints.grpc_server._start_sidecar_server",
-            fake_start_sidecar_server,
-        ), patch(
-            "sglang.srt.entrypoints.grpc_server.start_tli_draft_service",
-            fake_start_tli_draft_service,
-        ):
-            sidecar_runner, tli_runner = asyncio.run(
-                _start_smg_sidecars_when_ready(
+        async def run_test():
+            request_manager_future = asyncio.get_running_loop().create_future()
+            request_manager_future.set_result(request_manager)
+
+            with patch(
+                "sglang.srt.entrypoints.grpc_server._start_sidecar_server",
+                fake_start_sidecar_server,
+            ), patch(
+                "sglang.srt.entrypoints.grpc_server.start_tli_draft_service",
+                fake_start_tli_draft_service,
+            ):
+                return await _start_smg_sidecars_when_ready(
                     SimpleNamespace(
                         host="127.0.0.1",
                         tli_disaggregation_role="draft",
                         tli_service_port=32001,
                     ),
-                    module,
+                    request_manager_future,
                     SimpleNamespace(router=SimpleNamespace(add_get=lambda *args, **kwargs: None, add_post=lambda *args, **kwargs: None)),
                     "127.0.0.1",
                     30001,
                 )
-            )
+
+        sidecar_runner, tli_runner = asyncio.run(run_test())
 
         self.assertIn("sidecar", started)
         self.assertIn("tli", started)

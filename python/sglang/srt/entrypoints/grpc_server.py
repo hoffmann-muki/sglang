@@ -1,11 +1,11 @@
 """Thin gRPC server wrapper — delegates to smg-grpc-servicer package.
 
 The wrapper keeps the serving node on the gRPC launch path and starts the TLI
-DraftForward sidecar independently once the request manager becomes visible in
-the launcher runtime.
+DraftForward sidecar from an explicit request-manager construction hook.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -20,6 +20,14 @@ from sglang.srt.speculative.tli_disaggregation import (
 )
 
 logger = logging.getLogger(__name__)
+
+_REQUEST_MANAGER_CLASS_NAMES = ("GrpcRequestManager", "RequestManager")
+_REQUEST_MANAGER_MODULE_NAMES = (
+    "smg_grpc_servicer.sglang.server",
+    "smg_grpc_servicer.sglang.servicer",
+    "smg_grpc_servicer.sglang.grpc_request_manager",
+    "smg_grpc_servicer.sglang.request_manager",
+)
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -152,73 +160,85 @@ def _add_admin_routes(app, request_manager):
     app.router.add_post("/stop_profile", stop_profile_handler)
 
 
-def _request_manager_candidate(obj, seen: set[int]) -> object | None:
-    if obj is None:
-        return None
-    obj_id = id(obj)
-    if obj_id in seen:
-        return None
-    seen.add(obj_id)
+def _iter_request_manager_classes(smg_grpc_server):
+    """Yield concrete request-manager classes that can be wrapped explicitly."""
 
-    if hasattr(obj, "send_communicator_req"):
-        return obj
-
-    for attr_name in (
-        "request_manager",
-        "_request_manager",
-        "server_state",
-        "state",
-        "app",
-        "servicer",
-    ):
-        if hasattr(obj, attr_name):
-            candidate = _request_manager_candidate(getattr(obj, attr_name), seen)
-            if candidate is not None:
-                return candidate
-    return None
-
-
-def _discover_request_manager(module) -> object | None:
     seen: set[int] = set()
-    for value in vars(module).values():
-        candidate = _request_manager_candidate(value, seen)
-        if candidate is not None:
-            return candidate
-    return None
+    seen_classes: set[int] = set()
+    search_modules = [smg_grpc_server]
+    for module_name in _REQUEST_MANAGER_MODULE_NAMES:
+        module = getattr(smg_grpc_server, module_name.rsplit(".", 1)[-1], None)
+        if inspect.ismodule(module):
+            search_modules.append(module)
+        try:
+            imported_module = __import__(module_name, fromlist=["*"])
+        except ImportError:
+            continue
+        if inspect.ismodule(imported_module):
+            search_modules.append(imported_module)
+
+    for module in search_modules:
+        module_id = id(module)
+        if module_id in seen:
+            continue
+        seen.add(module_id)
+
+        for attr_name in _REQUEST_MANAGER_CLASS_NAMES:
+            candidate = getattr(module, attr_name, None)
+            if inspect.isclass(candidate) and id(candidate) not in seen_classes:
+                seen_classes.add(id(candidate))
+                yield candidate
 
 
-async def _wait_for_request_manager(module, timeout_s: float = 120.0):
-    deadline = time.monotonic() + timeout_s
-    while True:
-        request_manager = _discover_request_manager(module)
-        if request_manager is not None:
-            return request_manager
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                "Timed out waiting for the gRPC request manager to become "
-                "visible so the TLI DraftForward sidecar can start."
-            )
-        await asyncio.sleep(0.2)
+def _install_request_manager_capture(smg_grpc_server):
+    """Wrap the request-manager constructor so we get the live instance directly."""
+
+    loop = asyncio.get_running_loop()
+    request_manager_future = loop.create_future()
+    patched_classes = []
+
+    for request_manager_cls in _iter_request_manager_classes(smg_grpc_server):
+        original_init = request_manager_cls.__init__
+
+        def _wrapped_init(self, *args, __original_init=original_init, **kwargs):
+            __original_init(self, *args, **kwargs)
+            if not request_manager_future.done():
+                request_manager_future.set_result(self)
+
+        request_manager_cls.__init__ = _wrapped_init
+        patched_classes.append((request_manager_cls, original_init))
+
+    if not patched_classes:
+        raise RuntimeError(
+            "Unable to locate a gRPC request-manager class to capture explicitly. "
+            "TLI draft startup requires smg-grpc-servicer to expose one of: "
+            f"{', '.join(_REQUEST_MANAGER_CLASS_NAMES)}."
+        )
+
+    def _restore_request_manager_capture():
+        for request_manager_cls, original_init in patched_classes:
+            request_manager_cls.__init__ = original_init
+
+    return request_manager_future, _restore_request_manager_capture
 
 
 async def _start_smg_sidecars_when_ready(
     server_args,
-    serve_grpc_module,
+    request_manager_future,
     sidecar_app,
     sidecar_host,
     sidecar_port,
 ):
     try:
-        request_manager = await _wait_for_request_manager(serve_grpc_module)
-    except TimeoutError:
-        if tli_draft_service_enabled(server_args):
-            raise
-        logger.warning(
-            "Could not locate the gRPC request manager; skipping the HTTP "
-            "sidecar for this non-TLI launch."
+        request_manager = await asyncio.wait_for(
+            request_manager_future, timeout=120.0
         )
-        return None, None
-    logger.info("Discovered gRPC request manager; starting gRPC sidecar.")
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            "Timed out waiting for the gRPC request-manager constructor to "
+            "run so the sidecar can start."
+        ) from exc
+    logger.info("Captured gRPC request manager; starting gRPC sidecar.")
     try:
         _add_admin_routes(sidecar_app, request_manager)
     except Exception as e:
@@ -293,6 +313,7 @@ async def serve_grpc(server_args, model_info=None):
     grpc_task = None
     tli_runner = None
     sidecar_task = None
+    restore_request_manager_capture = None
     sidecar_port = (
         server_args.grpc_http_sidecar_port
         if server_args.grpc_http_sidecar_port is not None
@@ -336,13 +357,16 @@ async def serve_grpc(server_args, model_info=None):
             tli_runner = tli_result
 
     try:
+        request_manager_future, restore_request_manager_capture = (
+            _install_request_manager_capture(smg_grpc_server)
+        )
         grpc_task = asyncio.create_task(
             smg_grpc_server.serve_grpc(server_args, model_info=model_info)
         )
         sidecar_task = asyncio.create_task(
             _start_smg_sidecars_when_ready(
                 server_args,
-                smg_grpc_server,
+                request_manager_future,
                 sidecar_app,
                 server_args.host,
                 sidecar_port,
@@ -374,6 +398,11 @@ async def serve_grpc(server_args, model_info=None):
         else:
             await grpc_task
     finally:
+        if restore_request_manager_capture is not None:
+            try:
+                restore_request_manager_capture()
+            except Exception:
+                logger.exception("Failed to restore request-manager constructor.")
         if grpc_task is not None and not grpc_task.done():
             grpc_task.cancel()
             try:
