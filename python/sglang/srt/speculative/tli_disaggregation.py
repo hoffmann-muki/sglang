@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -66,6 +67,23 @@ def _request_source_candidate(obj, seen: set[int]):
                 return candidate
         return None
 
+    if inspect.ismodule(obj):
+        for attr_name in (
+            "request_manager",
+            "grpc_request_manager",
+            "_request_manager",
+            "servicer",
+            "scheduler",
+            "tokenizer_manager",
+            "manager",
+            "communicator",
+        ):
+            if hasattr(obj, attr_name):
+                candidate = _request_source_candidate(getattr(obj, attr_name), seen)
+                if candidate is not None:
+                    return candidate
+        return None
+
     for attr_name in (
         "scheduler",
         "tokenizer_manager",
@@ -89,7 +107,7 @@ def _discover_request_source_communicator(request_source):
     if candidate is None:
         raise RuntimeError(
             "TLI draft request source does not expose a compatible communicator. "
-            "Expected a scheduler/tokenizer_manager/request_manager object with "
+            "Expected a request_manager/module/object with "
             "handle_tli_draft_forward(...), tli_draft_forward_communicator, or "
             "send_communicator_req(...)."
         )

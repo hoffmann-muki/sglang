@@ -217,17 +217,17 @@ class TestTLIDisaggregation(CustomTestCase):
             draft_token_ids=torch.tensor([0, 1]),
         )
 
-        async def handle_tli_draft_forward(req):
+        async def communicator(req):
             self.assertEqual(req.request.request_id, request.request_id)
-            return _FakeSchedulerResult(success=True, response=expected, tp_rank=0)
+            return [
+                _FakeSchedulerResult(success=True, response=expected, tp_rank=0)
+            ]
 
         nested_source = (
             SimpleNamespace(),
             SimpleNamespace(
-                state=SimpleNamespace(
-                    scheduler=SimpleNamespace(
-                        handle_tli_draft_forward=handle_tli_draft_forward
-                    )
+                request_manager=SimpleNamespace(
+                    tli_draft_forward_communicator=communicator
                 )
             ),
         )
@@ -255,9 +255,11 @@ class TestTLIDisaggregation(CustomTestCase):
             draft_token_ids=torch.tensor([0, 1]),
         )
 
-        async def handle_tli_draft_forward(req):
+        async def communicator(req):
             self.assertEqual(req.request.request_id, request.request_id)
-            return _FakeSchedulerResult(success=True, response=expected, tp_rank=0)
+            return [
+                _FakeSchedulerResult(success=True, response=expected, tp_rank=0)
+            ]
 
         async def build_source():
             fut = asyncio.get_running_loop().create_future()
@@ -265,10 +267,8 @@ class TestTLIDisaggregation(CustomTestCase):
             return (
                 fut,
                 SimpleNamespace(
-                    state=SimpleNamespace(
-                        scheduler=SimpleNamespace(
-                            handle_tli_draft_forward=handle_tli_draft_forward
-                        )
+                    request_manager=SimpleNamespace(
+                        tli_draft_forward_communicator=communicator
                     )
                 ),
             )

@@ -28,7 +28,6 @@ _REQUEST_MANAGER_MODULE_NAMES = (
     "smg_grpc_servicer.sglang.grpc_request_manager",
     "smg_grpc_servicer.sglang.request_manager",
 )
-_SCHEDULER_CLASS_NAMES = ("Scheduler",)
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -223,33 +222,9 @@ def _install_request_manager_capture(smg_grpc_server):
     return request_manager_future, _restore_request_manager_capture
 
 
-def _install_scheduler_capture():
-    """Wrap the draft scheduler constructor so we can pass the real scheduler."""
-
-    from sglang.srt.managers import scheduler as sglang_scheduler_module
-
-    loop = asyncio.get_running_loop()
-    scheduler_future = loop.create_future()
-    original_init = sglang_scheduler_module.Scheduler.__init__
-
-    def _wrapped_init(self, *args, __original_init=original_init, **kwargs):
-        __original_init(self, *args, **kwargs)
-        if not scheduler_future.done() and getattr(
-            getattr(self, "server_args", None), "tli_disaggregation_role", "none"
-        ) == "draft":
-            scheduler_future.set_result(self)
-
-    sglang_scheduler_module.Scheduler.__init__ = _wrapped_init
-
-    def _restore_scheduler_capture():
-        sglang_scheduler_module.Scheduler.__init__ = original_init
-
-    return scheduler_future, _restore_scheduler_capture
-
-
 async def _start_smg_sidecars_when_ready(
     server_args,
-    scheduler_future,
+    request_source_roots,
     request_manager_future,
     sidecar_app,
     sidecar_host,
@@ -295,19 +270,11 @@ async def _start_smg_sidecars_when_ready(
         )
 
     try:
-        scheduler = None
         if tli_draft_service_enabled(server_args):
             try:
-                scheduler = await asyncio.wait_for(scheduler_future, timeout=120.0)
-            except asyncio.TimeoutError as exc:
-                raise TimeoutError(
-                    "Timed out waiting for the draft scheduler to become visible "
-                    "so the TLI DraftForward sidecar can start."
-                ) from exc
-
-        if tli_draft_service_enabled(server_args):
-            try:
-                tli_runner = await start_tli_draft_service(scheduler, server_args)
+                tli_runner = await start_tli_draft_service(
+                    request_source_roots, server_args
+                )
             except Exception:
                 if sidecar_runner is not None:
                     try:
@@ -348,7 +315,6 @@ async def serve_grpc(server_args, model_info=None):
     tli_runner = None
     sidecar_task = None
     restore_request_manager_capture = None
-    restore_scheduler_capture = None
     sidecar_port = (
         server_args.grpc_http_sidecar_port
         if server_args.grpc_http_sidecar_port is not None
@@ -395,14 +361,13 @@ async def serve_grpc(server_args, model_info=None):
         request_manager_future, restore_request_manager_capture = (
             _install_request_manager_capture(smg_grpc_server)
         )
-        scheduler_future, restore_scheduler_capture = _install_scheduler_capture()
         grpc_task = asyncio.create_task(
             smg_grpc_server.serve_grpc(server_args, model_info=model_info)
         )
         sidecar_task = asyncio.create_task(
             _start_smg_sidecars_when_ready(
                 server_args,
-                scheduler_future,
+                (request_manager_future, smg_grpc_server),
                 request_manager_future,
                 sidecar_app,
                 server_args.host,
@@ -440,11 +405,6 @@ async def serve_grpc(server_args, model_info=None):
                 restore_request_manager_capture()
             except Exception:
                 logger.exception("Failed to restore request-manager constructor.")
-        if restore_scheduler_capture is not None:
-            try:
-                restore_scheduler_capture()
-            except Exception:
-                logger.exception("Failed to restore scheduler constructor.")
         if grpc_task is not None and not grpc_task.done():
             grpc_task.cancel()
             try:
