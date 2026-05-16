@@ -7,6 +7,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.speculative import tli_disaggregation
+from sglang.srt.speculative.tli_draft_executor import (
+    TLIDraftRequestState,
+    TLIDraftSchedulerExecutor,
+)
 from sglang.srt.speculative.tli_disaggregation import (
     TLIDraftExecutionNotWiredError,
     start_tli_draft_service,
@@ -199,6 +203,48 @@ class TestTLIDisaggregation(CustomTestCase):
         self.assertTrue(torch.equal(response.parent_list, expected.parent_list))
         self.assertTrue(torch.equal(response.top_scores_index, expected.top_scores_index))
         self.assertTrue(torch.equal(response.draft_token_ids, expected.draft_token_ids))
+
+    def test_tli_draft_executor_reports_held_state_counts(self):
+        executor = TLIDraftSchedulerExecutor.__new__(TLIDraftSchedulerExecutor)
+        executor.server_args = SimpleNamespace(page_size=8)
+        executor.tree_cache = SimpleNamespace(supports_swa=lambda: True)
+        executor.states = {
+            (
+                "req-1",
+                0,
+            ): TLIDraftRequestState(
+                request_id="req-1",
+                tp_rank=0,
+                req=SimpleNamespace(
+                    req_pool_idx=3,
+                    kv_allocated_len=17,
+                    cache_protected_len=5,
+                    swa_evicted_seqlen=7,
+                ),
+                seq_len=17,
+            ),
+            (
+                "req-2",
+                0,
+            ): TLIDraftRequestState(
+                request_id="req-2",
+                tp_rank=0,
+                req=SimpleNamespace(
+                    req_pool_idx=9,
+                    kv_allocated_len=8,
+                    cache_protected_len=0,
+                    swa_evicted_seqlen=2,
+                ),
+                seq_len=8,
+            ),
+        }
+
+        self.assertEqual(executor.held_full_tokens(), 27)
+        self.assertEqual(executor.held_full_tokens({3}), 8)
+        self.assertEqual(executor.held_swa_tokens(), 23)
+        self.assertEqual(executor.held_swa_tokens({3}), 6)
+        self.assertEqual(executor.held_req_count(), 2)
+        self.assertEqual(executor.held_req_count({3}), 1)
 
     def test_start_tli_draft_service_starts_sidecar(self):
         fake_server = _FakeServer(

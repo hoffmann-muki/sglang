@@ -36,6 +36,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top_k_1
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils import next_power_of_2
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -136,6 +137,53 @@ class TLIDraftSchedulerExecutor:
             for state in self.states.values()
             if state.req.req_pool_idx is not None
         }
+
+    def held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Tokens intentionally retained by draft-owned request states.
+
+        These are not part of the tree cache's session slot accounting, so the
+        scheduler runtime checker needs a direct view of them.
+        """
+        total = 0
+        for state in self.states.values():
+            req = state.req
+            in_batch = (
+                active_pool_idxs is not None and req.req_pool_idx in active_pool_idxs
+            )
+            if req.req_pool_idx is None or in_batch:
+                continue
+            allocated = ceil_align(req.kv_allocated_len, self.server_args.page_size)
+            total += allocated - req.cache_protected_len
+        return total
+
+    def held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        """SWA tokens intentionally retained by draft-owned request states."""
+        if not self.tree_cache.supports_swa():
+            return 0
+
+        total = 0
+        for state in self.states.values():
+            req = state.req
+            in_batch = (
+                active_pool_idxs is not None and req.req_pool_idx in active_pool_idxs
+            )
+            if req.req_pool_idx is None or in_batch:
+                continue
+            allocated = ceil_align(req.kv_allocated_len, self.server_args.page_size)
+            total += allocated - max(req.cache_protected_len, req.swa_evicted_seqlen)
+        return total
+
+    def held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Req slots intentionally retained by draft-owned request states."""
+        total = 0
+        for state in self.states.values():
+            req = state.req
+            in_batch = (
+                active_pool_idxs is not None and req.req_pool_idx in active_pool_idxs
+            )
+            if req.req_pool_idx is not None and not in_batch:
+                total += 1
+        return total
 
     def _validate_request(self, request: TLIDraftRequest) -> None:
         if request.tp_rank != self.tp_rank:

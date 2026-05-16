@@ -160,17 +160,54 @@ class SchedulerRuntimeCheckerMixin:
             idxs.update(tli_draft_executor.active_req_pool_idxs())
         return idxs
 
+    def _tli_draft_executor_held_tokens(self: Scheduler) -> int:
+        tli_draft_executor = getattr(self, "tli_draft_executor", None)
+        if tli_draft_executor is None or not hasattr(
+            tli_draft_executor, "held_full_tokens"
+        ):
+            return 0
+        return tli_draft_executor.held_full_tokens(self._active_pool_idxs())
+
+    def _tli_draft_executor_held_swa_tokens(self: Scheduler) -> int:
+        tli_draft_executor = getattr(self, "tli_draft_executor", None)
+        if tli_draft_executor is None or not hasattr(
+            tli_draft_executor, "held_swa_tokens"
+        ):
+            return 0
+        return tli_draft_executor.held_swa_tokens(self._active_pool_idxs())
+
+    def _tli_draft_executor_held_req_count(self: Scheduler) -> int:
+        tli_draft_executor = getattr(self, "tli_draft_executor", None)
+        if tli_draft_executor is None or not hasattr(
+            tli_draft_executor, "held_req_count"
+        ):
+            return 0
+        return tli_draft_executor.held_req_count(self._active_pool_idxs())
+
     def _session_held_tokens(self: Scheduler) -> int:
-        return self.tree_cache.session_held_tokens(self._active_pool_idxs())
+        """Tokens intentionally retained outside the active batch.
+
+        This includes streaming-session slots plus draft-executor-held request
+        states that are kept alive across TLI RPC boundaries.
+        """
+        return self.tree_cache.session_held_tokens(self._active_pool_idxs()) + (
+            self._tli_draft_executor_held_tokens()
+        )
 
     def _session_held_full_tokens(self: Scheduler) -> int:
-        return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
+        return self.tree_cache.session_held_full_tokens(self._active_pool_idxs()) + (
+            self._tli_draft_executor_held_tokens()
+        )
 
     def _session_held_swa_tokens(self: Scheduler) -> int:
-        return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
+        return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs()) + (
+            self._tli_draft_executor_held_swa_tokens()
+        )
 
     def _session_held_req_count(self: Scheduler) -> int:
-        return self.tree_cache.session_held_req_count()
+        return self.tree_cache.session_held_req_count(
+            self._active_pool_idxs()
+        ) + self._tli_draft_executor_held_req_count()
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:

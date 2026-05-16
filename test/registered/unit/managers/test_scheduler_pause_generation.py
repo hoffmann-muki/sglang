@@ -146,6 +146,25 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         self.assertEqual(Scheduler._active_pool_idxs(scheduler), {3, 7})
 
+    def test_session_held_counts_include_tli_draft_executor_state(self):
+        scheduler = self._new_scheduler()
+        scheduler.last_batch = None
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.tree_cache.session_held_tokens.return_value = 11
+        scheduler.tree_cache.session_held_full_tokens.return_value = 11
+        scheduler.tree_cache.session_held_swa_tokens.return_value = 5
+        scheduler.tree_cache.session_held_req_count.return_value = 2
+        scheduler.tli_draft_executor = MagicMock()
+        scheduler.tli_draft_executor.active_req_pool_idxs.return_value = {3}
+        scheduler.tli_draft_executor.held_full_tokens.return_value = 7
+        scheduler.tli_draft_executor.held_swa_tokens.return_value = 4
+        scheduler.tli_draft_executor.held_req_count.return_value = 1
+
+        self.assertEqual(Scheduler._session_held_tokens(scheduler), 18)
+        self.assertEqual(Scheduler._session_held_full_tokens(scheduler), 18)
+        self.assertEqual(Scheduler._session_held_swa_tokens(scheduler), 9)
+        self.assertEqual(Scheduler._session_held_req_count(scheduler), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
