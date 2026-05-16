@@ -224,6 +224,7 @@ def _install_request_manager_capture(smg_grpc_server):
 
 async def _start_smg_sidecars_when_ready(
     server_args,
+    smg_grpc_server,
     request_manager_future,
     sidecar_app,
     sidecar_host,
@@ -272,7 +273,7 @@ async def _start_smg_sidecars_when_ready(
         if tli_draft_service_enabled(server_args):
             try:
                 tli_runner = await start_tli_draft_service(
-                    request_manager, server_args
+                    (request_manager, smg_grpc_server), server_args
                 )
             except Exception:
                 if sidecar_runner is not None:
@@ -366,6 +367,7 @@ async def serve_grpc(server_args, model_info=None):
         sidecar_task = asyncio.create_task(
             _start_smg_sidecars_when_ready(
                 server_args,
+                smg_grpc_server,
                 request_manager_future,
                 sidecar_app,
                 server_args.host,

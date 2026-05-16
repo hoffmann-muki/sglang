@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from collections.abc import Iterable, Mapping
 from typing import Awaitable, Callable
 
 from sglang.srt.managers.io_struct import TLIDraftForwardReqInput
@@ -57,20 +58,33 @@ def _request_source_candidate(obj, seen: set[int]):
     if hasattr(obj, "send_communicator_req"):
         return obj
 
-    for attr_name in (
-        "request_manager",
-        "_request_manager",
-        "server_state",
-        "state",
-        "scheduler",
-        "tokenizer_manager",
-        "manager",
-        "app",
-        "servicer",
-        "communicator",
-    ):
-        if hasattr(obj, attr_name):
-            candidate = _request_source_candidate(getattr(obj, attr_name), seen)
+    if isinstance(obj, Mapping):
+        for value in obj.values():
+            candidate = _request_source_candidate(value, seen)
+            if candidate is not None:
+                return candidate
+        return None
+
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        for value in obj:
+            candidate = _request_source_candidate(value, seen)
+            if candidate is not None:
+                return candidate
+        return None
+
+    if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes, bytearray)):
+        try:
+            for value in obj:
+                candidate = _request_source_candidate(value, seen)
+                if candidate is not None:
+                    return candidate
+        except TypeError:
+            pass
+
+    obj_vars = getattr(obj, "__dict__", None)
+    if obj_vars:
+        for value in obj_vars.values():
+            candidate = _request_source_candidate(value, seen)
             if candidate is not None:
                 return candidate
     return None
