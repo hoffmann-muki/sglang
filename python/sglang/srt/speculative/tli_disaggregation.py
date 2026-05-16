@@ -172,22 +172,7 @@ async def _draft_forward_via_request_source(
     request: TLIDraftRequest,
     timeout: float | None = None,
 ) -> TLIDraftResponse:
-    logger.info(
-        "[TLI-DEBUG] draft RPC enter request_id=%r mode=%s tp_rank=%s tp_size=%s "
-        "timeout=%s source_type=%s",
-        request.request_id,
-        request.mode,
-        request.tp_rank,
-        request.tp_size,
-        timeout,
-        type(request_source).__name__,
-    )
     communicator = _discover_request_source_communicator(request_source)
-    logger.info(
-        "[TLI-DEBUG] draft RPC resolved communicator=%s from source_type=%s",
-        type(communicator).__name__,
-        type(request_source).__name__,
-    )
     if hasattr(communicator, "handle_tli_draft_forward"):
         results = await communicator.handle_tli_draft_forward(
             TLIDraftForwardReqInput(request=request)
@@ -208,24 +193,11 @@ async def _draft_forward_via_request_source(
     if not results:
         raise RuntimeError("TLI DraftForward received no scheduler response.")
 
-    logger.info(
-        "[TLI-DEBUG] draft RPC scheduler response request_id=%r results=%s",
-        request.request_id,
-        [
-            (
-                getattr(result, "tp_rank", None),
-                getattr(result, "success", None),
-                getattr(result, "response", None) is not None,
-            )
-            for result in results
-        ],
-    )
-
     failures = [result for result in results if not result.success]
     if failures:
         messages = " | ".join(result.message for result in failures)
         logger.error(
-            "[TLI-DEBUG] draft RPC failed request_id=%r messages=%s",
+            "draft RPC failed request_id=%r messages=%s",
             request.request_id,
             messages,
         )
@@ -247,12 +219,6 @@ async def _draft_forward_via_request_source(
             "TLI DraftForward scheduler response for the requested TP rank did not "
             f"include a payload (tp_rank={request.tp_rank})."
         )
-    logger.info(
-        "[TLI-DEBUG] draft RPC exit request_id=%r mode=%s tp_rank=%s",
-        request.request_id,
-        request.mode,
-        request.tp_rank,
-    )
     return response
 
 

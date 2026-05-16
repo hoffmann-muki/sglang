@@ -13,21 +13,19 @@ import time
 import uuid
 from types import MethodType
 
-from aiohttp import web
 import zmq
-
+from aiohttp import web
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
     TLIDraftForwardReqInput,
-    TLIDraftForwardReqOutput,
 )
-from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.speculative.tli_disaggregation import (
     start_tli_draft_service,
     tli_draft_service_enabled,
 )
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.network import get_zmq_socket
 
 logger = logging.getLogger(__name__)
 
@@ -262,24 +260,11 @@ def _install_tli_draft_forward_bridge(request_manager):
     request_manager._tli_draft_forward_reply_socket = reply_socket
 
     async def _poll_tli_draft_forward_replies():
-        logger.info(
-            "[TLI-DEBUG] draft reply poller enter reply_ipc_name=%s",
-            reply_ipc_name,
-        )
         try:
             while True:
                 recv_obj = await reply_socket.recv_pyobj()
                 rid = getattr(recv_obj, "rid", None)
                 pending = pending_futures.pop(rid, None)
-                logger.info(
-                    "[TLI-DEBUG] draft reply poller got response rid=%r type=%s "
-                    "success=%s has_payload=%s pending=%s",
-                    rid,
-                    type(recv_obj).__name__,
-                    getattr(recv_obj, "success", None),
-                    getattr(recv_obj, "response", None) is not None,
-                    pending is not None,
-                )
                 if pending is None:
                     logger.warning(
                         "Dropping orphan TLI DraftForward response with rid=%r.",
@@ -288,7 +273,6 @@ def _install_tli_draft_forward_bridge(request_manager):
                 elif not pending.done():
                     pending.set_result(recv_obj)
         except asyncio.CancelledError:
-            logger.info("[TLI-DEBUG] draft reply poller cancelled")
             raise
 
     reply_poller_task = asyncio.create_task(_poll_tli_draft_forward_replies())
@@ -305,54 +289,15 @@ def _install_tli_draft_forward_bridge(request_manager):
         future = loop.create_future()
         pending_futures[rid] = future
         try:
-            logger.info(
-                "[TLI-DEBUG] draft request-manager bridge send enter rid=%r "
-                "request_id=%r mode=%s tp_rank=%s pending=%d",
-                rid,
-                getattr(recv_req.request, "request_id", None),
-                getattr(recv_req.request, "mode", None),
-                getattr(recv_req.request, "tp_rank", None),
-                len(pending_futures),
-            )
             self.send_to_scheduler.send_pyobj(recv_req)
-            logger.info(
-                "[TLI-DEBUG] draft request-manager bridge send exit rid=%r "
-                "pending=%d",
-                rid,
-                len(pending_futures),
-            )
             timeout = getattr(self.server_args, "tli_rpc_timeout", None)
             if timeout is not None:
-                logger.info(
-                    "[TLI-DEBUG] draft request-manager bridge await enter rid=%r "
-                    "timeout=%s",
-                    rid,
-                    timeout,
-                )
                 result = await asyncio.wait_for(future, timeout=timeout)
             else:
-                logger.info(
-                    "[TLI-DEBUG] draft request-manager bridge await enter rid=%r "
-                    "timeout=None",
-                    rid,
-                )
                 result = await future
-            logger.info(
-                "[TLI-DEBUG] draft request-manager bridge await exit rid=%r "
-                "result_type=%s success=%s has_payload=%s",
-                rid,
-                type(result).__name__,
-                getattr(result, "success", None),
-                getattr(result, "response", None) is not None,
-            )
             return result
         finally:
             pending_futures.pop(rid, None)
-            logger.info(
-                "[TLI-DEBUG] draft request-manager bridge cleanup rid=%r pending=%d",
-                rid,
-                len(pending_futures),
-            )
 
     request_manager.handle_tli_draft_forward = MethodType(
         _handle_tli_draft_forward, request_manager
@@ -366,9 +311,7 @@ def _install_tli_draft_forward_bridge(request_manager):
             if hasattr(request_manager, "handle_tli_draft_forward"):
                 delattr(request_manager, "handle_tli_draft_forward")
         else:
-            request_manager.handle_tli_draft_forward = (
-                original_handle_tli_draft_forward
-            )
+            request_manager.handle_tli_draft_forward = original_handle_tli_draft_forward
         if original_tli_draft_forward_communicator is None:
             if hasattr(request_manager, "tli_draft_forward_communicator"):
                 delattr(request_manager, "tli_draft_forward_communicator")
@@ -405,9 +348,7 @@ async def _start_smg_sidecars_when_ready(
     restore_tli_draft_forward_bridge = None
     tli_runner = None
     try:
-        request_manager = await asyncio.wait_for(
-            request_manager_future, timeout=120.0
-        )
+        request_manager = await asyncio.wait_for(request_manager_future, timeout=120.0)
     except asyncio.TimeoutError as exc:
         raise TimeoutError(
             "Timed out waiting for the gRPC request-manager constructor to "
@@ -453,9 +394,7 @@ async def _start_smg_sidecars_when_ready(
                     restore_tli_draft_forward_bridge = (
                         _install_tli_draft_forward_bridge(request_manager)
                     )
-                tli_runner = await start_tli_draft_service(
-                    request_manager, server_args
-                )
+                tli_runner = await start_tli_draft_service(request_manager, server_args)
             except Exception:
                 if restore_tli_draft_forward_bridge is not None:
                     try:
@@ -485,13 +424,14 @@ async def _start_smg_sidecars_when_ready(
             try:
                 restore_tli_draft_forward_bridge()
             except Exception:
-                logger.exception("Failed to restore TLI draft bridge after cancellation.")
+                logger.exception(
+                    "Failed to restore TLI draft bridge after cancellation."
+                )
         raise
 
 
 async def serve_grpc(server_args, model_info=None):
-    """Start the standalone gRPC server with integrated scheduler.
-    """
+    """Start the standalone gRPC server with integrated scheduler."""
     try:
         from smg_grpc_servicer.sglang import server as smg_grpc_server
     except ImportError as e:

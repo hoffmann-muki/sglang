@@ -3302,23 +3302,7 @@ class Scheduler(
         try:
             response_rid = recv_req.rid or getattr(recv_req.request, "request_id", "")
             local_tp_rank = getattr(self.tp_worker, "tp_rank", recv_req.request.tp_rank)
-            logger.info(
-                "[TLI-DEBUG] scheduler TLI handle enter rid=%r request_id=%r "
-                "mode=%s request_tp_rank=%s local_tp_rank=%s",
-                response_rid,
-                getattr(recv_req.request, "request_id", None),
-                getattr(recv_req.request, "mode", None),
-                recv_req.request.tp_rank,
-                local_tp_rank,
-            )
             if local_tp_rank != recv_req.request.tp_rank:
-                logger.info(
-                    "[TLI-DEBUG] scheduler TLI handle bypass rid=%r local_tp_rank=%s "
-                    "request_tp_rank=%s",
-                    response_rid,
-                    local_tp_rank,
-                    recv_req.request.tp_rank,
-                )
                 output = TLIDraftForwardReqOutput(
                     success=True,
                     message="",
@@ -3333,17 +3317,7 @@ class Scheduler(
                 )
 
                 self.tli_draft_executor = TLIDraftSchedulerExecutor(self)
-            logger.info(
-                "[TLI-DEBUG] scheduler TLI handle executor enter rid=%r has_executor=%s",
-                response_rid,
-                hasattr(self, "tli_draft_executor"),
-            )
             response = self.tli_draft_executor.handle(recv_req.request)
-            logger.info(
-                "[TLI-DEBUG] scheduler TLI handle executor exit rid=%r response_type=%s",
-                response_rid,
-                type(response).__name__,
-            )
             output = TLIDraftForwardReqOutput(
                 success=True,
                 message="",
@@ -3354,12 +3328,6 @@ class Scheduler(
             return self._send_tli_draft_forward_reply(output, recv_req)
         except Exception as exc:
             logger.exception("TLI draft forward failed: %s", exc)
-            logger.info(
-                "[TLI-DEBUG] scheduler TLI handle failure rid=%r request_id=%r error=%s",
-                getattr(recv_req, "rid", ""),
-                getattr(recv_req.request, "request_id", None),
-                exc,
-            )
             output = TLIDraftForwardReqOutput(
                 success=False,
                 message=str(exc),
@@ -3389,17 +3357,7 @@ class Scheduler(
             socket = get_zmq_socket(context, zmq.PUSH, reply_ipc_name, bind=False)
             self._tli_draft_forward_reply_sockets[reply_ipc_name] = socket
 
-        logger.info(
-            "[TLI-DEBUG] scheduler TLI direct reply send enter rid=%r reply_ipc=%s",
-            getattr(output, "rid", None),
-            reply_ipc_name,
-        )
         socket.send_pyobj(output)
-        logger.info(
-            "[TLI-DEBUG] scheduler TLI direct reply send exit rid=%r reply_ipc=%s",
-            getattr(output, "rid", None),
-            reply_ipc_name,
-        )
         return None
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
@@ -3787,17 +3745,6 @@ class SenderWrapper:
         if self.socket is None:
             return
 
-        is_tli_output = isinstance(output, TLIDraftForwardReqOutput)
-        if is_tli_output:
-            logger.info(
-                "[TLI-DEBUG] scheduler sender send_output enter type=%s rid=%r "
-                "recv_type=%s http_worker_ipc=%r",
-                type(output).__name__,
-                getattr(output, "rid", None),
-                type(recv_obj).__name__ if recv_obj is not None else None,
-                getattr(output, "http_worker_ipc", None),
-            )
-
         if (
             isinstance(recv_obj, BaseReq)
             and recv_obj.http_worker_ipc is not None
@@ -3807,12 +3754,6 @@ class SenderWrapper:
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
         self.socket.send_pyobj(output)
-        if is_tli_output:
-            logger.info(
-                "[TLI-DEBUG] scheduler sender send_output exit type=%s rid=%r",
-                type(output).__name__,
-                getattr(output, "rid", None),
-            )
 
 
 def dispatch_event_loop(scheduler: Scheduler):
