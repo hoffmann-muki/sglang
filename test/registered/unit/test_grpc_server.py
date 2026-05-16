@@ -46,6 +46,7 @@ class TestGrpcServerCompat(CustomTestCase):
 
     def test_start_smg_sidecars_when_ready_starts_both_sidecars(self):
         request_manager = SimpleNamespace(scheduler=_Scheduler())
+        scheduler = _Scheduler()
 
         started = {}
 
@@ -60,7 +61,8 @@ class TestGrpcServerCompat(CustomTestCase):
         async def run_test():
             request_manager_future = asyncio.get_running_loop().create_future()
             request_manager_future.set_result(request_manager)
-            smg_grpc_server = SimpleNamespace(name="smg_grpc_server")
+            scheduler_future = asyncio.get_running_loop().create_future()
+            scheduler_future.set_result(scheduler)
 
             with patch(
                 "sglang.srt.entrypoints.grpc_server._start_sidecar_server",
@@ -75,7 +77,7 @@ class TestGrpcServerCompat(CustomTestCase):
                         tli_disaggregation_role="draft",
                         tli_service_port=32001,
                     ),
-                    smg_grpc_server,
+                    scheduler_future,
                     request_manager_future,
                     SimpleNamespace(router=SimpleNamespace(add_get=lambda *args, **kwargs: None, add_post=lambda *args, **kwargs: None)),
                     "127.0.0.1",
@@ -88,7 +90,7 @@ class TestGrpcServerCompat(CustomTestCase):
         self.assertIn("tli", started)
         self.assertEqual(started["sidecar"][0], "127.0.0.1")
         self.assertEqual(started["sidecar"][1], 30001)
-        self.assertIs(started["tli"][0], request_manager)
+        self.assertIs(started["tli"][0], scheduler)
         self.assertIsNotNone(sidecar_runner)
         self.assertIsNotNone(tli_runner)
 
