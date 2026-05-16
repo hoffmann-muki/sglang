@@ -85,6 +85,36 @@ class TestGrpcServerCompat(CustomTestCase):
 
         asyncio.run(run_test())
 
+    def test_install_request_manager_capture_installs_tli_bridge_for_draft_role(self):
+        async def run_test():
+            with patch(
+                "sglang.srt.entrypoints.grpc_server._iter_request_manager_classes",
+                return_value=[_BridgeRequestManager],
+            ):
+                future, restore_capture = _install_request_manager_capture(
+                    SimpleNamespace(),
+                    SimpleNamespace(tli_disaggregation_role="draft"),
+                )
+                request_manager = _BridgeRequestManager()
+                try:
+                    self.assertIs(await future, request_manager)
+                    self.assertTrue(
+                        callable(request_manager.handle_tli_draft_forward)
+                    )
+                    self.assertTrue(
+                        callable(request_manager.tli_draft_forward_communicator)
+                    )
+                    self.assertTrue(
+                        callable(
+                            request_manager._tli_draft_forward_bridge_restore
+                        )
+                    )
+                finally:
+                    request_manager._tli_draft_forward_bridge_restore()
+                    restore_capture()
+
+        asyncio.run(run_test())
+
     def test_start_smg_sidecars_when_ready_starts_both_sidecars(self):
         request_manager = _BridgeRequestManager()
 
@@ -153,27 +183,23 @@ class TestGrpcServerCompat(CustomTestCase):
             )
 
             async def consume_scheduler_output():
-                first = await request_manager.recv_from_scheduler.recv_pyobj()
-                second = await request_manager.recv_from_scheduler.recv_pyobj()
-                return first, second
+                return await request_manager.recv_from_scheduler.recv_pyobj()
 
             consumer_task = asyncio.create_task(consume_scheduler_output())
             try:
                 response = await request_manager.handle_tli_draft_forward(request)
-                first, second = await consumer_task
+                normal_output = await consumer_task
             finally:
                 restore()
 
-            return response, first, second
+            return response, normal_output
 
-        response, first, second = asyncio.run(run_test())
+        response, normal_output = asyncio.run(run_test())
 
         self.assertEqual(response.rid, "draft-1")
         self.assertTrue(response.success)
         self.assertEqual(response.tp_rank, 0)
-        self.assertEqual(first.rid, "draft-1")
-        self.assertEqual(first.request.request_id, "req-1")
-        self.assertEqual(second, {"kind": "normal"})
+        self.assertEqual(normal_output, {"kind": "normal"})
 
 
 if __name__ == "__main__":

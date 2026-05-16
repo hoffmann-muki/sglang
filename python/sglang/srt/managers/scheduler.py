@@ -3751,14 +3751,16 @@ class SenderWrapper:
         if self.socket is None:
             return
 
-        logger.info(
-            "[TLI-DEBUG] scheduler sender send_output type=%s rid=%r recv_type=%s "
-            "http_worker_ipc=%r",
-            type(output).__name__,
-            getattr(output, "rid", None),
-            type(recv_obj).__name__ if recv_obj is not None else None,
-            getattr(output, "http_worker_ipc", None),
-        )
+        is_tli_output = isinstance(output, TLIDraftForwardReqOutput)
+        if is_tli_output:
+            logger.info(
+                "[TLI-DEBUG] scheduler sender send_output enter type=%s rid=%r "
+                "recv_type=%s http_worker_ipc=%r",
+                type(output).__name__,
+                getattr(output, "rid", None),
+                type(recv_obj).__name__ if recv_obj is not None else None,
+                getattr(output, "http_worker_ipc", None),
+            )
 
         if (
             isinstance(recv_obj, BaseReq)
@@ -3769,6 +3771,12 @@ class SenderWrapper:
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
         self.socket.send_pyobj(output)
+        if is_tli_output:
+            logger.info(
+                "[TLI-DEBUG] scheduler sender send_output exit type=%s rid=%r",
+                type(output).__name__,
+                getattr(output, "rid", None),
+            )
 
 
 def dispatch_event_loop(scheduler: Scheduler):

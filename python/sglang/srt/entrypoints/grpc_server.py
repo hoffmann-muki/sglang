@@ -247,7 +247,7 @@ def _iter_request_manager_classes(smg_grpc_server):
                 yield candidate
 
 
-def _install_request_manager_capture(smg_grpc_server):
+def _install_request_manager_capture(smg_grpc_server, server_args=None):
     """Wrap the request-manager constructor so we get the live instance directly."""
 
     loop = asyncio.get_running_loop()
@@ -259,6 +259,16 @@ def _install_request_manager_capture(smg_grpc_server):
 
         def _wrapped_init(self, *args, __original_init=original_init, **kwargs):
             __original_init(self, *args, **kwargs)
+            # Install before the request manager starts awaiting scheduler output;
+            # replacing the socket later can miss an already-pending recv.
+            if (
+                server_args is not None
+                and tli_draft_service_enabled(server_args)
+                and not hasattr(self, "_tli_draft_forward_bridge_restore")
+            ):
+                self._tli_draft_forward_bridge_restore = (
+                    _install_tli_draft_forward_bridge(self)
+                )
             if not request_manager_future.done():
                 request_manager_future.set_result(self)
 
@@ -295,22 +305,6 @@ def _install_tli_draft_forward_bridge(request_manager):
         original_recv_from_scheduler, pending_futures
     )
     request_manager._tli_draft_forward_pending_futures = pending_futures
-
-    async def _pump_tli_draft_forward_responses():
-        logger.info("[TLI-DEBUG] draft response pump enter")
-        try:
-            while True:
-                recv_obj = await request_manager.recv_from_scheduler.recv_pyobj()
-                logger.info(
-                    "[TLI-DEBUG] draft response pump observed non-TLI payload type=%s",
-                    type(recv_obj).__name__,
-                )
-        except asyncio.CancelledError:
-            logger.info("[TLI-DEBUG] draft response pump cancelled")
-            raise
-
-    response_pump_task = asyncio.create_task(_pump_tli_draft_forward_responses())
-    request_manager._tli_draft_forward_response_pump_task = response_pump_task
 
     async def _handle_tli_draft_forward(self, recv_req: TLIDraftForwardReqInput):
         rid = recv_req.rid or getattr(recv_req.request, "request_id", None)
@@ -381,24 +375,23 @@ def _install_tli_draft_forward_bridge(request_manager):
     def _restore_tli_draft_forward_bridge():
         request_manager.recv_from_scheduler = original_recv_from_scheduler
         if original_handle_tli_draft_forward is None:
-            delattr(request_manager, "handle_tli_draft_forward")
+            if hasattr(request_manager, "handle_tli_draft_forward"):
+                delattr(request_manager, "handle_tli_draft_forward")
         else:
             request_manager.handle_tli_draft_forward = (
                 original_handle_tli_draft_forward
             )
         if original_tli_draft_forward_communicator is None:
-            delattr(request_manager, "tli_draft_forward_communicator")
+            if hasattr(request_manager, "tli_draft_forward_communicator"):
+                delattr(request_manager, "tli_draft_forward_communicator")
         else:
             request_manager.tli_draft_forward_communicator = (
                 original_tli_draft_forward_communicator
             )
         if hasattr(request_manager, "_tli_draft_forward_pending_futures"):
             delattr(request_manager, "_tli_draft_forward_pending_futures")
-        if hasattr(request_manager, "_tli_draft_forward_response_pump_task"):
-            task = request_manager._tli_draft_forward_response_pump_task
-            delattr(request_manager, "_tli_draft_forward_response_pump_task")
-            if not task.done():
-                task.cancel()
+        if hasattr(request_manager, "_tli_draft_forward_bridge_restore"):
+            delattr(request_manager, "_tli_draft_forward_bridge_restore")
 
     return _restore_tli_draft_forward_bridge
 
@@ -454,9 +447,13 @@ async def _start_smg_sidecars_when_ready(
     try:
         if tli_draft_service_enabled(server_args):
             try:
-                restore_tli_draft_forward_bridge = (
-                    _install_tli_draft_forward_bridge(request_manager)
+                restore_tli_draft_forward_bridge = getattr(
+                    request_manager, "_tli_draft_forward_bridge_restore", None
                 )
+                if restore_tli_draft_forward_bridge is None:
+                    restore_tli_draft_forward_bridge = (
+                        _install_tli_draft_forward_bridge(request_manager)
+                    )
                 tli_runner = await start_tli_draft_service(
                     request_manager, server_args
                 )
@@ -557,7 +554,7 @@ async def serve_grpc(server_args, model_info=None):
 
     try:
         request_manager_future, restore_request_manager_capture = (
-            _install_request_manager_capture(smg_grpc_server)
+            _install_request_manager_capture(smg_grpc_server, server_args)
         )
         grpc_task = asyncio.create_task(
             smg_grpc_server.serve_grpc(server_args, model_info=model_info)
