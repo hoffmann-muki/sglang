@@ -172,8 +172,6 @@ def draft_request_to_proto(
         request = request.to_draft_vocab(translator)
     message = proto_module.TliDraftRequest(
         request_id=request.request_id,
-        verified_id=tensor_to_proto_tensor(request.verified_id, proto_module),
-        hidden_states=tensor_to_proto_tensor(request.hidden_states, proto_module),
         mode=request.mode,
         capture_hidden_mode=_capture_hidden_mode_to_proto(
             request.capture_hidden_mode
@@ -186,28 +184,54 @@ def draft_request_to_proto(
         tp_rank=request.tp_rank,
         tp_size=request.tp_size,
     )
+    verified_id = tensor_to_proto_tensor(request.verified_id, proto_module)
+    hidden_states = tensor_to_proto_tensor(request.hidden_states, proto_module)
+    if hasattr(message.verified_id, "CopyFrom"):
+        message.verified_id.CopyFrom(verified_id)
+        message.hidden_states.CopyFrom(hidden_states)
+    else:
+        message.verified_id = verified_id
+        message.hidden_states = hidden_states
     if request.request_ids is not None:
         message.request_ids.extend(list(request.request_ids))
     if request.input_ids is not None:
-        message.input_ids = tensor_to_proto_tensor(request.input_ids, proto_module)
+        input_ids = tensor_to_proto_tensor(request.input_ids, proto_module)
+        if hasattr(message.input_ids, "CopyFrom"):
+            message.input_ids.CopyFrom(input_ids)
+        else:
+            message.input_ids = input_ids
     if request.accept_length is not None:
-        message.accept_length = tensor_to_proto_tensor(
-            request.accept_length, proto_module
-        )
+        accept_length = tensor_to_proto_tensor(request.accept_length, proto_module)
+        if hasattr(message.accept_length, "CopyFrom"):
+            message.accept_length.CopyFrom(accept_length)
+        else:
+            message.accept_length = accept_length
     if request.accept_length_cpu is not None:
         message.accept_length_cpu.extend(list(request.accept_length_cpu))
     if request.seq_lens_for_draft_extend is not None:
-        message.seq_lens_for_draft_extend = tensor_to_proto_tensor(
+        seq_lens_for_draft_extend = tensor_to_proto_tensor(
             request.seq_lens_for_draft_extend, proto_module
         )
+        if hasattr(message.seq_lens_for_draft_extend, "CopyFrom"):
+            message.seq_lens_for_draft_extend.CopyFrom(seq_lens_for_draft_extend)
+        else:
+            message.seq_lens_for_draft_extend = seq_lens_for_draft_extend
     if request.seq_lens_for_draft_extend_cpu is not None:
-        message.seq_lens_for_draft_extend_cpu = tensor_to_proto_tensor(
+        seq_lens_for_draft_extend_cpu = tensor_to_proto_tensor(
             request.seq_lens_for_draft_extend_cpu, proto_module
         )
+        if hasattr(message.seq_lens_for_draft_extend_cpu, "CopyFrom"):
+            message.seq_lens_for_draft_extend_cpu.CopyFrom(
+                seq_lens_for_draft_extend_cpu
+            )
+        else:
+            message.seq_lens_for_draft_extend_cpu = seq_lens_for_draft_extend_cpu
     if request.mm_input_embeds is not None:
-        message.mm_input_embeds = tensor_to_proto_tensor(
-            request.mm_input_embeds, proto_module
-        )
+        mm_input_embeds = tensor_to_proto_tensor(request.mm_input_embeds, proto_module)
+        if hasattr(message.mm_input_embeds, "CopyFrom"):
+            message.mm_input_embeds.CopyFrom(mm_input_embeds)
+        else:
+            message.mm_input_embeds = mm_input_embeds
     return message
 
 
@@ -285,23 +309,39 @@ def draft_response_to_proto(
     proto_module = _resolve_proto_module(proto_module)
     message = proto_module.TliDraftResponse(
         request_id=response.request_id,
-        parent_list=tensor_to_proto_tensor(response.parent_list, proto_module),
-        top_scores_index=tensor_to_proto_tensor(
-            response.top_scores_index, proto_module
-        ),
-        draft_token_ids=tensor_to_proto_tensor(response.draft_token_ids, proto_module),
         mode=response.mode,
     )
+    parent_list = tensor_to_proto_tensor(response.parent_list, proto_module)
+    top_scores_index = tensor_to_proto_tensor(response.top_scores_index, proto_module)
+    draft_token_ids = tensor_to_proto_tensor(response.draft_token_ids, proto_module)
+    if hasattr(message.parent_list, "CopyFrom"):
+        message.parent_list.CopyFrom(parent_list)
+        message.top_scores_index.CopyFrom(top_scores_index)
+        message.draft_token_ids.CopyFrom(draft_token_ids)
+    else:
+        message.parent_list = parent_list
+        message.top_scores_index = top_scores_index
+        message.draft_token_ids = draft_token_ids
     if response.next_hidden_states is not None:
-        message.next_hidden_states = tensor_to_proto_tensor(
+        next_hidden_states = tensor_to_proto_tensor(
             response.next_hidden_states, proto_module
         )
+        if hasattr(message.next_hidden_states, "CopyFrom"):
+            message.next_hidden_states.CopyFrom(next_hidden_states)
+        else:
+            message.next_hidden_states = next_hidden_states
     if response.next_topk_p is not None:
-        message.next_topk_p = tensor_to_proto_tensor(response.next_topk_p, proto_module)
+        next_topk_p = tensor_to_proto_tensor(response.next_topk_p, proto_module)
+        if hasattr(message.next_topk_p, "CopyFrom"):
+            message.next_topk_p.CopyFrom(next_topk_p)
+        else:
+            message.next_topk_p = next_topk_p
     if response.next_topk_index is not None:
-        message.next_topk_index = tensor_to_proto_tensor(
-            response.next_topk_index, proto_module
-        )
+        next_topk_index = tensor_to_proto_tensor(response.next_topk_index, proto_module)
+        if hasattr(message.next_topk_index, "CopyFrom"):
+            message.next_topk_index.CopyFrom(next_topk_index)
+        else:
+            message.next_topk_index = next_topk_index
     return message
 
 
