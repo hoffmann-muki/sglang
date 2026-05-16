@@ -129,6 +129,14 @@ class TLIDraftSchedulerExecutor:
             self._release_request_state(state)
         self.states.clear()
 
+    def active_req_pool_idxs(self) -> set[int]:
+        """Return req pool indices intentionally held across RPC boundaries."""
+        return {
+            state.req.req_pool_idx
+            for state in self.states.values()
+            if state.req.req_pool_idx is not None
+        }
+
     def _validate_request(self, request: TLIDraftRequest) -> None:
         if request.tp_rank != self.tp_rank:
             raise ValueError(

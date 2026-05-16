@@ -153,6 +153,11 @@ class SchedulerRuntimeCheckerMixin:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
+        tli_draft_executor = getattr(self, "tli_draft_executor", None)
+        if tli_draft_executor is not None and hasattr(
+            tli_draft_executor, "active_req_pool_idxs"
+        ):
+            idxs.update(tli_draft_executor.active_req_pool_idxs())
         return idxs
 
     def _session_held_tokens(self: Scheduler) -> int:
