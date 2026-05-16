@@ -188,24 +188,55 @@ class RemoteTLIWorker(EAGLEWorker):
         translate_request_to_draft_vocab: bool,
         translate_response_to_target_vocab: bool,
     ) -> TLIDraftResponse:
+        logger.info(
+            "[TLI-DEBUG] target draft RPC enter request_id=%r mode=%s tp_rank=%s "
+            "tp_size=%s root=%s uses_rank0_broadcast=%s",
+            request.request_id,
+            request.mode,
+            request.tp_rank,
+            request.tp_size,
+            self.target_worker.world_group.is_first_rank,
+            self.uses_rank0_broadcast,
+        )
         if not self.uses_rank0_broadcast:
-            return self.client.draft_forward(
+            response = self.client.draft_forward(
                 request,
                 timeout=timeout,
                 translate_request_to_draft_vocab=translate_request_to_draft_vocab,
                 translate_response_to_target_vocab=translate_response_to_target_vocab,
             )
+            logger.info(
+                "[TLI-DEBUG] target draft RPC exit request_id=%r mode=%s tp_rank=%s",
+                request.request_id,
+                request.mode,
+                request.tp_rank,
+            )
+            return response
 
         world_group = self.target_worker.world_group
         is_root = world_group.is_first_rank
         payload: list[_BroadcastedDraftResult]
         if is_root:
             try:
+                logger.info(
+                    "[TLI-DEBUG] target root draft RPC call begin request_id=%r "
+                    "mode=%s timeout=%s",
+                    request.request_id,
+                    request.mode,
+                    timeout,
+                )
                 response = self.client.draft_forward(
                     request,
                     timeout=timeout,
                     translate_request_to_draft_vocab=translate_request_to_draft_vocab,
                     translate_response_to_target_vocab=translate_response_to_target_vocab,
+                )
+                logger.info(
+                    "[TLI-DEBUG] target root draft RPC call end request_id=%r "
+                    "mode=%s has_response=%s",
+                    request.request_id,
+                    request.mode,
+                    response is not None,
                 )
                 payload = [_BroadcastedDraftResult(ok=True, response=response)]
             except Exception:
@@ -225,6 +256,14 @@ class RemoteTLIWorker(EAGLEWorker):
             world_group.cpu_group,
             src=world_group.first_rank,
         )[0]
+        logger.info(
+            "[TLI-DEBUG] target draft RPC broadcast complete request_id=%r mode=%s "
+            "ok=%s has_response=%s",
+            request.request_id,
+            request.mode,
+            broadcasted.ok,
+            broadcasted.response is not None,
+        )
         if not broadcasted.ok:
             raise RuntimeError(
                 "TLI DraftForward RPC failed on the target root rank:\n"
@@ -234,6 +273,12 @@ class RemoteTLIWorker(EAGLEWorker):
             raise RuntimeError(
                 "TLI DraftForward RPC succeeded but returned no response payload."
             )
+        logger.info(
+            "[TLI-DEBUG] target draft RPC exit request_id=%r mode=%s tp_rank=%s",
+            request.request_id,
+            request.mode,
+            request.tp_rank,
+        )
         return broadcasted.response
 
     def _draft_extend_input_ids(self, batch) -> torch.Tensor:
@@ -369,11 +414,27 @@ class RemoteTLIWorker(EAGLEWorker):
             seq_lens_for_draft_extend_cpu=seq_lens_cpu,
             mm_input_embeds=mm_input_embeds,
         )
+        logger.info(
+            "[TLI-DEBUG] target forward_draft_extend request_id=%r request_ids=%s "
+            "seq_lens=%s hidden_shape=%s",
+            request.request_id,
+            request_ids,
+            seq_lens_cpu.tolist() if hasattr(seq_lens_cpu, "tolist") else seq_lens_cpu,
+            tuple(hidden_states.shape),
+        )
         response = self._run_rank0_broadcasted_draft_forward(
             request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
+        )
+        logger.info(
+            "[TLI-DEBUG] target forward_draft_extend got response request_id=%r "
+            "next_hidden_shape=%s",
+            request.request_id,
+            tuple(response.next_hidden_states.shape)
+            if response.next_hidden_states is not None
+            else None,
         )
         self._apply_next_draft_state(batch.spec_info, response, "extend")
 
@@ -412,11 +473,26 @@ class RemoteTLIWorker(EAGLEWorker):
             num_tokens_per_req=self.topk,
             num_tokens_for_logprob_per_req=self.topk,
         )
+        logger.info(
+            "[TLI-DEBUG] target draft request request_id=%r request_ids=%s "
+            "verified_shape=%s hidden_shape=%s",
+            request.request_id,
+            request_ids,
+            tuple(spec_info.verified_id.shape),
+            tuple(spec_info.hidden_states.shape),
+        )
         response = self._run_rank0_broadcasted_draft_forward(
             request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
+        )
+        logger.info(
+            "[TLI-DEBUG] target draft got response request_id=%r parent_shape=%s "
+            "token_shape=%s",
+            request.request_id,
+            tuple(response.parent_list.shape) if response.parent_list is not None else None,
+            tuple(response.draft_token_ids.shape) if response.draft_token_ids is not None else None,
         )
 
         (
@@ -477,10 +553,27 @@ class RemoteTLIWorker(EAGLEWorker):
             if spec_info.accept_length is not None
             else None,
         )
+        logger.info(
+            "[TLI-DEBUG] target extend_after_decode request_id=%r request_ids=%s "
+            "verified_shape=%s hidden_shape=%s accept_length=%s",
+            request.request_id,
+            request_ids,
+            tuple(spec_info.verified_id.shape),
+            tuple(spec_info.hidden_states.shape),
+            request.accept_length_cpu,
+        )
         response = self._run_rank0_broadcasted_draft_forward(
             request,
             timeout=self.server_args.tli_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
+        )
+        logger.info(
+            "[TLI-DEBUG] target extend_after_decode got response request_id=%r "
+            "next_hidden_shape=%s",
+            request.request_id,
+            tuple(response.next_hidden_states.shape)
+            if response.next_hidden_states is not None
+            else None,
         )
         self._apply_next_draft_state(spec_info, response, "extend_after_decode")
