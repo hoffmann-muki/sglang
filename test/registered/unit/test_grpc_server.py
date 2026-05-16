@@ -75,7 +75,6 @@ class TestGrpcServerCompat(CustomTestCase):
                         tli_disaggregation_role="draft",
                         tli_service_port=32001,
                     ),
-                    (request_manager, smg_grpc_server),
                     request_manager_future,
                     SimpleNamespace(router=SimpleNamespace(add_get=lambda *args, **kwargs: None, add_post=lambda *args, **kwargs: None)),
                     "127.0.0.1",
@@ -88,8 +87,7 @@ class TestGrpcServerCompat(CustomTestCase):
         self.assertIn("tli", started)
         self.assertEqual(started["sidecar"][0], "127.0.0.1")
         self.assertEqual(started["sidecar"][1], 30001)
-        self.assertEqual(started["tli"][0][0], request_manager)
-        self.assertIs(started["tli"][0][1], smg_grpc_server)
+        self.assertIs(started["tli"][0], request_manager)
         self.assertIsNotNone(sidecar_runner)
         self.assertIsNotNone(tli_runner)
 
