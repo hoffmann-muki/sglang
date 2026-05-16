@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,6 +40,8 @@ from sglang.srt.speculative.eagle_worker import get_last_loc_large_page_size_top
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils import next_power_of_2
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class TLIDraftExecutorNotReadyError(RuntimeError):
@@ -96,21 +99,48 @@ class TLIDraftSchedulerExecutor:
             )
 
     def handle(self, request: TLIDraftRequest) -> TLIDraftResponse:
+        request_ids = request.request_ids or [request.request_id]
+        logger.info(
+            "[TLI-DEBUG] executor handle enter mode=%s request_id=%r request_ids=%s "
+            "tp_rank=%s state_count=%d",
+            request.mode,
+            request.request_id,
+            request_ids,
+            request.tp_rank,
+            len(self.states),
+        )
         self._validate_request(request)
         if request.mode == "release":
-            self.release(request.request_ids or [request.request_id], request.tp_rank)
+            self.release(request_ids, request.tp_rank)
+            logger.info(
+                "[TLI-DEBUG] executor handle release exit request_id=%r tp_rank=%s "
+                "state_count=%d",
+                request.request_id,
+                request.tp_rank,
+                len(self.states),
+            )
             return self._empty_response(request)
 
         self._ensure_spec_config(request)
 
         if request.mode == "extend":
-            return self._handle_extend(request)
-        if request.mode == "decode":
-            return self._handle_decode(request)
-        if request.mode == "extend_after_decode":
-            return self._handle_extend_after_decode(request)
+            response = self._handle_extend(request)
+        elif request.mode == "decode":
+            response = self._handle_decode(request)
+        elif request.mode == "extend_after_decode":
+            response = self._handle_extend_after_decode(request)
+        else:
+            raise ValueError(f"Unsupported TLI draft mode: {request.mode!r}")
 
-        raise ValueError(f"Unsupported TLI draft mode: {request.mode!r}")
+        logger.info(
+            "[TLI-DEBUG] executor handle exit mode=%s request_id=%r tp_rank=%s "
+            "state_count=%d",
+            request.mode,
+            request.request_id,
+            request.tp_rank,
+            len(self.states),
+        )
+        return response
 
     def release(
         self, request_ids: list[str], tp_rank: int, *, cache_prefix: bool = False
@@ -221,6 +251,14 @@ class TLIDraftSchedulerExecutor:
                 "draft logits to the target/draft vocabulary intersection."
             )
 
+        logger.info(
+            "[TLI-DEBUG] translator init enter target_tokenizer_path=%s draft_tokenizer_path=%s "
+            "tp_rank=%s",
+            target_tokenizer_path,
+            self.server_args.tokenizer_path,
+            self.tp_rank,
+        )
+
         target_tokenizer = get_tokenizer(
             target_tokenizer_path,
             tokenizer_mode=self.server_args.tokenizer_mode,
@@ -243,10 +281,22 @@ class TLIDraftSchedulerExecutor:
             draft_vocab_size=self.model_config.vocab_size,
             device=torch.device(self.device),
         )
+        logger.info(
+            "[TLI-DEBUG] translator init exit target_vocab=%s draft_vocab=%s tp_rank=%s",
+            target_vocab_size,
+            self.model_config.vocab_size,
+            self.tp_rank,
+        )
         return self._translator
 
     def _handle_extend(self, request: TLIDraftRequest) -> TLIDraftResponse:
         request_ids = request.request_ids or [request.request_id]
+        logger.info(
+            "[TLI-DEBUG] extend enter request_id=%r request_ids=%s tp_rank=%s",
+            request.request_id,
+            request_ids,
+            request.tp_rank,
+        )
         self.release(request_ids, request.tp_rank)
         batch = self._build_initial_extend_batch(request, request_ids)
         hidden_states = self._align_extend_hidden_states(request, batch)
@@ -272,19 +322,48 @@ class TLIDraftSchedulerExecutor:
             )
 
         try:
+            logger.info(
+                "[TLI-DEBUG] extend forward enter request_id=%r batch_size=%d "
+                "extend_tokens=%d",
+                request.request_id,
+                batch.batch_size(),
+                batch.extend_num_tokens,
+            )
             logits_output = self.model_runner.forward(forward_batch).logits_output
         except Exception:
+            logger.exception(
+                "[TLI-DEBUG] extend forward failed request_id=%r tp_rank=%s",
+                request.request_id,
+                request.tp_rank,
+            )
             for state in self._states_from_batch(batch, request_ids):
                 self._release_request_state(state)
             raise
+        logger.info(
+            "[TLI-DEBUG] extend forward exit request_id=%r logits_shape=%s",
+            request.request_id,
+            tuple(logits_output.next_token_logits.shape),
+        )
         maybe_detect_nan(logits_output.next_token_logits, "tli_draft_extend")
         self._capture_for_decode(logits_output, forward_batch.spec_info)
         self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
+        logger.info(
+            "[TLI-DEBUG] extend exit request_id=%r tp_rank=%s state_count=%d",
+            request.request_id,
+            request.tp_rank,
+            len(self.states),
+        )
         return self._state_response(request, forward_batch.spec_info)
 
     def _handle_decode(self, request: TLIDraftRequest) -> TLIDraftResponse:
         request_ids = request.request_ids or [request.request_id]
+        logger.info(
+            "[TLI-DEBUG] decode enter request_id=%r request_ids=%s tp_rank=%s",
+            request.request_id,
+            request_ids,
+            request.tp_rank,
+        )
         batch = self._build_decode_batch(request, request_ids)
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -296,8 +375,20 @@ class TLIDraftSchedulerExecutor:
         if not forward_batch.forward_mode.is_idle() and self._speculative_num_steps > 1:
             self._draft_attn_backend.init_forward_metadata(forward_batch)
 
+        logger.info(
+            "[TLI-DEBUG] decode forward enter request_id=%r batch_size=%d steps=%d",
+            request.request_id,
+            forward_batch.batch_size,
+            self._speculative_num_steps,
+        )
         parent_list, top_scores_index, draft_tokens = self._draft_forward(
             forward_batch
+        )
+        logger.info(
+            "[TLI-DEBUG] decode exit request_id=%r parent_count=%d token_count=%d",
+            request.request_id,
+            parent_list.shape[0],
+            draft_tokens.shape[0],
         )
         return TLIDraftResponse(
             request_id=request.request_id,
@@ -311,6 +402,13 @@ class TLIDraftSchedulerExecutor:
         self, request: TLIDraftRequest
     ) -> TLIDraftResponse:
         request_ids = request.request_ids or [request.request_id]
+        logger.info(
+            "[TLI-DEBUG] extend_after_decode enter request_id=%r request_ids=%s "
+            "tp_rank=%s",
+            request.request_id,
+            request_ids,
+            request.tp_rank,
+        )
         batch, states, new_seq_lens = self._build_extend_after_decode_batch(
             request, request_ids
         )
@@ -328,17 +426,41 @@ class TLIDraftSchedulerExecutor:
             forward_batch.attn_backend = attn_backend
 
         try:
+            logger.info(
+                "[TLI-DEBUG] extend_after_decode forward enter request_id=%r "
+                "batch_size=%d extend_tokens=%d",
+                request.request_id,
+                batch.batch_size(),
+                batch.extend_num_tokens,
+            )
             logits_output = self.model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
         except Exception:
+            logger.exception(
+                "[TLI-DEBUG] extend_after_decode forward failed request_id=%r "
+                "tp_rank=%s",
+                request.request_id,
+                request.tp_rank,
+            )
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
             raise
+        logger.info(
+            "[TLI-DEBUG] extend_after_decode forward exit request_id=%r logits_shape=%s",
+            request.request_id,
+            tuple(logits_output.next_token_logits.shape),
+        )
         maybe_detect_nan(logits_output.next_token_logits, "tli_draft_extend_after_decode")
         self._capture_for_decode(logits_output, forward_batch.spec_info)
         self._commit_extend_after_decode_state(states, new_seq_lens)
         self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
+        logger.info(
+            "[TLI-DEBUG] extend_after_decode exit request_id=%r tp_rank=%s state_count=%d",
+            request.request_id,
+            request.tp_rank,
+            len(self.states),
+        )
         return self._state_response(request, forward_batch.spec_info)
 
     def _build_initial_extend_batch(
@@ -744,6 +866,13 @@ class TLIDraftSchedulerExecutor:
         scores = None
         translator = self._translator_or_create()
 
+        logger.info(
+            "[TLI-DEBUG] draft_forward enter batch_size=%d steps=%d topk=%s",
+            forward_batch.batch_size,
+            self._speculative_num_steps,
+            self._topk,
+        )
+
         for i in range(self._speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self._topk
@@ -763,9 +892,23 @@ class TLIDraftSchedulerExecutor:
             forward_batch.attn_backend = self._draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
+            logger.info(
+                "[TLI-DEBUG] draft_forward step=%d forward enter input_shape=%s "
+                "out_cache_shape=%s",
+                i,
+                tuple(input_ids.shape),
+                tuple(forward_batch.out_cache_loc.shape),
+            )
             logits_output = self.model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
+            logger.info(
+                "[TLI-DEBUG] draft_forward step=%d forward exit logits_shape=%s "
+                "hidden_shape=%s",
+                i,
+                tuple(logits_output.next_token_logits.shape),
+                tuple(logits_output.hidden_states.shape),
+            )
             maybe_detect_nan(logits_output.next_token_logits, f"tli_draft_forward step {i}")
             constrained_logits = translator.constrain_draft_logits(
                 logits_output.next_token_logits
@@ -780,6 +923,12 @@ class TLIDraftSchedulerExecutor:
             )
             hidden_states = logits_output.hidden_states
 
+        logger.info(
+            "[TLI-DEBUG] draft_forward exit batch_size=%d steps=%d returned_tokens=%d",
+            forward_batch.batch_size,
+            self._speculative_num_steps,
+            self._speculative_num_draft_tokens,
+        )
         return organize_draft_results(
             score_list, token_list, parents_list, self._speculative_num_draft_tokens
         )

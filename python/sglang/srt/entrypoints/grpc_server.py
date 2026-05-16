@@ -100,11 +100,20 @@ class _DraftForwardRecvProxy:
         while True:
             recv_obj = await self._recv_socket.recv_pyobj()
             if isinstance(recv_obj, TLIDraftForwardReqOutput):
-                pending = self._pending_futures.pop(getattr(recv_obj, "rid", None), None)
+                rid = getattr(recv_obj, "rid", None)
+                logger.info(
+                    "[TLI-DEBUG] draft recv-proxy got response rid=%r success=%s "
+                    "tp_rank=%s has_payload=%s",
+                    rid,
+                    recv_obj.success,
+                    recv_obj.tp_rank,
+                    recv_obj.response is not None,
+                )
+                pending = self._pending_futures.pop(rid, None)
                 if pending is None:
                     logger.warning(
                         "Dropping orphan TLI DraftForward response with rid=%r.",
-                        getattr(recv_obj, "rid", None),
+                        rid,
                     )
                 elif not pending.done():
                     pending_loop = pending.get_loop()
@@ -117,6 +126,10 @@ class _DraftForwardRecvProxy:
                         pending_loop.call_soon_threadsafe(_set_result)
                     else:
                         _set_result()
+                    logger.info(
+                        "[TLI-DEBUG] draft recv-proxy delivered response rid=%r",
+                        rid,
+                    )
                 continue
             return recv_obj
 
