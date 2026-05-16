@@ -153,36 +153,28 @@ class SchedulerRuntimeCheckerMixin:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
-        tli_draft_executor = getattr(self, "tli_draft_executor", None)
-        if tli_draft_executor is not None and hasattr(
-            tli_draft_executor, "active_req_pool_idxs"
-        ):
-            idxs.update(tli_draft_executor.active_req_pool_idxs())
         return idxs
 
-    def _tli_draft_executor_held_tokens(self: Scheduler) -> int:
-        tli_draft_executor = getattr(self, "tli_draft_executor", None)
-        if tli_draft_executor is None or not hasattr(
-            tli_draft_executor, "held_full_tokens"
-        ):
-            return 0
-        return tli_draft_executor.held_full_tokens(self._active_pool_idxs())
+    def _draft_executor(self: Scheduler):
+        return getattr(self, "tli_draft_executor", None)
 
-    def _tli_draft_executor_held_swa_tokens(self: Scheduler) -> int:
-        tli_draft_executor = getattr(self, "tli_draft_executor", None)
-        if tli_draft_executor is None or not hasattr(
-            tli_draft_executor, "held_swa_tokens"
-        ):
+    def _draft_executor_held_tokens(self: Scheduler) -> int:
+        draft_executor = self._draft_executor()
+        if draft_executor is None or not hasattr(draft_executor, "held_full_tokens"):
             return 0
-        return tli_draft_executor.held_swa_tokens(self._active_pool_idxs())
+        return draft_executor.held_full_tokens()
 
-    def _tli_draft_executor_held_req_count(self: Scheduler) -> int:
-        tli_draft_executor = getattr(self, "tli_draft_executor", None)
-        if tli_draft_executor is None or not hasattr(
-            tli_draft_executor, "held_req_count"
-        ):
+    def _draft_executor_held_swa_tokens(self: Scheduler) -> int:
+        draft_executor = self._draft_executor()
+        if draft_executor is None or not hasattr(draft_executor, "held_swa_tokens"):
             return 0
-        return tli_draft_executor.held_req_count(self._active_pool_idxs())
+        return draft_executor.held_swa_tokens()
+
+    def _draft_executor_held_req_count(self: Scheduler) -> int:
+        draft_executor = self._draft_executor()
+        if draft_executor is None or not hasattr(draft_executor, "held_req_count"):
+            return 0
+        return draft_executor.held_req_count()
 
     def _session_held_tokens(self: Scheduler) -> int:
         """Tokens intentionally retained outside the active batch.
@@ -191,23 +183,23 @@ class SchedulerRuntimeCheckerMixin:
         states that are kept alive across TLI RPC boundaries.
         """
         return self.tree_cache.session_held_tokens(self._active_pool_idxs()) + (
-            self._tli_draft_executor_held_tokens()
+            self._draft_executor_held_tokens()
         )
 
     def _session_held_full_tokens(self: Scheduler) -> int:
         return self.tree_cache.session_held_full_tokens(self._active_pool_idxs()) + (
-            self._tli_draft_executor_held_tokens()
+            self._draft_executor_held_tokens()
         )
 
     def _session_held_swa_tokens(self: Scheduler) -> int:
         return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs()) + (
-            self._tli_draft_executor_held_swa_tokens()
+            self._draft_executor_held_swa_tokens()
         )
 
     def _session_held_req_count(self: Scheduler) -> int:
         return self.tree_cache.session_held_req_count(
             self._active_pool_idxs()
-        ) + self._tli_draft_executor_held_req_count()
+        ) + self._draft_executor_held_req_count()
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:

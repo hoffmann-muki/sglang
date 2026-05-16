@@ -240,11 +240,8 @@ class TestTLIDisaggregation(CustomTestCase):
         }
 
         self.assertEqual(executor.held_full_tokens(), 27)
-        self.assertEqual(executor.held_full_tokens({3}), 8)
         self.assertEqual(executor.held_swa_tokens(), 23)
-        self.assertEqual(executor.held_swa_tokens({3}), 6)
         self.assertEqual(executor.held_req_count(), 2)
-        self.assertEqual(executor.held_req_count({3}), 1)
 
     def test_start_tli_draft_service_starts_sidecar(self):
         fake_server = _FakeServer(

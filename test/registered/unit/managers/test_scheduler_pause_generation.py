@@ -137,14 +137,20 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
 
-    def test_active_pool_idxs_includes_tli_draft_executor_state(self):
+    def test_active_pool_idxs_ignores_tli_draft_executor_state(self):
         scheduler = self._new_scheduler()
-        scheduler.last_batch = None
+        scheduler.last_batch = MagicMock()
+        scheduler.last_batch.is_empty.return_value = False
+        req1 = MagicMock()
+        req1.req_pool_idx = 5
+        req2 = MagicMock()
+        req2.req_pool_idx = None
+        scheduler.last_batch.reqs = [req1, req2]
         scheduler.running_batch.is_empty.return_value = True
         scheduler.tli_draft_executor = MagicMock()
         scheduler.tli_draft_executor.active_req_pool_idxs.return_value = {3, 7}
 
-        self.assertEqual(Scheduler._active_pool_idxs(scheduler), {3, 7})
+        self.assertEqual(Scheduler._active_pool_idxs(scheduler), {5})
 
     def test_session_held_counts_include_tli_draft_executor_state(self):
         scheduler = self._new_scheduler()
