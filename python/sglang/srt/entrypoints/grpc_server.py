@@ -296,6 +296,22 @@ def _install_tli_draft_forward_bridge(request_manager):
     )
     request_manager._tli_draft_forward_pending_futures = pending_futures
 
+    async def _pump_tli_draft_forward_responses():
+        logger.info("[TLI-DEBUG] draft response pump enter")
+        try:
+            while True:
+                recv_obj = await request_manager.recv_from_scheduler.recv_pyobj()
+                logger.info(
+                    "[TLI-DEBUG] draft response pump observed non-TLI payload type=%s",
+                    type(recv_obj).__name__,
+                )
+        except asyncio.CancelledError:
+            logger.info("[TLI-DEBUG] draft response pump cancelled")
+            raise
+
+    response_pump_task = asyncio.create_task(_pump_tli_draft_forward_responses())
+    request_manager._tli_draft_forward_response_pump_task = response_pump_task
+
     async def _handle_tli_draft_forward(self, recv_req: TLIDraftForwardReqInput):
         rid = recv_req.rid or getattr(recv_req.request, "request_id", None)
         if rid is None:
@@ -378,6 +394,11 @@ def _install_tli_draft_forward_bridge(request_manager):
             )
         if hasattr(request_manager, "_tli_draft_forward_pending_futures"):
             delattr(request_manager, "_tli_draft_forward_pending_futures")
+        if hasattr(request_manager, "_tli_draft_forward_response_pump_task"):
+            task = request_manager._tli_draft_forward_response_pump_task
+            delattr(request_manager, "_tli_draft_forward_response_pump_task")
+            if not task.done():
+                task.cancel()
 
     return _restore_tli_draft_forward_bridge
 
