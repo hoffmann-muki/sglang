@@ -11,6 +11,9 @@ from sglang.srt.speculative.tli_draft_executor import (
     TLIDraftRequestState,
     TLIDraftSchedulerExecutor,
 )
+from sglang.srt.speculative.eagle_utils import (
+    _normalize_verified_id_for_tree_build,
+)
 from sglang.srt.speculative.tli_disaggregation import (
     TLIDraftExecutionNotWiredError,
     start_tli_draft_service,
@@ -280,6 +283,16 @@ class TestTLIDisaggregation(CustomTestCase):
             )
         )
         self.assertIsNone(server)
+
+    def test_verified_id_normalization_uses_last_token_per_row(self):
+        draft_tokens = torch.zeros((1, 4), dtype=torch.int64)
+        verified_id = torch.tensor([11, 22], dtype=torch.int64)
+
+        normalized = _normalize_verified_id_for_tree_build(
+            verified_id, draft_tokens
+        )
+
+        self.assertTrue(torch.equal(normalized, torch.tensor([22], dtype=torch.int64)))
 
 
 if __name__ == "__main__":

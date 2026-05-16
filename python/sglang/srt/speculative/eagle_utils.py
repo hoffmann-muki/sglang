@@ -45,6 +45,35 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+def _normalize_verified_id_for_tree_build(
+    verified_id: torch.Tensor, draft_tokens: torch.Tensor
+) -> torch.Tensor:
+    """Normalize verified ids to one token per tree row.
+
+    The tree builder expects one verified token per request. Some remote draft
+    paths can hand us a flattened verified-id payload with multiple tokens per
+    request; in that case we keep the last token for each row, which is the
+    token that should anchor the draft tree.
+    """
+    if draft_tokens.dim() == 1:
+        draft_tokens = draft_tokens.unsqueeze(0)
+
+    batch_size = draft_tokens.shape[0]
+    verified_id = verified_id.flatten()
+
+    if batch_size == 0:
+        return verified_id.new_empty((0,))
+    if verified_id.numel() == batch_size:
+        return verified_id
+    if verified_id.numel() % batch_size == 0:
+        return verified_id.reshape(batch_size, -1)[:, -1].contiguous()
+
+    raise ValueError(
+        "Incompatible verified_id and draft_tokens shapes for tree build: "
+        f"verified_id={tuple(verified_id.shape)}, draft_tokens={tuple(draft_tokens.shape)}"
+    )
+
+
 def build_tree_kernel_efficient(
     verified_id: torch.Tensor,
     parent_list: List[torch.Tensor],
@@ -59,6 +88,9 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
+    verified_id = _normalize_verified_id_for_tree_build(verified_id, draft_tokens)
+    if draft_tokens.dim() == 1:
+        draft_tokens = draft_tokens.unsqueeze(0)
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
