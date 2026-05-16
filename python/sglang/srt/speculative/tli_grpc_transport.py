@@ -107,11 +107,24 @@ def _tensor_from_bytes(
     data: bytes,
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
+    shape = list(shape)
+    tensor_dtype = _str_to_dtype(dtype)
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    expected_nbytes = numel * torch.empty((), dtype=tensor_dtype).element_size()
+    if len(data) != expected_nbytes:
+        raise ValueError(
+            "Invalid TLI tensor payload size: "
+            f"shape={shape}, dtype={dtype}, expected={expected_nbytes}, "
+            f"got={len(data)}"
+        )
+    if numel == 0:
+        return torch.empty(shape, dtype=tensor_dtype, device=device)
+
     # `torch.frombuffer` warns on immutable bytes objects; copy into a writable
     # bytearray first since we immediately clone anyway.
-    tensor = torch.frombuffer(
-        bytearray(data), dtype=_str_to_dtype(dtype)
-    ).reshape(list(shape))
+    tensor = torch.frombuffer(bytearray(data), dtype=tensor_dtype).reshape(shape)
     tensor = tensor.clone()
     if device != "cpu" and device != torch.device("cpu"):
         tensor = tensor.to(device)

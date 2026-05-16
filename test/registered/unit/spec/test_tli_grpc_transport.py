@@ -135,6 +135,38 @@ class TestTLIGRPCTransport(CustomTestCase):
         decoded = tensor_from_proto_tensor(encoded.verified_id)
         self.assertTrue(torch.equal(decoded, tensor))
 
+    def test_response_proto_supports_empty_extend_tensors(self):
+        response = TLIDraftResponse(
+            request_id="req-empty-extend",
+            mode="extend",
+            parent_list=torch.empty((0,), dtype=torch.int64),
+            top_scores_index=torch.empty((0,), dtype=torch.int64),
+            draft_token_ids=torch.empty((0,), dtype=torch.int64),
+            next_hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+            next_topk_p=torch.ones((1, 1), dtype=torch.float32),
+            next_topk_index=torch.zeros((1, 1), dtype=torch.int64),
+        )
+
+        proto_response = draft_response_to_proto(
+            response,
+            proto_module=_FAKE_PROTO,
+        )
+        decoded = draft_response_from_proto(proto_response)
+
+        self.assertEqual(decoded.request_id, response.request_id)
+        self.assertEqual(decoded.mode, "extend")
+        self.assertEqual(tuple(decoded.parent_list.shape), (0,))
+        self.assertEqual(decoded.parent_list.dtype, torch.int64)
+        self.assertEqual(tuple(decoded.top_scores_index.shape), (0,))
+        self.assertEqual(decoded.top_scores_index.dtype, torch.int64)
+        self.assertEqual(tuple(decoded.draft_token_ids.shape), (0,))
+        self.assertEqual(decoded.draft_token_ids.dtype, torch.int64)
+        self.assertTrue(
+            torch.equal(decoded.next_hidden_states, response.next_hidden_states)
+        )
+        self.assertTrue(torch.equal(decoded.next_topk_p, response.next_topk_p))
+        self.assertTrue(torch.equal(decoded.next_topk_index, response.next_topk_index))
+
     def test_request_proto_translation(self):
         request = TLIDraftRequest(
             request_id="req-1",
