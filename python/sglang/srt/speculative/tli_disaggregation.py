@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from collections.abc import Iterable, Mapping
 from typing import Awaitable, Callable
 
 from sglang.srt.managers.io_struct import TLIDraftForwardReqInput
@@ -53,17 +52,12 @@ def _request_source_candidate(obj, seen: set[int]):
         return None
     seen.add(obj_id)
 
+    if hasattr(obj, "handle_tli_draft_forward"):
+        return obj
     if hasattr(obj, "tli_draft_forward_communicator"):
         return getattr(obj, "tli_draft_forward_communicator")
     if hasattr(obj, "send_communicator_req"):
         return obj
-
-    if isinstance(obj, Mapping):
-        for value in obj.values():
-            candidate = _request_source_candidate(value, seen)
-            if candidate is not None:
-                return candidate
-        return None
 
     if isinstance(obj, (list, tuple, set, frozenset)):
         for value in obj:
@@ -72,19 +66,18 @@ def _request_source_candidate(obj, seen: set[int]):
                 return candidate
         return None
 
-    if isinstance(obj, Iterable) and not isinstance(obj, (str, bytes, bytearray)):
-        try:
-            for value in obj:
-                candidate = _request_source_candidate(value, seen)
-                if candidate is not None:
-                    return candidate
-        except TypeError:
-            pass
-
-    obj_vars = getattr(obj, "__dict__", None)
-    if obj_vars:
-        for value in obj_vars.values():
-            candidate = _request_source_candidate(value, seen)
+    for attr_name in (
+        "scheduler",
+        "tokenizer_manager",
+        "request_manager",
+        "_request_manager",
+        "servicer",
+        "server_state",
+        "state",
+        "manager",
+    ):
+        if hasattr(obj, attr_name):
+            candidate = _request_source_candidate(getattr(obj, attr_name), seen)
             if candidate is not None:
                 return candidate
     return None
@@ -96,8 +89,9 @@ def _discover_request_source_communicator(request_source):
     if candidate is None:
         raise RuntimeError(
             "TLI draft request source does not expose a compatible communicator. "
-            "Expected a tli_draft_forward_communicator callable or an object "
-            "with send_communicator_req(...)."
+            "Expected a scheduler/tokenizer_manager/request_manager object with "
+            "handle_tli_draft_forward(...), tli_draft_forward_communicator, or "
+            "send_communicator_req(...)."
         )
     return candidate
 
@@ -164,7 +158,13 @@ async def _draft_forward_via_request_source(
     timeout: float | None = None,
 ) -> TLIDraftResponse:
     communicator = _discover_request_source_communicator(request_source)
-    if hasattr(communicator, "send_communicator_req"):
+    if hasattr(communicator, "handle_tli_draft_forward"):
+        results = await communicator.handle_tli_draft_forward(
+            TLIDraftForwardReqInput(request=request)
+        )
+        if not isinstance(results, list):
+            results = [results]
+    elif hasattr(communicator, "send_communicator_req"):
         results = await communicator.send_communicator_req(
             TLIDraftForwardReqInput(request=request),
             "tli_draft_forward_communicator",
@@ -172,6 +172,8 @@ async def _draft_forward_via_request_source(
         )
     else:
         results = await communicator(TLIDraftForwardReqInput(request=request))
+        if not isinstance(results, list):
+            results = [results]
 
     if not results:
         raise RuntimeError("TLI DraftForward received no scheduler response.")

@@ -217,22 +217,16 @@ class TestTLIDisaggregation(CustomTestCase):
             draft_token_ids=torch.tensor([0, 1]),
         )
 
-        async def tli_draft_forward_communicator(req):
+        async def handle_tli_draft_forward(req):
             self.assertEqual(req.request.request_id, request.request_id)
-            return [
-                _FakeSchedulerResult(
-                    success=True,
-                    response=expected,
-                    tp_rank=0,
-                )
-            ]
+            return _FakeSchedulerResult(success=True, response=expected, tp_rank=0)
 
         nested_source = (
             SimpleNamespace(),
             SimpleNamespace(
                 state=SimpleNamespace(
-                    manager=SimpleNamespace(
-                        tli_draft_forward_communicator=tli_draft_forward_communicator
+                    scheduler=SimpleNamespace(
+                        handle_tli_draft_forward=handle_tli_draft_forward
                     )
                 )
             ),
@@ -242,6 +236,49 @@ class TestTLIDisaggregation(CustomTestCase):
         )
 
         self.assertEqual(response.request_id, "req-4")
+        self.assertTrue(torch.equal(response.parent_list, expected.parent_list))
+        self.assertTrue(torch.equal(response.top_scores_index, expected.top_scores_index))
+        self.assertTrue(torch.equal(response.draft_token_ids, expected.draft_token_ids))
+
+    def test_future_in_request_source_graph_does_not_break_lookup(self):
+        request = TLIDraftRequest(
+            request_id="req-5",
+            verified_id=torch.tensor([0, 1]),
+            hidden_states=torch.zeros(2, 3),
+            tp_rank=0,
+            tp_size=1,
+        )
+        expected = TLIDraftResponse(
+            request_id="req-5",
+            parent_list=torch.tensor([[0, 1]]),
+            top_scores_index=torch.tensor([[1, 0]]),
+            draft_token_ids=torch.tensor([0, 1]),
+        )
+
+        async def handle_tli_draft_forward(req):
+            self.assertEqual(req.request.request_id, request.request_id)
+            return _FakeSchedulerResult(success=True, response=expected, tp_rank=0)
+
+        async def build_source():
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result("not-a-communicator")
+            return (
+                fut,
+                SimpleNamespace(
+                    state=SimpleNamespace(
+                        scheduler=SimpleNamespace(
+                            handle_tli_draft_forward=handle_tli_draft_forward
+                        )
+                    )
+                ),
+            )
+
+        nested_source = asyncio.run(build_source())
+        response = asyncio.run(
+            tokenizer_manager_backed_tli_draft_handler(nested_source, request)
+        )
+
+        self.assertEqual(response.request_id, "req-5")
         self.assertTrue(torch.equal(response.parent_list, expected.parent_list))
         self.assertTrue(torch.equal(response.top_scores_index, expected.top_scores_index))
         self.assertTrue(torch.equal(response.draft_token_ids, expected.draft_token_ids))

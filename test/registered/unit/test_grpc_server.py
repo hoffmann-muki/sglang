@@ -19,6 +19,11 @@ class _RequestManager:
         return []
 
 
+class _Scheduler:
+    async def handle_tli_draft_forward(self, *args, **kwargs):
+        return []
+
+
 class TestGrpcServerCompat(CustomTestCase):
     def test_install_request_manager_capture_resolves_on_constructor(self):
         class _GrpcRequestManager(_RequestManager):
@@ -40,7 +45,7 @@ class TestGrpcServerCompat(CustomTestCase):
         asyncio.run(run_test())
 
     def test_start_smg_sidecars_when_ready_starts_both_sidecars(self):
-        request_manager = _RequestManager()
+        request_manager = SimpleNamespace(scheduler=_Scheduler())
 
         started = {}
 
@@ -83,8 +88,7 @@ class TestGrpcServerCompat(CustomTestCase):
         self.assertIn("tli", started)
         self.assertEqual(started["sidecar"][0], "127.0.0.1")
         self.assertEqual(started["sidecar"][1], 30001)
-        self.assertEqual(started["tli"][0][0], request_manager)
-        self.assertIs(started["tli"][0][1], smg_grpc_server)
+        self.assertIs(started["tli"][0], request_manager)
         self.assertIsNotNone(sidecar_runner)
         self.assertIsNotNone(tli_runner)
 
