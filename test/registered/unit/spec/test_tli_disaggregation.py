@@ -161,6 +161,47 @@ class TestTLIDisaggregation(CustomTestCase):
         self.assertTrue(torch.equal(response.top_scores_index, expected.top_scores_index))
         self.assertTrue(torch.equal(response.draft_token_ids, expected.draft_token_ids))
 
+    def test_nested_request_source_backed_handler_round_trip(self):
+        request = TLIDraftRequest(
+            request_id="req-3",
+            verified_id=torch.tensor([0, 1]),
+            hidden_states=torch.zeros(2, 3),
+            tp_rank=0,
+            tp_size=1,
+        )
+        expected = TLIDraftResponse(
+            request_id="req-3",
+            parent_list=torch.tensor([[0, 1]]),
+            top_scores_index=torch.tensor([[1, 0]]),
+            draft_token_ids=torch.tensor([0, 1]),
+        )
+
+        async def tli_draft_forward_communicator(req):
+            self.assertEqual(req.request.request_id, request.request_id)
+            return [
+                _FakeSchedulerResult(
+                    success=True,
+                    response=expected,
+                    tp_rank=0,
+                )
+            ]
+
+        nested_source = SimpleNamespace(
+            state=SimpleNamespace(
+                manager=SimpleNamespace(
+                    tli_draft_forward_communicator=tli_draft_forward_communicator
+                )
+            )
+        )
+        response = asyncio.run(
+            tokenizer_manager_backed_tli_draft_handler(nested_source, request)
+        )
+
+        self.assertEqual(response.request_id, "req-3")
+        self.assertTrue(torch.equal(response.parent_list, expected.parent_list))
+        self.assertTrue(torch.equal(response.top_scores_index, expected.top_scores_index))
+        self.assertTrue(torch.equal(response.draft_token_ids, expected.draft_token_ids))
+
     def test_start_tli_draft_service_starts_sidecar(self):
         fake_server = _FakeServer(
             kwargs={

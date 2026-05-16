@@ -44,6 +44,50 @@ def _read_file(path: str | None) -> bytes | None:
     return Path(path).read_bytes()
 
 
+def _request_source_candidate(obj, seen: set[int]):
+    if obj is None:
+        return None
+    obj_id = id(obj)
+    if obj_id in seen:
+        return None
+    seen.add(obj_id)
+
+    if hasattr(obj, "tli_draft_forward_communicator"):
+        return getattr(obj, "tli_draft_forward_communicator")
+    if hasattr(obj, "send_communicator_req"):
+        return obj
+
+    for attr_name in (
+        "request_manager",
+        "_request_manager",
+        "server_state",
+        "state",
+        "scheduler",
+        "tokenizer_manager",
+        "manager",
+        "app",
+        "servicer",
+        "communicator",
+    ):
+        if hasattr(obj, attr_name):
+            candidate = _request_source_candidate(getattr(obj, attr_name), seen)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _discover_request_source_communicator(request_source):
+    seen: set[int] = set()
+    candidate = _request_source_candidate(request_source, seen)
+    if candidate is None:
+        raise RuntimeError(
+            "TLI draft request source does not expose a compatible communicator. "
+            "Expected a tli_draft_forward_communicator callable or an object "
+            "with send_communicator_req(...)."
+        )
+    return candidate
+
+
 def build_tli_server_credentials(server_args):
     """Build grpc.ServerCredentials for draft-side TLS/mTLS, or None."""
     if not server_args.tli_grpc_use_tls:
@@ -105,19 +149,15 @@ async def _draft_forward_via_request_source(
     request: TLIDraftRequest,
     timeout: float | None = None,
 ) -> TLIDraftResponse:
-    communicator = getattr(request_source, "tli_draft_forward_communicator", None)
-    if communicator is not None:
-        results = await communicator(TLIDraftForwardReqInput(request=request))
-    elif hasattr(request_source, "send_communicator_req"):
-        results = await request_source.send_communicator_req(
+    communicator = _discover_request_source_communicator(request_source)
+    if hasattr(communicator, "send_communicator_req"):
+        results = await communicator.send_communicator_req(
             TLIDraftForwardReqInput(request=request),
             "tli_draft_forward_communicator",
             timeout=timeout,
         )
     else:
-        raise RuntimeError(
-            "TLI draft request source does not expose a compatible communicator."
-        )
+        results = await communicator(TLIDraftForwardReqInput(request=request))
 
     if not results:
         raise RuntimeError("TLI DraftForward received no scheduler response.")
