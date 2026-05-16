@@ -3302,7 +3302,23 @@ class Scheduler(
         try:
             response_rid = recv_req.rid or getattr(recv_req.request, "request_id", "")
             local_tp_rank = getattr(self.tp_worker, "tp_rank", recv_req.request.tp_rank)
+            logger.info(
+                "[TLI-DEBUG] scheduler TLI handle enter rid=%r request_id=%r "
+                "mode=%s request_tp_rank=%s local_tp_rank=%s",
+                response_rid,
+                getattr(recv_req.request, "request_id", None),
+                getattr(recv_req.request, "mode", None),
+                recv_req.request.tp_rank,
+                local_tp_rank,
+            )
             if local_tp_rank != recv_req.request.tp_rank:
+                logger.info(
+                    "[TLI-DEBUG] scheduler TLI handle bypass rid=%r local_tp_rank=%s "
+                    "request_tp_rank=%s",
+                    response_rid,
+                    local_tp_rank,
+                    recv_req.request.tp_rank,
+                )
                 return TLIDraftForwardReqOutput(
                     success=True,
                     message="",
@@ -3316,7 +3332,17 @@ class Scheduler(
                 )
 
                 self.tli_draft_executor = TLIDraftSchedulerExecutor(self)
+            logger.info(
+                "[TLI-DEBUG] scheduler TLI handle executor enter rid=%r has_executor=%s",
+                response_rid,
+                hasattr(self, "tli_draft_executor"),
+            )
             response = self.tli_draft_executor.handle(recv_req.request)
+            logger.info(
+                "[TLI-DEBUG] scheduler TLI handle executor exit rid=%r response_type=%s",
+                response_rid,
+                type(response).__name__,
+            )
             return TLIDraftForwardReqOutput(
                 success=True,
                 message="",
@@ -3326,6 +3352,12 @@ class Scheduler(
             )
         except Exception as exc:
             logger.exception("TLI draft forward failed: %s", exc)
+            logger.info(
+                "[TLI-DEBUG] scheduler TLI handle failure rid=%r request_id=%r error=%s",
+                getattr(recv_req, "rid", ""),
+                getattr(recv_req.request, "request_id", None),
+                exc,
+            )
             return TLIDraftForwardReqOutput(
                 success=False,
                 message=str(exc),

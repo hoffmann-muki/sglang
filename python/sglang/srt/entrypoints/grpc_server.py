@@ -101,13 +101,15 @@ class _DraftForwardRecvProxy:
             recv_obj = await self._recv_socket.recv_pyobj()
             if isinstance(recv_obj, TLIDraftForwardReqOutput):
                 rid = getattr(recv_obj, "rid", None)
+                pending = self._pending_futures.get(rid)
                 logger.info(
                     "[TLI-DEBUG] draft recv-proxy got response rid=%r success=%s "
-                    "tp_rank=%s has_payload=%s",
+                    "tp_rank=%s has_payload=%s pending=%s",
                     rid,
                     recv_obj.success,
                     recv_obj.tp_rank,
                     recv_obj.response is not None,
+                    pending is not None,
                 )
                 pending = self._pending_futures.pop(rid, None)
                 if pending is None:
@@ -304,13 +306,54 @@ def _install_tli_draft_forward_bridge(request_manager):
         future = loop.create_future()
         pending_futures[rid] = future
         try:
+            logger.info(
+                "[TLI-DEBUG] draft request-manager bridge send enter rid=%r "
+                "request_id=%r mode=%s tp_rank=%s pending=%d",
+                rid,
+                getattr(recv_req.request, "request_id", None),
+                getattr(recv_req.request, "mode", None),
+                getattr(recv_req.request, "tp_rank", None),
+                len(pending_futures),
+            )
             self.send_to_scheduler.send_pyobj(recv_req)
+            logger.info(
+                "[TLI-DEBUG] draft request-manager bridge send exit rid=%r "
+                "pending=%d",
+                rid,
+                len(pending_futures),
+            )
             timeout = getattr(self.server_args, "tli_rpc_timeout", None)
             if timeout is not None:
-                return await asyncio.wait_for(future, timeout=timeout)
-            return await future
+                logger.info(
+                    "[TLI-DEBUG] draft request-manager bridge await enter rid=%r "
+                    "timeout=%s",
+                    rid,
+                    timeout,
+                )
+                result = await asyncio.wait_for(future, timeout=timeout)
+            else:
+                logger.info(
+                    "[TLI-DEBUG] draft request-manager bridge await enter rid=%r "
+                    "timeout=None",
+                    rid,
+                )
+                result = await future
+            logger.info(
+                "[TLI-DEBUG] draft request-manager bridge await exit rid=%r "
+                "result_type=%s success=%s has_payload=%s",
+                rid,
+                type(result).__name__,
+                getattr(result, "success", None),
+                getattr(result, "response", None) is not None,
+            )
+            return result
         finally:
             pending_futures.pop(rid, None)
+            logger.info(
+                "[TLI-DEBUG] draft request-manager bridge cleanup rid=%r pending=%d",
+                rid,
+                len(pending_futures),
+            )
 
     request_manager.handle_tli_draft_forward = MethodType(
         _handle_tli_draft_forward, request_manager
