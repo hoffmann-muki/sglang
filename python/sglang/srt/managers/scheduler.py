@@ -3300,6 +3300,7 @@ class Scheduler(
         self, recv_req: TLIDraftForwardReqInput
     ) -> TLIDraftForwardReqOutput:
         try:
+            response_rid = recv_req.rid or getattr(recv_req.request, "request_id", "")
             local_tp_rank = getattr(self.tp_worker, "tp_rank", recv_req.request.tp_rank)
             if local_tp_rank != recv_req.request.tp_rank:
                 return TLIDraftForwardReqOutput(
@@ -3307,6 +3308,7 @@ class Scheduler(
                     message="",
                     response=None,
                     tp_rank=local_tp_rank,
+                    rid=response_rid,
                 )
             if not hasattr(self, "tli_draft_executor"):
                 from sglang.srt.speculative.tli_draft_executor import (
@@ -3320,6 +3322,7 @@ class Scheduler(
                 message="",
                 response=response,
                 tp_rank=recv_req.request.tp_rank,
+                rid=response_rid,
             )
         except Exception as exc:
             logger.exception("TLI draft forward failed: %s", exc)
@@ -3328,6 +3331,7 @@ class Scheduler(
                 message=str(exc),
                 response=None,
                 tp_rank=recv_req.request.tp_rank,
+                rid=getattr(recv_req, "rid", ""),
             )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):

@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import logging
 import inspect
+import logging
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -45,69 +45,53 @@ def _read_file(path: str | None) -> bytes | None:
     return Path(path).read_bytes()
 
 
-def _request_source_candidate(obj, seen: set[int]):
+_REQUEST_SOURCE_ATTRS = (
+    "bootstrap_server",
+    "request_manager",
+    "scheduler",
+    "tokenizer_manager",
+    "servicer",
+    "manager",
+)
+
+
+def _has_direct_tli_communicator(obj) -> bool:
+    return any(
+        hasattr(obj, attr_name)
+        for attr_name in (
+            "handle_tli_draft_forward",
+            "tli_draft_forward_communicator",
+            "send_communicator_req",
+        )
+    )
+
+
+def _request_source_candidate(obj):
     if obj is None:
         return None
-    obj_id = id(obj)
-    if obj_id in seen:
-        return None
-    seen.add(obj_id)
 
-    if hasattr(obj, "handle_tli_draft_forward"):
-        return obj
-    if hasattr(obj, "tli_draft_forward_communicator"):
-        return getattr(obj, "tli_draft_forward_communicator")
-    if hasattr(obj, "send_communicator_req"):
+    if _has_direct_tli_communicator(obj):
         return obj
 
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        for value in obj:
-            candidate = _request_source_candidate(value, seen)
-            if candidate is not None:
-                return candidate
-        return None
+    for attr_name in _REQUEST_SOURCE_ATTRS:
+        candidate = getattr(obj, attr_name, None)
+        if candidate is not None and _has_direct_tli_communicator(candidate):
+            return candidate
 
     if inspect.ismodule(obj):
-        for attr_name in (
-            "request_manager",
-            "grpc_request_manager",
-            "_request_manager",
-            "servicer",
-            "scheduler",
-            "tokenizer_manager",
-            "manager",
-            "communicator",
-        ):
-            if hasattr(obj, attr_name):
-                candidate = _request_source_candidate(getattr(obj, attr_name), seen)
-                if candidate is not None:
-                    return candidate
-        return None
-
-    for attr_name in (
-        "scheduler",
-        "tokenizer_manager",
-        "request_manager",
-        "_request_manager",
-        "servicer",
-        "server_state",
-        "state",
-        "manager",
-    ):
-        if hasattr(obj, attr_name):
-            candidate = _request_source_candidate(getattr(obj, attr_name), seen)
-            if candidate is not None:
+        for attr_name in _REQUEST_SOURCE_ATTRS:
+            candidate = getattr(obj, attr_name, None)
+            if candidate is not None and _has_direct_tli_communicator(candidate):
                 return candidate
     return None
 
 
 def _discover_request_source_communicator(request_source):
-    seen: set[int] = set()
-    candidate = _request_source_candidate(request_source, seen)
+    candidate = _request_source_candidate(request_source)
     if candidate is None:
         raise RuntimeError(
             "TLI draft request source does not expose a compatible communicator. "
-            "Expected a request_manager/module/object with "
+            "Expected a request_manager/module/object with a direct "
             "handle_tli_draft_forward(...), tli_draft_forward_communicator, or "
             "send_communicator_req(...)."
         )
@@ -157,13 +141,26 @@ async def unimplemented_tli_draft_handler(
     )
 
 
-async def tokenizer_manager_backed_tli_draft_handler(
-    tokenizer_manager,
+async def request_manager_backed_tli_draft_handler(
+    request_manager,
     request: TLIDraftRequest,
     timeout: float | None = None,
 ) -> TLIDraftResponse:
     """Bridge DraftForward RPCs into the local scheduler communicator."""
     return await _draft_forward_via_request_source(
+        request_manager,
+        request,
+        timeout=timeout,
+    )
+
+
+async def tokenizer_manager_backed_tli_draft_handler(
+    tokenizer_manager,
+    request: TLIDraftRequest,
+    timeout: float | None = None,
+) -> TLIDraftResponse:
+    """Backward-compatible alias for request-manager backed draft handling."""
+    return await request_manager_backed_tli_draft_handler(
         tokenizer_manager,
         request,
         timeout=timeout,
