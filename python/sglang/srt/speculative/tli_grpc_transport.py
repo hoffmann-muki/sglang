@@ -159,6 +159,43 @@ def _message_has_field(message, field_name: str) -> bool:
     return value is not None
 
 
+def _tensor_debug_summary(tensor) -> str:
+    if tensor is None:
+        return "None"
+    shape = tuple(getattr(tensor, "shape", ()))
+    dtype = getattr(tensor, "dtype", None)
+    device = getattr(tensor, "device", None)
+    numel = getattr(tensor, "numel", None)
+    numel = numel() if callable(numel) else None
+    return f"shape={shape} dtype={dtype} device={device} numel={numel}"
+
+
+def _draft_request_debug_summary(request: TLIDraftRequest) -> str:
+    return (
+        f"request_id={request.request_id!r} mode={request.mode} "
+        f"tp_rank={request.tp_rank} tp_size={request.tp_size} "
+        f"request_ids={request.request_ids} "
+        f"verified_id={_tensor_debug_summary(request.verified_id)} "
+        f"hidden_states={_tensor_debug_summary(request.hidden_states)} "
+        f"input_ids={_tensor_debug_summary(request.input_ids)} "
+        f"accept_length={_tensor_debug_summary(request.accept_length)} "
+        f"seq_lens_for_draft_extend={_tensor_debug_summary(request.seq_lens_for_draft_extend)} "
+        f"mm_input_embeds={_tensor_debug_summary(request.mm_input_embeds)}"
+    )
+
+
+def _draft_response_debug_summary(response: TLIDraftResponse) -> str:
+    return (
+        f"request_id={response.request_id!r} mode={response.mode} "
+        f"parent_list={_tensor_debug_summary(response.parent_list)} "
+        f"top_scores_index={_tensor_debug_summary(response.top_scores_index)} "
+        f"draft_token_ids={_tensor_debug_summary(response.draft_token_ids)} "
+        f"next_hidden_states={_tensor_debug_summary(response.next_hidden_states)} "
+        f"next_topk_p={_tensor_debug_summary(response.next_topk_p)} "
+        f"next_topk_index={_tensor_debug_summary(response.next_topk_index)}"
+    )
+
+
 def draft_request_to_proto(
     request: TLIDraftRequest,
     *,
@@ -417,6 +454,11 @@ class TliSpeculativeServiceAdapter:
             if self.translator is not None and self.translate_requests_to_draft_vocab:
                 tli_request = tli_request.to_draft_vocab(self.translator)
 
+            logger.info(
+                "[TLI-DEBUG] gRPC adapter DraftForward enter %s",
+                _draft_request_debug_summary(tli_request),
+            )
+
             response = self.request_handler(tli_request)
             if inspect.isawaitable(response):
                 response = await response
@@ -425,9 +467,33 @@ class TliSpeculativeServiceAdapter:
                     "TLI request handler must return TLIDraftResponse, got "
                     f"{type(response).__name__}"
                 )
+            logger.info(
+                "[TLI-DEBUG] gRPC adapter DraftForward handler returned %s",
+                _draft_response_debug_summary(response),
+            )
             if self.translator is not None and self.translate_responses_to_target_vocab:
                 response = response.to_target_vocab(self.translator)
-            return draft_response_to_proto(response, proto_module=self.proto_module)
+                logger.info(
+                    "[TLI-DEBUG] gRPC adapter DraftForward translated response %s",
+                    _draft_response_debug_summary(response),
+                )
+            logger.info(
+                "[TLI-DEBUG] gRPC adapter DraftForward proto encode enter request_id=%r "
+                "mode=%s",
+                response.request_id,
+                response.mode,
+            )
+            proto_response = draft_response_to_proto(
+                response, proto_module=self.proto_module
+            )
+            logger.info(
+                "[TLI-DEBUG] gRPC adapter DraftForward proto encode exit request_id=%r "
+                "mode=%s proto_type=%s",
+                response.request_id,
+                response.mode,
+                type(proto_response).__name__,
+            )
+            return proto_response
         except Exception as exc:
             logger.exception("TLI DraftForward RPC failed: %s", exc)
             if context is not None:
@@ -532,6 +598,14 @@ class TliSpeculativeBlockingClient:
         if self.translator is not None and translate_request_to_draft_vocab:
             request = request.to_draft_vocab(self.translator)
 
+        logger.info(
+            "[TLI-DEBUG] blocking client draft_forward enter %s timeout=%s "
+            "translate_request_to_draft_vocab=%s translate_response_to_target_vocab=%s",
+            _draft_request_debug_summary(request),
+            timeout,
+            translate_request_to_draft_vocab,
+            translate_response_to_target_vocab,
+        )
         proto_request = draft_request_to_proto(
             request,
             proto_module=None,
@@ -539,9 +613,24 @@ class TliSpeculativeBlockingClient:
             translate_to_draft_vocab=False,
         )
         proto_response = self._stub.DraftForward(proto_request, timeout=timeout)
+        logger.info(
+            "[TLI-DEBUG] blocking client draft_forward stub returned request_id=%r "
+            "mode=%s proto_type=%s",
+            request.request_id,
+            request.mode,
+            type(proto_response).__name__,
+        )
         response = draft_response_from_proto(proto_response)
+        logger.info(
+            "[TLI-DEBUG] blocking client draft_forward decoded response %s",
+            _draft_response_debug_summary(response),
+        )
         if self.translator is not None and translate_response_to_target_vocab:
             response = response.to_target_vocab(self.translator)
+            logger.info(
+                "[TLI-DEBUG] blocking client draft_forward translated response %s",
+                _draft_response_debug_summary(response),
+            )
         return response
 
     def close(self):
