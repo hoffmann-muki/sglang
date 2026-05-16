@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import zmq.asyncio
 
 from sglang.srt.entrypoints.grpc_server import (
     _install_request_manager_capture,
@@ -15,6 +16,7 @@ from sglang.srt.managers.io_struct import (
     TLIDraftForwardReqOutput,
 )
 from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,7 +32,8 @@ class _RequestManager:
 class _BridgeRequestManager:
     def __init__(self):
         self.server_args = SimpleNamespace(tli_rpc_timeout=1.0)
-        self.send_to_scheduler = _FakeSchedulerSocket()
+        self.context = zmq.asyncio.Context(2)
+        self.send_to_scheduler = _FakeSchedulerSocket(self.context)
         self.recv_from_scheduler = self.send_to_scheduler
 
     async def send_communicator_req(self, *args, **kwargs):
@@ -38,27 +41,30 @@ class _BridgeRequestManager:
 
 
 class _FakeSchedulerSocket:
-    def __init__(self):
+    def __init__(self, context):
+        self.context = context
         self.sent = []
         self.recv_queue = asyncio.Queue()
 
     def send_pyobj(self, obj):
         self.sent.append(obj)
         if isinstance(obj, TLIDraftForwardReqInput):
-            self.recv_queue.put_nowait(
-                TLIDraftForwardReqOutput(
-                    rid=obj.rid,
-                    success=True,
-                    message="",
-                    response=TLIDraftResponse(
-                        request_id=obj.request.request_id,
-                        parent_list=[],
-                        top_scores_index=[],
-                        draft_token_ids=[],
-                    ),
-                    tp_rank=obj.request.tp_rank,
-                )
+            output = TLIDraftForwardReqOutput(
+                rid=obj.rid,
+                success=True,
+                message="",
+                response=TLIDraftResponse(
+                    request_id=obj.request.request_id,
+                    parent_list=[],
+                    top_scores_index=[],
+                    draft_token_ids=[],
+                ),
+                tp_rank=obj.request.tp_rank,
             )
+            socket = get_zmq_socket(
+                self.context, zmq.PUSH, obj.reply_ipc_name, bind=False
+            )
+            socket.send_pyobj(output)
             self.recv_queue.put_nowait({"kind": "normal"})
 
     async def recv_pyobj(self):

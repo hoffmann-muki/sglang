@@ -3298,7 +3298,7 @@ class Scheduler(
 
     def handle_tli_draft_forward(
         self, recv_req: TLIDraftForwardReqInput
-    ) -> TLIDraftForwardReqOutput:
+    ) -> Optional[TLIDraftForwardReqOutput]:
         try:
             response_rid = recv_req.rid or getattr(recv_req.request, "request_id", "")
             local_tp_rank = getattr(self.tp_worker, "tp_rank", recv_req.request.tp_rank)
@@ -3319,13 +3319,14 @@ class Scheduler(
                     local_tp_rank,
                     recv_req.request.tp_rank,
                 )
-                return TLIDraftForwardReqOutput(
+                output = TLIDraftForwardReqOutput(
                     success=True,
                     message="",
                     response=None,
                     tp_rank=local_tp_rank,
                     rid=response_rid,
                 )
+                return self._send_tli_draft_forward_reply(output, recv_req)
             if not hasattr(self, "tli_draft_executor"):
                 from sglang.srt.speculative.tli_draft_executor import (
                     TLIDraftSchedulerExecutor,
@@ -3343,13 +3344,14 @@ class Scheduler(
                 response_rid,
                 type(response).__name__,
             )
-            return TLIDraftForwardReqOutput(
+            output = TLIDraftForwardReqOutput(
                 success=True,
                 message="",
                 response=response,
                 tp_rank=recv_req.request.tp_rank,
                 rid=response_rid,
             )
+            return self._send_tli_draft_forward_reply(output, recv_req)
         except Exception as exc:
             logger.exception("TLI draft forward failed: %s", exc)
             logger.info(
@@ -3358,13 +3360,47 @@ class Scheduler(
                 getattr(recv_req.request, "request_id", None),
                 exc,
             )
-            return TLIDraftForwardReqOutput(
+            output = TLIDraftForwardReqOutput(
                 success=False,
                 message=str(exc),
                 response=None,
                 tp_rank=recv_req.request.tp_rank,
                 rid=getattr(recv_req, "rid", ""),
             )
+            return self._send_tli_draft_forward_reply(output, recv_req)
+
+    def _send_tli_draft_forward_reply(
+        self,
+        output: TLIDraftForwardReqOutput,
+        recv_req: TLIDraftForwardReqInput,
+    ) -> Optional[TLIDraftForwardReqOutput]:
+        reply_ipc_name = getattr(recv_req, "reply_ipc_name", None)
+        if reply_ipc_name is None:
+            return output
+
+        if not hasattr(self, "_tli_draft_forward_reply_sockets"):
+            self._tli_draft_forward_reply_sockets = {}
+        socket = self._tli_draft_forward_reply_sockets.get(reply_ipc_name)
+        if socket is None:
+            context = getattr(self, "_tli_draft_forward_reply_context", None)
+            if context is None:
+                context = zmq.Context(1)
+                self._tli_draft_forward_reply_context = context
+            socket = get_zmq_socket(context, zmq.PUSH, reply_ipc_name, bind=False)
+            self._tli_draft_forward_reply_sockets[reply_ipc_name] = socket
+
+        logger.info(
+            "[TLI-DEBUG] scheduler TLI direct reply send enter rid=%r reply_ipc=%s",
+            getattr(output, "rid", None),
+            reply_ipc_name,
+        )
+        socket.send_pyobj(output)
+        logger.info(
+            "[TLI-DEBUG] scheduler TLI direct reply send exit rid=%r reply_ipc=%s",
+            getattr(output, "rid", None),
+            reply_ipc_name,
+        )
+        return None
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

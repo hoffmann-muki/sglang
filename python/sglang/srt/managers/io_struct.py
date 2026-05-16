@@ -1630,6 +1630,7 @@ class SlowDownReqOutput(BaseReq):
 @dataclass
 class TLIDraftForwardReqInput(BaseReq):
     request: TLIDraftRequest
+    reply_ipc_name: Optional[str] = None
 
 
 @dataclass

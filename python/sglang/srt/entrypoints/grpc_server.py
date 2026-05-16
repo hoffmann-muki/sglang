@@ -8,11 +8,13 @@ import asyncio
 import inspect
 import json
 import logging
+import tempfile
 import time
 import uuid
 from types import MethodType
 
 from aiohttp import web
+import zmq
 
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -21,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     TLIDraftForwardReqOutput,
 )
 from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.speculative.tli_disaggregation import (
     start_tli_draft_service,
     tli_draft_service_enabled,
@@ -87,56 +90,6 @@ def _check_communicator_results(results, action):
         msgs = " | ".join(r.message for r in failures)
         return web.Response(status=500, text=f"{action} failed: {msgs}\n")
     return None
-
-
-class _DraftForwardRecvProxy:
-    """Proxy the scheduler socket and intercept TLI responses."""
-
-    def __init__(self, recv_socket, pending_futures):
-        self._recv_socket = recv_socket
-        self._pending_futures = pending_futures
-
-    async def recv_pyobj(self):
-        while True:
-            recv_obj = await self._recv_socket.recv_pyobj()
-            if isinstance(recv_obj, TLIDraftForwardReqOutput):
-                rid = getattr(recv_obj, "rid", None)
-                pending = self._pending_futures.get(rid)
-                logger.info(
-                    "[TLI-DEBUG] draft recv-proxy got response rid=%r success=%s "
-                    "tp_rank=%s has_payload=%s pending=%s",
-                    rid,
-                    recv_obj.success,
-                    recv_obj.tp_rank,
-                    recv_obj.response is not None,
-                    pending is not None,
-                )
-                pending = self._pending_futures.pop(rid, None)
-                if pending is None:
-                    logger.warning(
-                        "Dropping orphan TLI DraftForward response with rid=%r.",
-                        rid,
-                    )
-                elif not pending.done():
-                    pending_loop = pending.get_loop()
-
-                    def _set_result():
-                        if not pending.done():
-                            pending.set_result(recv_obj)
-
-                    if pending_loop.is_running():
-                        pending_loop.call_soon_threadsafe(_set_result)
-                    else:
-                        _set_result()
-                    logger.info(
-                        "[TLI-DEBUG] draft recv-proxy delivered response rid=%r",
-                        rid,
-                    )
-                continue
-            return recv_obj
-
-    def __getattr__(self, name):
-        return getattr(self._recv_socket, name)
 
 
 def _add_admin_routes(app, request_manager):
@@ -293,24 +246,60 @@ def _install_tli_draft_forward_bridge(request_manager):
     """Attach a TLI draft-forward bridge to the live request manager."""
 
     pending_futures: dict[str, asyncio.Future] = {}
-    original_recv_from_scheduler = request_manager.recv_from_scheduler
     original_handle_tli_draft_forward = getattr(
         request_manager, "handle_tli_draft_forward", None
     )
     original_tli_draft_forward_communicator = getattr(
         request_manager, "tli_draft_forward_communicator", None
     )
-
-    request_manager.recv_from_scheduler = _DraftForwardRecvProxy(
-        original_recv_from_scheduler, pending_futures
+    reply_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+    reply_socket = get_zmq_socket(
+        request_manager.context, zmq.PULL, reply_ipc_name, bind=True
     )
+
     request_manager._tli_draft_forward_pending_futures = pending_futures
+    request_manager._tli_draft_forward_reply_ipc_name = reply_ipc_name
+    request_manager._tli_draft_forward_reply_socket = reply_socket
+
+    async def _poll_tli_draft_forward_replies():
+        logger.info(
+            "[TLI-DEBUG] draft reply poller enter reply_ipc_name=%s",
+            reply_ipc_name,
+        )
+        try:
+            while True:
+                recv_obj = await reply_socket.recv_pyobj()
+                rid = getattr(recv_obj, "rid", None)
+                pending = pending_futures.pop(rid, None)
+                logger.info(
+                    "[TLI-DEBUG] draft reply poller got response rid=%r type=%s "
+                    "success=%s has_payload=%s pending=%s",
+                    rid,
+                    type(recv_obj).__name__,
+                    getattr(recv_obj, "success", None),
+                    getattr(recv_obj, "response", None) is not None,
+                    pending is not None,
+                )
+                if pending is None:
+                    logger.warning(
+                        "Dropping orphan TLI DraftForward response with rid=%r.",
+                        rid,
+                    )
+                elif not pending.done():
+                    pending.set_result(recv_obj)
+        except asyncio.CancelledError:
+            logger.info("[TLI-DEBUG] draft reply poller cancelled")
+            raise
+
+    reply_poller_task = asyncio.create_task(_poll_tli_draft_forward_replies())
+    request_manager._tli_draft_forward_reply_poller_task = reply_poller_task
 
     async def _handle_tli_draft_forward(self, recv_req: TLIDraftForwardReqInput):
         rid = recv_req.rid or getattr(recv_req.request, "request_id", None)
         if rid is None:
             rid = f"tli-{uuid.uuid4().hex}"
         recv_req.rid = rid
+        recv_req.reply_ipc_name = reply_ipc_name
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -373,7 +362,6 @@ def _install_tli_draft_forward_bridge(request_manager):
     )
 
     def _restore_tli_draft_forward_bridge():
-        request_manager.recv_from_scheduler = original_recv_from_scheduler
         if original_handle_tli_draft_forward is None:
             if hasattr(request_manager, "handle_tli_draft_forward"):
                 delattr(request_manager, "handle_tli_draft_forward")
@@ -390,6 +378,17 @@ def _install_tli_draft_forward_bridge(request_manager):
             )
         if hasattr(request_manager, "_tli_draft_forward_pending_futures"):
             delattr(request_manager, "_tli_draft_forward_pending_futures")
+        if hasattr(request_manager, "_tli_draft_forward_reply_ipc_name"):
+            delattr(request_manager, "_tli_draft_forward_reply_ipc_name")
+        if hasattr(request_manager, "_tli_draft_forward_reply_socket"):
+            socket = request_manager._tli_draft_forward_reply_socket
+            delattr(request_manager, "_tli_draft_forward_reply_socket")
+            socket.close(linger=0)
+        if hasattr(request_manager, "_tli_draft_forward_reply_poller_task"):
+            task = request_manager._tli_draft_forward_reply_poller_task
+            delattr(request_manager, "_tli_draft_forward_reply_poller_task")
+            if not task.done():
+                task.cancel()
         if hasattr(request_manager, "_tli_draft_forward_bridge_restore"):
             delattr(request_manager, "_tli_draft_forward_bridge_restore")
 
