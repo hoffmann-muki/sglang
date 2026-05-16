@@ -3751,6 +3751,15 @@ class SenderWrapper:
         if self.socket is None:
             return
 
+        logger.info(
+            "[TLI-DEBUG] scheduler sender send_output type=%s rid=%r recv_type=%s "
+            "http_worker_ipc=%r",
+            type(output).__name__,
+            getattr(output, "rid", None),
+            type(recv_obj).__name__ if recv_obj is not None else None,
+            getattr(output, "http_worker_ipc", None),
+        )
+
         if (
             isinstance(recv_obj, BaseReq)
             and recv_obj.http_worker_ipc is not None
