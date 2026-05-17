@@ -286,7 +286,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
 
+    def available_size(self) -> int:
+        return self.token_to_kv_pool_allocator.available_size()
+
     def available_and_evictable_str(self) -> str:
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = self.available_size()
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
