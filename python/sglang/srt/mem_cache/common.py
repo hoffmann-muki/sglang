@@ -540,6 +540,20 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[CACHE-DEBUG] release_kv_cache enter rid=%r is_insert=%s "
+            "req_pool_idx=%s kv_committed_len=%s kv_allocated_len=%s "
+            "cache_protected_len=%s swa_evicted_seqlen=%s mamba_pool_idx=%s",
+            getattr(req, "rid", None),
+            is_insert,
+            getattr(req, "req_pool_idx", None),
+            getattr(req, "kv_committed_len", None),
+            getattr(req, "kv_allocated_len", None),
+            getattr(req, "cache_protected_len", None),
+            getattr(req, "swa_evicted_seqlen", None),
+            getattr(req, "mamba_pool_idx", None),
+        )
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -555,6 +569,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[CACHE-DEBUG] release_kv_cache after cache_finished_req rid=%r "
+            "req_pool_idx=%s kv_committed_len=%s kv_allocated_len=%s",
+            getattr(req, "rid", None),
+            getattr(req, "req_pool_idx", None),
+            getattr(req, "kv_committed_len", None),
+            getattr(req, "kv_allocated_len", None),
+        )
+
     # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
@@ -565,6 +589,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
+
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[CACHE-DEBUG] release_kv_cache pop_overallocated rid=%r "
+            "start_p=%s end_p=%s page_size=%s spec_algo=%s",
+            getattr(req, "rid", None),
+            start_p,
+            end_p,
+            page_size,
+            spec_algo,
+        )
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
@@ -581,6 +616,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "[CACHE-DEBUG] release_kv_cache freed rid=%r free_count=%s "
+                "indices_start=%s indices_end=%s",
+                getattr(req, "rid", None),
+                len(indices_to_free),
+                start_p,
+                end_p,
+            )
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
@@ -590,6 +634,20 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     tree_cache.req_to_token_pool.free(req)
+
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[CACHE-DEBUG] release_kv_cache exit rid=%r req_pool_idx=%s "
+            "kv_committed_len=%s kv_allocated_len=%s available=%s evictable=%s "
+            "protected=%s",
+            getattr(req, "rid", None),
+            getattr(req, "req_pool_idx", None),
+            getattr(req, "kv_committed_len", None),
+            getattr(req, "kv_allocated_len", None),
+            tree_cache.available_size(),
+            tree_cache.evictable_size(),
+            tree_cache.protected_size(),
+        )
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

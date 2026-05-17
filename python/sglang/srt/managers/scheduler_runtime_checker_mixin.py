@@ -576,6 +576,10 @@ class SchedulerRuntimeCheckerMixin:
         # memory leak check
         has_leak, messages = self._check_all_pools(self.get_pool_stats())
         if has_leak:
+            logger.warning(
+                "[Mem Check (IDLE)] leak detected before raise: %s",
+                "\n".join(messages),
+            )
             self._report_leak("pool", "\n".join(messages))
         self._check_req_pool()
 
