@@ -23,7 +23,9 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.standalone_worker import StandaloneWorker
-from sglang.srt.speculative.vocab_mapping import VocabMapping
+from sglang.srt.speculative.tli_token_translator import (
+    TLITokenTranslator,
+)
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
@@ -118,7 +120,7 @@ class TLIWorker(StandaloneWorker):
             tokenizer_backend=server_args.tokenizer_backend,
         )
 
-        self.vocab_mapping = VocabMapping(
+        self.vocab_mapping = TLITokenTranslator(
             target_tokenizer=target_tokenizer,
             draft_tokenizer=draft_tokenizer,
             target_vocab_size=target_worker.model_runner.model_config.vocab_size,

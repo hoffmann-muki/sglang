@@ -279,7 +279,7 @@ def _install_draft_forward_bridge(request_manager):
     async def _handle_draft_forward(self, recv_req: DraftForwardReqInput):
         rid = recv_req.rid or getattr(recv_req.request, "request_id", None)
         if rid is None:
-            rid = f"tli-{uuid.uuid4().hex}"
+            rid = f"draft-forward-{uuid.uuid4().hex}"
         recv_req.rid = rid
         recv_req.reply_ipc_name = reply_ipc_name
 

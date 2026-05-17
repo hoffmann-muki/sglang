@@ -11,7 +11,7 @@ from sglang.srt.speculative.vocab_mapping import VocabMapping
 
 
 class TLITokenTranslator(VocabMapping):
-    """Bidirectional target/draft token translator for disaggregated TLI."""
+    """Bidirectional target/draft token translator for TLI speculative decoding."""
 
     def translate_target_to_draft_ids(self, target_ids: torch.Tensor) -> torch.Tensor:
         return super().map_target_to_draft_ids(target_ids)

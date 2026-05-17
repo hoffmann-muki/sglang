@@ -301,21 +301,21 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
 
-## TLI target/draft disaggregation
+## TLI draft-forward target/draft disaggregation
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--tli-disaggregation-role` | Role for disaggregated TLI. `target` runs the verification side and `draft` runs the draft model on the gRPC serving path while also starting the TLI DraftForward sidecar. | `none` | `none`, `target`, `draft` |
-| `--tli-draft-server-addr` | Target-side address of the draft gRPC service, formatted as `host:port`. | `None` | Type: str |
-| `--tli-draft-tokenizer-path` | Tokenizer path for the draft model. Required on the target node so target tokens can be translated into draft tokens. | `None` | Type: str |
-| `--tli-draft-tp-size` | Tensor-parallel size of the remote draft node. Use `1` for the asymmetric disaggregated setup; if omitted, the target defaults to its own `--tp` for the existing symmetric TLI path. | `None` | Type: int |
-| `--tli-service-host` | Draft-side bind host for the TLI `DraftForward` gRPC service. | `None` | Type: str |
-| `--tli-service-port` | Draft-side bind port for the TLI `DraftForward` gRPC service. | `None` | Type: int |
-| `--tli-rpc-timeout` | Optional timeout in seconds for target-to-draft TLI RPC calls. | `None` | Type: float |
-| `--tli-target-tokenizer-path` | Tokenizer path for the target model. Required on the draft node so draft-side token IDs can be translated back to the target vocabulary. | `None` | Type: str |
-| `--tli-grpc-use-tls` | Enable TLS for the TLI gRPC transport. | `False` | bool flag (set to enable) |
-| `--tli-grpc-certfile` | TLS certificate chain for the draft-side gRPC server. | `None` | Type: str |
-| `--tli-grpc-keyfile` | Private key for the draft-side gRPC server. | `None` | Type: str |
-| `--tli-grpc-ca-certs` | CA bundle used to verify the peer in TLS/mTLS mode. | `None` | Type: str |
+| `--draft-disaggregation-role` | Role for draft-forward disaggregation. `target` runs the verification side and `draft` runs the draft model on the gRPC serving path while also starting the DraftForward sidecar. | `none` | `none`, `target`, `draft` |
+| `--remote-draft-server-addr` | Target-side address of the draft gRPC service, formatted as `host:port`. | `None` | Type: str |
+| `--remote-draft-tokenizer-path` | Tokenizer path for the draft model. Required on the target node so target tokens can be translated into draft tokens. | `None` | Type: str |
+| `--remote-draft-tp-size` | Tensor-parallel size of the remote draft node. Use `1` for the asymmetric disaggregated setup; if omitted, the target defaults to its own `--tp` for the existing symmetric draft-forward path. | `None` | Type: int |
+| `--draft-forward-service-host` | Draft-side bind host for the DraftForward gRPC service. | `None` | Type: str |
+| `--draft-forward-service-port` | Draft-side bind port for the DraftForward gRPC service. | `None` | Type: int |
+| `--draft-forward-rpc-timeout` | Optional timeout in seconds for target-to-draft DraftForward RPC calls. | `None` | Type: float |
+| `--draft-forward-target-tokenizer-path` | Tokenizer path for the target model. Required on the draft node so draft-side token IDs can be translated back to the target vocabulary. | `None` | Type: str |
+| `--draft-forward-grpc-use-tls` | Enable TLS for the DraftForward gRPC transport. | `False` | bool flag (set to enable) |
+| `--draft-forward-grpc-certfile` | TLS certificate chain for the draft-side gRPC server. | `None` | Type: str |
+| `--draft-forward-grpc-keyfile` | Private key for the draft-side gRPC server. | `None` | Type: str |
+| `--draft-forward-grpc-ca-certs` | CA bundle used to verify the peer in TLS/mTLS mode. | `None` | Type: str |
 
 ## Multi-layer Eagle speculative decoding
 | Argument | Description | Defaults | Options |

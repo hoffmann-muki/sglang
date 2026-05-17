@@ -42,7 +42,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
 | STANDALONE | Smaller draft LLM (token-level, same vocabulary) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
-| TLI | Smaller draft LLM with heterogeneous vocabulary | Yes | `--speculative-algorithm TLI` + `--tli-draft-tokenizer-path ...` | Lossless; requires overlap; does **not** support `--enable-dp-attention` |
+| TLI | Smaller draft LLM with heterogeneous vocabulary | Yes | `--speculative-algorithm TLI` + `--remote-draft-tokenizer-path ...` | Lossless; requires overlap; does **not** support `--enable-dp-attention` |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
 
@@ -338,11 +338,17 @@ print(response.choices[0].message.content)
 
 TLI extends standalone speculative decoding to draft models whose tokenizer differs from the target model. It computes the token intersection at startup, maps token IDs between vocabularies, and masks draft logits so speculative sampling only considers intersection tokens.
 
+TLI can run in two configurations:
+- Colocated TLI, where the target and draft live in the same serving process.
+- Draft-forward disaggregation, where the target and draft run on separate nodes and communicate over the DraftForward transport.
+
+### Draft-forward target/draft disaggregation
+
 ### Constraints
 
-- Requires `--tli-draft-tokenizer-path` on the target node and `--tli-target-tokenizer-path` on the draft node.
-- For disaggregated deployment, the target node may set `--tli-draft-tp-size 1` to use a single-rank draft service while keeping a multi-rank target.
-- The draft node uses the gRPC serving path and starts the TLI DraftForward sidecar independently of the removed smg-grpc-servicer callback hook.
+- Requires `--remote-draft-tokenizer-path` on the target node and `--draft-forward-target-tokenizer-path` on the draft node.
+- For disaggregated deployment, the target node may set `--remote-draft-tp-size 1` to use a single-rank draft service while keeping a multi-rank target.
+- The draft node uses the gRPC serving path and starts the DraftForward sidecar independently of the removed smg-grpc-servicer callback hook.
 - Does not support `--enable-dp-attention`.
 - Does not support SpecV2 / the overlap scheduler.
 - Requires `--speculative-eagle-topk 1`.
@@ -357,10 +363,10 @@ python3 -m sglang.launch_server \
     --host 0.0.0.0 \
     --port 30001 \
     --model-path Qwen/Qwen2.5-0.5B-Instruct \
-    --tli-disaggregation-role draft \
-    --tli-service-host 0.0.0.0 \
-    --tli-service-port 31000 \
-    --tli-target-tokenizer-path meta-llama/Llama-3.1-8B-Instruct \
+    --draft-disaggregation-role draft \
+    --draft-forward-service-host 0.0.0.0 \
+    --draft-forward-service-port 31000 \
+    --draft-forward-target-tokenizer-path meta-llama/Llama-3.1-8B-Instruct \
     --tp 1
 
 # Target node
@@ -369,10 +375,10 @@ python3 -m sglang.launch_server \
     --port 30000 \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-algorithm TLI \
-    --tli-disaggregation-role target \
-    --tli-draft-server-addr 127.0.0.1:31000 \
-    --tli-draft-tokenizer-path Qwen/Qwen2.5-0.5B-Instruct \
-    --tli-draft-tp-size 1 \
+    --draft-disaggregation-role target \
+    --remote-draft-server-addr 127.0.0.1:31000 \
+    --remote-draft-tokenizer-path Qwen/Qwen2.5-0.5B-Instruct \
+    --remote-draft-tp-size 1 \
     --speculative-num-draft-tokens 5 \
     --tp 4
 ```
