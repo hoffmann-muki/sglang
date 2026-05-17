@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -15,6 +16,27 @@ register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
 
 class TestBuildEagleTree(unittest.TestCase):
     """Unit tests for build_eagle_tree functionality."""
+
+    def test_get_tree_verified_id_compacts_flat_verified_tokens(self):
+        draft_input = EagleDraftInput(
+            verified_id=torch.tensor(
+                [101, 201, 202, 203, 301, 302, 401, 402],  # 1, 3, 2, 2 tokens
+                device=get_device(),
+                dtype=torch.int32,
+            ),
+            accept_length=torch.tensor(
+                [0, 2, 1, 1], device=get_device(), dtype=torch.int32
+            ),
+        )
+
+        tree_verified_id = draft_input.get_tree_verified_id()
+
+        self.assertTrue(
+            torch.equal(
+                tree_verified_id.cpu(),
+                torch.tensor([101, 203, 302, 402], dtype=torch.int32),
+            )
+        )
 
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""

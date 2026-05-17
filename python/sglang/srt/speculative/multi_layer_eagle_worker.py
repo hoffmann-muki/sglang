@@ -440,7 +440,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.get_tree_verified_id(),
             parent_list,
             top_scores_index,
             draft_tokens,

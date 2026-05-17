@@ -587,7 +587,7 @@ class RemoteDraftWorker(EAGLEWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.get_tree_verified_id(),
             response.parent_list.to(self.device),
             response.top_scores_index.to(self.device),
             response.draft_token_ids.to(self.device),

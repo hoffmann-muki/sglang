@@ -82,6 +82,53 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
+    def get_tree_verified_id(self) -> torch.Tensor:
+        """Return one verified token per request for tree construction.
+
+        ``verified_id`` remains flattened for extend-after-decode, where we need
+        the full accepted-token sequence. Tree construction, however, needs one
+        anchor token per request. When the payload is flattened across requests,
+        use ``accept_length`` to select the last token from each request chunk.
+        """
+        verified_id = self.verified_id
+        if verified_id is None:
+            device = (
+                self.hidden_states.device
+                if self.hidden_states is not None
+                else "cpu"
+            )
+            return torch.empty((0,), dtype=torch.int32, device=device)
+
+        verified_id = verified_id.flatten()
+        if verified_id.numel() == 0:
+            return verified_id
+
+        accept_length = self.accept_length
+        if accept_length is None:
+            return verified_id
+
+        accept_length = accept_length.to(device=verified_id.device, dtype=torch.long)
+        if accept_length.numel() == 0:
+            return verified_id
+
+        if verified_id.numel() == accept_length.numel():
+            return verified_id
+
+        token_counts = accept_length + 1
+        if verified_id.numel() != int(token_counts.sum().item()):
+            return verified_id
+
+        row_starts = torch.cumsum(
+            torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.long, device=verified_id.device),
+                    token_counts[:-1],
+                )
+            ),
+            dim=0,
+        )
+        return verified_id[row_starts + accept_length]
+
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
