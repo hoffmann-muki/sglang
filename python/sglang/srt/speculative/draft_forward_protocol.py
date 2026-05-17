@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RPC-friendly request/response objects for disaggregated TLI speculative decoding."""
+"""RPC-friendly request/response objects for remote draft forwarding."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 if TYPE_CHECKING:
     from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 
-TLIDraftMode = Literal["extend", "decode", "extend_after_decode", "release"]
+DraftForwardMode = Literal["extend", "decode", "extend_after_decode", "release"]
 
 
 @dataclass(slots=True)
-class TLIDraftRequest:
+class DraftForwardRequest:
     """Request sent from the target server to the draft server."""
 
     request_id: str
@@ -27,7 +27,7 @@ class TLIDraftRequest:
     input_ids: Optional[torch.Tensor] = None
     tp_rank: int = 0
     tp_size: int = 1
-    mode: TLIDraftMode = "decode"
+    mode: DraftForwardMode = "decode"
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     topk: int = 1
     speculative_num_steps: int = 1
@@ -39,8 +39,11 @@ class TLIDraftRequest:
     seq_lens_for_draft_extend: Optional[torch.Tensor] = None
     seq_lens_for_draft_extend_cpu: Optional[torch.Tensor] = None
     mm_input_embeds: Optional[torch.Tensor] = None
+    round_ids: Optional[List[int]] = None
+    token_positions: Optional[List[int]] = None
+    prefix_versions: Optional[List[int]] = None
 
-    def to_draft_vocab(self, translator: TLITokenTranslator) -> TLIDraftRequest:
+    def to_draft_vocab(self, translator: TLITokenTranslator) -> DraftForwardRequest:
         """Translate token-id payloads into draft vocabulary.
 
         Only fields that represent vocabulary IDs are translated here. Structural
@@ -59,19 +62,22 @@ class TLIDraftRequest:
 
 
 @dataclass(slots=True)
-class TLIDraftResponse:
+class DraftForwardResponse:
     """Response sent from the draft server back to the target server."""
 
     request_id: str
     parent_list: torch.Tensor
     top_scores_index: torch.Tensor
     draft_token_ids: torch.Tensor
-    mode: TLIDraftMode = "decode"
+    mode: DraftForwardMode = "decode"
     next_hidden_states: Optional[torch.Tensor] = None
     next_topk_p: Optional[torch.Tensor] = None
     next_topk_index: Optional[torch.Tensor] = None
+    round_ids: Optional[List[int]] = None
+    token_positions: Optional[List[int]] = None
+    prefix_versions: Optional[List[int]] = None
 
-    def to_target_vocab(self, translator: TLITokenTranslator) -> TLIDraftResponse:
+    def to_target_vocab(self, translator: TLITokenTranslator) -> DraftForwardResponse:
         """Translate token-id payloads back into target vocabulary.
 
         ``parent_list`` and ``top_scores_index`` are structural indices and are

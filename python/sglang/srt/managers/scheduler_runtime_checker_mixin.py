@@ -156,7 +156,7 @@ class SchedulerRuntimeCheckerMixin:
         return idxs
 
     def _draft_executor(self: Scheduler):
-        return getattr(self, "tli_draft_executor", None)
+        return getattr(self, "remote_draft_executor", None)
 
     def _draft_executor_held_tokens(self: Scheduler) -> int:
         draft_executor = self._draft_executor()
@@ -180,7 +180,7 @@ class SchedulerRuntimeCheckerMixin:
         """Tokens intentionally retained outside the active batch.
 
         This includes streaming-session slots plus draft-executor-held request
-        states that are kept alive across TLI RPC boundaries.
+        states that are kept alive across DraftForward RPC boundaries.
         """
         return self.tree_cache.session_held_tokens(self._active_pool_idxs()) + (
             self._draft_executor_held_tokens()
@@ -197,9 +197,10 @@ class SchedulerRuntimeCheckerMixin:
         )
 
     def _session_held_req_count(self: Scheduler) -> int:
-        return self.tree_cache.session_held_req_count(
-            self._active_pool_idxs()
-        ) + self._draft_executor_held_req_count()
+        return (
+            self.tree_cache.session_held_req_count(self._active_pool_idxs())
+            + self._draft_executor_held_req_count()
+        )
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:

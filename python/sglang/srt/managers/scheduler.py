@@ -136,8 +136,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
-    TLIDraftForwardReqInput,
-    TLIDraftForwardReqOutput,
+    DraftForwardReqInput,
+    DraftForwardReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
@@ -1072,7 +1072,7 @@ class Scheduler(
             or self.spec_algorithm.is_ngram()
             or (
                 self.spec_algorithm.is_tli()
-                and self.server_args.tli_disaggregation_role == "target"
+                and self.server_args.draft_disaggregation_role == "target"
             )
         ):
             draft_token_to_kv_pool = None
@@ -1330,7 +1330,7 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
-                (TLIDraftForwardReqInput, self.handle_tli_draft_forward),
+                (DraftForwardReqInput, self.handle_draft_forward),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
@@ -3254,8 +3254,8 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
-            if hasattr(self, "tli_draft_executor"):
-                self.tli_draft_executor.clear()
+            if hasattr(self, "remote_draft_executor"):
+                self.remote_draft_executor.clear()
 
             if empty_cache:
                 torch.cuda.empty_cache()
@@ -3296,66 +3296,66 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=ret)
 
-    def handle_tli_draft_forward(
-        self, recv_req: TLIDraftForwardReqInput
-    ) -> Optional[TLIDraftForwardReqOutput]:
+    def handle_draft_forward(
+        self, recv_req: DraftForwardReqInput
+    ) -> Optional[DraftForwardReqOutput]:
         try:
             response_rid = recv_req.rid or getattr(recv_req.request, "request_id", "")
             local_tp_rank = getattr(self.tp_worker, "tp_rank", recv_req.request.tp_rank)
             if local_tp_rank != recv_req.request.tp_rank:
-                output = TLIDraftForwardReqOutput(
+                output = DraftForwardReqOutput(
                     success=True,
                     message="",
                     response=None,
                     tp_rank=local_tp_rank,
                     rid=response_rid,
                 )
-                return self._send_tli_draft_forward_reply(output, recv_req)
-            if not hasattr(self, "tli_draft_executor"):
-                from sglang.srt.speculative.tli_draft_executor import (
-                    TLIDraftSchedulerExecutor,
+                return self._send_draft_forward_reply(output, recv_req)
+            if not hasattr(self, "remote_draft_executor"):
+                from sglang.srt.speculative.remote_draft_executor import (
+                    RemoteDraftSchedulerExecutor,
                 )
 
-                self.tli_draft_executor = TLIDraftSchedulerExecutor(self)
-            response = self.tli_draft_executor.handle(recv_req.request)
-            output = TLIDraftForwardReqOutput(
+                self.remote_draft_executor = RemoteDraftSchedulerExecutor(self)
+            response = self.remote_draft_executor.handle(recv_req.request)
+            output = DraftForwardReqOutput(
                 success=True,
                 message="",
                 response=response,
                 tp_rank=recv_req.request.tp_rank,
                 rid=response_rid,
             )
-            return self._send_tli_draft_forward_reply(output, recv_req)
+            return self._send_draft_forward_reply(output, recv_req)
         except Exception as exc:
-            logger.exception("TLI draft forward failed: %s", exc)
-            output = TLIDraftForwardReqOutput(
+            logger.exception("DraftForward failed: %s", exc)
+            output = DraftForwardReqOutput(
                 success=False,
                 message=str(exc),
                 response=None,
                 tp_rank=recv_req.request.tp_rank,
                 rid=getattr(recv_req, "rid", ""),
             )
-            return self._send_tli_draft_forward_reply(output, recv_req)
+            return self._send_draft_forward_reply(output, recv_req)
 
-    def _send_tli_draft_forward_reply(
+    def _send_draft_forward_reply(
         self,
-        output: TLIDraftForwardReqOutput,
-        recv_req: TLIDraftForwardReqInput,
-    ) -> Optional[TLIDraftForwardReqOutput]:
+        output: DraftForwardReqOutput,
+        recv_req: DraftForwardReqInput,
+    ) -> Optional[DraftForwardReqOutput]:
         reply_ipc_name = getattr(recv_req, "reply_ipc_name", None)
         if reply_ipc_name is None:
             return output
 
-        if not hasattr(self, "_tli_draft_forward_reply_sockets"):
-            self._tli_draft_forward_reply_sockets = {}
-        socket = self._tli_draft_forward_reply_sockets.get(reply_ipc_name)
+        if not hasattr(self, "_draft_forward_reply_sockets"):
+            self._draft_forward_reply_sockets = {}
+        socket = self._draft_forward_reply_sockets.get(reply_ipc_name)
         if socket is None:
-            context = getattr(self, "_tli_draft_forward_reply_context", None)
+            context = getattr(self, "_draft_forward_reply_context", None)
             if context is None:
                 context = zmq.Context(1)
-                self._tli_draft_forward_reply_context = context
+                self._draft_forward_reply_context = context
             socket = get_zmq_socket(context, zmq.PUSH, reply_ipc_name, bind=False)
-            self._tli_draft_forward_reply_sockets[reply_ipc_name] = socket
+            self._draft_forward_reply_sockets[reply_ipc_name] = socket
 
         socket.send_pyobj(output)
         return None

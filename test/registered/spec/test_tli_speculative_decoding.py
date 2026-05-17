@@ -17,7 +17,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-large")
 
 GSM_DATASET_PATH = None
@@ -57,7 +56,7 @@ class _TliSpecBase(CustomTestCase):
 
     @classmethod
     def get_server_args(cls):
-        return COMMON_SERVER_ARGS + ["--tli-draft-tokenizer-path", cls.draft_model]
+        return COMMON_SERVER_ARGS + ["--remote-draft-tokenizer-path", cls.draft_model]
 
     @classmethod
     def setUpClass(cls):

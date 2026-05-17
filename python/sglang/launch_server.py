@@ -26,10 +26,10 @@ def run_server(server_args):
             from sglang.srt.disaggregation.encode_server import launch_server
 
             launch_server(server_args)
-    elif server_args.tli_disaggregation_role == "draft" or server_args.grpc_mode:
+    elif server_args.draft_disaggregation_role == "draft" or server_args.grpc_mode:
         # TODO: Once the native Rust gRPC server starts alongside HTTP in the
         # default path below (controlled by SGLANG_ENABLE_GRPC / SGLANG_GRPC_PORT),
-        # remove this legacy SMG path and the grpc_mode flag.
+        # remove this dedicated gRPC-only serving path and the grpc_mode flag.
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
         asyncio.run(serve_grpc(server_args))

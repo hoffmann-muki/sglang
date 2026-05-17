@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Remote-target worker for disaggregated TLI speculative decoding.
+"""Remote-target worker for disaggregated draft-forward speculative decoding.
 
 This worker runs the target model locally and delegates draft-model operations to
-the TLI DraftForward gRPC service. It intentionally does not allocate or load a
+the DraftForward gRPC service. It intentionally does not allocate or load a
 local draft model.
 """
 
@@ -26,11 +26,16 @@ from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import fast_topk
-from sglang.srt.speculative.tli_disaggregation import (
-    build_tli_channel_credentials,
+from sglang.srt.speculative.draft_disaggregation import (
+    build_draft_forward_channel_credentials,
 )
-from sglang.srt.speculative.tli_grpc_transport import TliSpeculativeBlockingClient
-from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
+from sglang.srt.speculative.draft_forward_grpc_transport import (
+    StreamingDraftForwardClient,
+)
+from sglang.srt.speculative.draft_forward_protocol import (
+    DraftForwardRequest,
+    DraftForwardResponse,
+)
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.srt.utils.common import broadcast_pyobj
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -43,12 +48,20 @@ class _BroadcastedDraftResult:
     """Target-side wrapper used to fan a rank-0 draft RPC result out to TP ranks."""
 
     ok: bool
-    response: TLIDraftResponse | None = None
+    response: DraftForwardResponse | None = None
     error: str | None = None
 
 
-class RemoteTLIWorker(EAGLEWorker):
-    """Target-side TLI worker that talks to a remote draft/speculator service."""
+@dataclass(slots=True)
+class _TargetRequestOrdering:
+    """Target-side monotonically increasing per-request ordering state."""
+
+    round_id: int = 0
+    prefix_version: int = 0
+
+
+class RemoteDraftWorker(EAGLEWorker):
+    """Target-side worker that talks to a remote draft/speculator service."""
 
     def __init__(
         self,
@@ -83,19 +96,23 @@ class RemoteTLIWorker(EAGLEWorker):
             target_worker.get_memory_pool()
         )
         self.active_request_ids: set[str] = set()
-        self.remote_draft_tp_size = server_args.tli_draft_tp_size or self.tp_size
+        self._request_ordering: dict[str, _TargetRequestOrdering] = {}
+        self.remote_draft_tp_size = server_args.remote_draft_tp_size or self.tp_size
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        if server_args.tli_draft_server_addr is None:
-            raise ValueError("RemoteTLIWorker requires --tli-draft-server-addr.")
+        remote_draft_server_addr = server_args.remote_draft_server_addr
+        if remote_draft_server_addr is None:
+            raise ValueError("RemoteDraftWorker requires --remote-draft-server-addr.")
 
         target_tokenizer_path = server_args.tokenizer_path
-        draft_tokenizer_path = server_args.tli_draft_tokenizer_path
+        draft_tokenizer_path = server_args.remote_draft_tokenizer_path
         if draft_tokenizer_path is None:
-            raise ValueError("RemoteTLIWorker requires --tli-draft-tokenizer-path.")
+            raise ValueError(
+                "RemoteDraftWorker requires --remote-draft-tokenizer-path."
+            )
         target_tokenizer = get_tokenizer(
             target_tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
@@ -118,25 +135,26 @@ class RemoteTLIWorker(EAGLEWorker):
             draft_vocab_size=draft_vocab_size,
             device=torch.device(self.device),
         )
-        self.client = TliSpeculativeBlockingClient(
-            server_args.tli_draft_server_addr,
+        self.client = StreamingDraftForwardClient(
+            remote_draft_server_addr,
             translator=self.vocab_mapping,
-            channel_credentials=build_tli_channel_credentials(server_args),
+            channel_credentials=build_draft_forward_channel_credentials(server_args),
         )
         logger.info(
-            "RemoteTLIWorker initialized; draft RPC target=%s draft_tp_size=%d "
+            "RemoteDraftWorker initialized; DraftForward target=%s draft_tp_size=%d "
             "mode=%s",
-            server_args.tli_draft_server_addr,
+            remote_draft_server_addr,
             self.remote_draft_tp_size,
             "asymmetric" if self.uses_rank0_broadcast else "symmetric",
         )
 
     @property
     def draft_model_runner(self):
-        raise RuntimeError("RemoteTLIWorker does not own a local draft model runner.")
+        raise RuntimeError("RemoteDraftWorker does not own a local draft model runner.")
 
     def clear_cache_pool(self):
         self._release_request_ids(sorted(self.active_request_ids))
+        self._request_ordering.clear()
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
         constrained_logits = self.vocab_mapping.constrain_draft_logits(
@@ -149,6 +167,8 @@ class RemoteTLIWorker(EAGLEWorker):
     def _request_ids(self, batch) -> list[str]:
         request_ids = [req.rid for req in batch.reqs]
         self.active_request_ids.update(request_ids)
+        for request_id in request_ids:
+            self._request_ordering.setdefault(request_id, _TargetRequestOrdering())
         return request_ids
 
     def _request_ids_for_spec_info(
@@ -164,10 +184,101 @@ class RemoteTLIWorker(EAGLEWorker):
             for req_pool_idx in req_pool_indices.to("cpu").tolist()
         ]
         self.active_request_ids.update(request_ids)
+        for request_id in request_ids:
+            self._request_ordering.setdefault(request_id, _TargetRequestOrdering())
         return request_ids
 
     def _batch_request_id(self, request_ids: list[str], mode: str) -> str:
         return f"{mode}:{','.join(request_ids)}"
+
+    def _request_by_id(self, batch) -> dict[str, object]:
+        return {req.rid: req for req in batch.reqs}
+
+    def _token_positions_for_request_ids(
+        self,
+        request_ids: list[str],
+        req_by_id: dict[str, object],
+    ) -> list[int]:
+        positions = []
+        for request_id in request_ids:
+            req = req_by_id.get(request_id)
+            if req is None:
+                positions.append(0)
+            else:
+                positions.append(len(req.origin_input_ids) + len(req.output_ids))
+        return positions
+
+    def _attach_ordering_metadata(
+        self,
+        request: DraftForwardRequest,
+        *,
+        request_ids: list[str],
+        token_positions: list[int],
+        advance_round: bool,
+        prefix_versions: list[int] | None = None,
+    ) -> DraftForwardRequest:
+        round_ids = []
+        request_prefix_versions = []
+        for request_id in request_ids:
+            state = self._request_ordering.setdefault(
+                request_id,
+                _TargetRequestOrdering(),
+            )
+            if advance_round:
+                state.round_id += 1
+            round_ids.append(state.round_id)
+            request_prefix_versions.append(state.prefix_version)
+        request.round_ids = round_ids
+        request.token_positions = token_positions
+        request.prefix_versions = prefix_versions or request_prefix_versions
+        return request
+
+    def _next_prefix_versions(
+        self,
+        request_ids: list[str],
+        accepted_lengths: list[int],
+    ) -> list[int]:
+        prefix_versions = []
+        for request_id, accepted_len in zip(request_ids, accepted_lengths):
+            state = self._request_ordering.setdefault(
+                request_id,
+                _TargetRequestOrdering(),
+            )
+            prefix_versions.append(state.prefix_version + int(accepted_len) + 1)
+        return prefix_versions
+
+    def _commit_prefix_versions(
+        self,
+        request_ids: list[str],
+        prefix_versions: list[int],
+    ) -> None:
+        for request_id, prefix_version in zip(request_ids, prefix_versions):
+            self._request_ordering.setdefault(
+                request_id,
+                _TargetRequestOrdering(),
+            ).prefix_version = prefix_version
+
+    @staticmethod
+    def _validate_ordering_response(
+        request: DraftForwardRequest,
+        response: DraftForwardResponse,
+    ) -> None:
+        expected = (
+            getattr(request, "round_ids", None),
+            getattr(request, "token_positions", None),
+            getattr(request, "prefix_versions", None),
+        )
+        actual = (
+            getattr(response, "round_ids", None),
+            getattr(response, "token_positions", None),
+            getattr(response, "prefix_versions", None),
+        )
+        if actual != expected:
+            raise RuntimeError(
+                "DraftForward response ordering metadata mismatch: "
+                f"request_id={request.request_id!r}, expected={expected}, "
+                f"actual={actual}"
+            )
 
     @property
     def uses_rank0_broadcast(self) -> bool:
@@ -181,19 +292,21 @@ class RemoteTLIWorker(EAGLEWorker):
 
     def _run_rank0_broadcasted_draft_forward(
         self,
-        request: TLIDraftRequest,
+        request: DraftForwardRequest,
         *,
         timeout: float | None,
         translate_request_to_draft_vocab: bool,
         translate_response_to_target_vocab: bool,
-    ) -> TLIDraftResponse:
+    ) -> DraftForwardResponse:
         if not self.uses_rank0_broadcast:
-            return self.client.draft_forward(
+            response = self.client.draft_forward(
                 request,
                 timeout=timeout,
                 translate_request_to_draft_vocab=translate_request_to_draft_vocab,
                 translate_response_to_target_vocab=translate_response_to_target_vocab,
             )
+            self._validate_ordering_response(request, response)
+            return response
 
         world_group = self.target_worker.world_group
         is_root = world_group.is_first_rank
@@ -208,7 +321,7 @@ class RemoteTLIWorker(EAGLEWorker):
                 )
                 payload = [_BroadcastedDraftResult(ok=True, response=response)]
             except Exception:
-                logger.exception("TLI DraftForward RPC failed on target root rank.")
+                logger.exception("DraftForward RPC failed on target root rank.")
                 payload = [
                     _BroadcastedDraftResult(
                         ok=False,
@@ -226,13 +339,14 @@ class RemoteTLIWorker(EAGLEWorker):
         )[0]
         if not broadcasted.ok:
             raise RuntimeError(
-                "TLI DraftForward RPC failed on the target root rank:\n"
+                "DraftForward RPC failed on the target root rank:\n"
                 f"{broadcasted.error}"
             )
         if broadcasted.response is None:
             raise RuntimeError(
-                "TLI DraftForward RPC succeeded but returned no response payload."
+                "DraftForward RPC succeeded but returned no response payload."
             )
+        self._validate_ordering_response(request, broadcasted.response)
         return broadcasted.response
 
     def _draft_extend_input_ids(self, batch) -> torch.Tensor:
@@ -243,7 +357,7 @@ class RemoteTLIWorker(EAGLEWorker):
     def _apply_next_draft_state(
         self,
         draft_input: EagleDraftInput,
-        response: TLIDraftResponse,
+        response: DraftForwardResponse,
         mode: str,
     ):
         if (
@@ -252,7 +366,7 @@ class RemoteTLIWorker(EAGLEWorker):
             or response.next_hidden_states is None
         ):
             raise RuntimeError(
-                f"TLI draft service returned a {mode} response without next "
+                f"DraftForward service returned a {mode} response without next "
                 "draft state (next_topk_p, next_topk_index, next_hidden_states)."
             )
         draft_input.topk_p = response.next_topk_p.to(self.device)
@@ -262,7 +376,7 @@ class RemoteTLIWorker(EAGLEWorker):
     def _release_request_ids(self, request_ids: list[str]) -> None:
         if not request_ids:
             return
-        release_request = TLIDraftRequest(
+        release_request = DraftForwardRequest(
             request_id=f"release:{','.join(request_ids)}",
             request_ids=request_ids,
             verified_id=torch.empty((0,), dtype=torch.int64),
@@ -273,11 +387,13 @@ class RemoteTLIWorker(EAGLEWorker):
         )
         self._run_rank0_broadcasted_draft_forward(
             release_request,
-            timeout=self.server_args.tli_rpc_timeout,
+            timeout=self.server_args.draft_forward_rpc_timeout,
             translate_request_to_draft_vocab=False,
             translate_response_to_target_vocab=False,
         )
         self.active_request_ids.difference_update(request_ids)
+        for request_id in request_ids:
+            self._request_ordering.pop(request_id, None)
 
     def forward_batch_generation(self, batch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -344,6 +460,7 @@ class RemoteTLIWorker(EAGLEWorker):
         mm_input_embeds=None,
     ):
         request_ids = self._request_ids(batch)
+        req_by_id = self._request_by_id(batch)
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
@@ -351,7 +468,7 @@ class RemoteTLIWorker(EAGLEWorker):
             num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
-        request = TLIDraftRequest(
+        request = DraftForwardRequest(
             request_id=self._batch_request_id(request_ids, "extend"),
             request_ids=request_ids,
             input_ids=self._draft_extend_input_ids(batch),
@@ -368,9 +485,18 @@ class RemoteTLIWorker(EAGLEWorker):
             seq_lens_for_draft_extend_cpu=seq_lens_cpu,
             mm_input_embeds=mm_input_embeds,
         )
+        self._attach_ordering_metadata(
+            request,
+            request_ids=request_ids,
+            token_positions=self._token_positions_for_request_ids(
+                request_ids,
+                req_by_id,
+            ),
+            advance_round=True,
+        )
         response = self._run_rank0_broadcasted_draft_forward(
             request,
-            timeout=self.server_args.tli_rpc_timeout,
+            timeout=self.server_args.draft_forward_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
         )
@@ -391,12 +517,13 @@ class RemoteTLIWorker(EAGLEWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         request_ids = self._request_ids(batch)
+        req_by_id = self._request_by_id(batch)
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 spec_info.verified_id.to(torch.int64)
             )
 
-        request = TLIDraftRequest(
+        request = DraftForwardRequest(
             request_id=self._batch_request_id(request_ids, "decode"),
             request_ids=request_ids,
             verified_id=spec_info.verified_id,
@@ -411,9 +538,18 @@ class RemoteTLIWorker(EAGLEWorker):
             num_tokens_per_req=self.topk,
             num_tokens_for_logprob_per_req=self.topk,
         )
+        self._attach_ordering_metadata(
+            request,
+            request_ids=request_ids,
+            token_positions=self._token_positions_for_request_ids(
+                request_ids,
+                req_by_id,
+            ),
+            advance_round=True,
+        )
         response = self._run_rank0_broadcasted_draft_forward(
             request,
-            timeout=self.server_args.tli_rpc_timeout,
+            timeout=self.server_args.draft_forward_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
         )
@@ -456,7 +592,17 @@ class RemoteTLIWorker(EAGLEWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         request_ids = self._request_ids_for_spec_info(batch, spec_info)
-        request = TLIDraftRequest(
+        req_by_id = self._request_by_id(batch)
+        accept_length_cpu = (
+            spec_info.accept_length.cpu().tolist()
+            if spec_info.accept_length is not None
+            else []
+        )
+        next_prefix_versions = self._next_prefix_versions(
+            request_ids,
+            accept_length_cpu,
+        )
+        request = DraftForwardRequest(
             request_id=self._batch_request_id(request_ids, "extend_after_decode"),
             request_ids=request_ids,
             verified_id=spec_info.verified_id,
@@ -471,16 +617,23 @@ class RemoteTLIWorker(EAGLEWorker):
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=1,
             accept_length=spec_info.accept_length,
-            accept_length_cpu=(
-                spec_info.accept_length.cpu().tolist()
-                if spec_info.accept_length is not None
-                else None
+            accept_length_cpu=accept_length_cpu or None,
+        )
+        self._attach_ordering_metadata(
+            request,
+            request_ids=request_ids,
+            token_positions=self._token_positions_for_request_ids(
+                request_ids,
+                req_by_id,
             ),
+            advance_round=True,
+            prefix_versions=next_prefix_versions,
         )
         response = self._run_rank0_broadcasted_draft_forward(
             request,
-            timeout=self.server_args.tli_rpc_timeout,
+            timeout=self.server_args.draft_forward_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
         )
+        self._commit_prefix_versions(request_ids, next_prefix_versions)
         self._apply_next_draft_state(spec_info, response, "extend_after_decode")

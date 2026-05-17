@@ -521,18 +521,18 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
-    tli_disaggregation_role: Literal["none", "target", "draft"] = "none"
-    tli_draft_server_addr: Optional[str] = None
-    tli_draft_tokenizer_path: Optional[str] = None
-    tli_draft_tp_size: Optional[int] = None
-    tli_service_host: Optional[str] = None
-    tli_service_port: Optional[int] = None
-    tli_rpc_timeout: Optional[float] = None
-    tli_target_tokenizer_path: Optional[str] = None
-    tli_grpc_use_tls: bool = False
-    tli_grpc_certfile: Optional[str] = None
-    tli_grpc_keyfile: Optional[str] = None
-    tli_grpc_ca_certs: Optional[str] = None
+    draft_disaggregation_role: Literal["none", "target", "draft"] = "none"
+    remote_draft_server_addr: Optional[str] = None
+    remote_draft_tokenizer_path: Optional[str] = None
+    remote_draft_tp_size: Optional[int] = None
+    draft_forward_service_host: Optional[str] = None
+    draft_forward_service_port: Optional[int] = None
+    draft_forward_rpc_timeout: Optional[float] = None
+    draft_forward_target_tokenizer_path: Optional[str] = None
+    draft_forward_grpc_use_tls: bool = False
+    draft_forward_grpc_certfile: Optional[str] = None
+    draft_forward_grpc_keyfile: Optional[str] = None
+    draft_forward_grpc_ca_certs: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -875,8 +875,8 @@ class ServerArgs:
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
 
-        # Handle experimental TLI target/draft disaggregation.
-        self._handle_tli_disaggregation()
+        # Handle experimental target/draft draft-forward disaggregation.
+        self._handle_draft_forward_disaggregation()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -1147,14 +1147,14 @@ class ServerArgs:
             ignore_patterns=["*.bin", "*.safetensors"],
             revision=self.revision,
         )
-        if self.tli_draft_tokenizer_path:
-            self.tli_draft_tokenizer_path = _resolve_or_download(
-                self.tli_draft_tokenizer_path,
+        if self.remote_draft_tokenizer_path:
+            self.remote_draft_tokenizer_path = _resolve_or_download(
+                self.remote_draft_tokenizer_path,
                 ignore_patterns=["*.bin", "*.safetensors"],
             )
-        if self.tli_target_tokenizer_path:
-            self.tli_target_tokenizer_path = _resolve_or_download(
-                self.tli_target_tokenizer_path,
+        if self.draft_forward_target_tokenizer_path:
+            self.draft_forward_target_tokenizer_path = _resolve_or_download(
+                self.draft_forward_target_tokenizer_path,
                 ignore_patterns=["*.bin", "*.safetensors"],
             )
         if self.speculative_draft_model_path:
@@ -3584,17 +3584,19 @@ class ServerArgs:
 
         if self.speculative_algorithm == "TLI":
             if self.enable_dp_attention:
-                raise ValueError("TLI speculative decoding does not support dp attention.")
-
-            if self.tli_draft_tokenizer_path is None:
                 raise ValueError(
-                    "TLI speculative decoding requires --tli-draft-tokenizer-path "
+                    "TLI speculative decoding does not support dp attention."
+                )
+
+            if self.remote_draft_tokenizer_path is None:
+                raise ValueError(
+                    "TLI speculative decoding requires --remote-draft-tokenizer-path "
                     "so the target side can translate into the draft vocabulary."
                 )
             if self.speculative_draft_model_path is not None:
                 raise ValueError(
                     "--speculative-draft-model-path is not used by TLI speculative "
-                    "decoding. Use --tli-draft-tokenizer-path instead."
+                    "decoding. Use --remote-draft-tokenizer-path instead."
                 )
 
             if self.max_running_requests is None:
@@ -3657,135 +3659,158 @@ class ServerArgs:
                 )
                 self.speculative_adaptive = False
 
-    def _handle_tli_disaggregation(self):
-        if self.tli_disaggregation_role == "none":
-            tli_fields = (
-                self.tli_draft_server_addr,
-                self.tli_draft_tokenizer_path,
-                self.tli_draft_tp_size,
-                self.tli_service_host,
-                self.tli_service_port,
-                self.tli_rpc_timeout,
-                self.tli_target_tokenizer_path,
-                self.tli_grpc_certfile,
-                self.tli_grpc_keyfile,
-                self.tli_grpc_ca_certs,
+    def _handle_draft_forward_disaggregation(self):
+        if self.draft_disaggregation_role == "none":
+            draft_forward_fields = (
+                self.remote_draft_server_addr,
+                self.remote_draft_tokenizer_path,
+                self.remote_draft_tp_size,
+                self.draft_forward_service_host,
+                self.draft_forward_service_port,
+                self.draft_forward_rpc_timeout,
+                self.draft_forward_target_tokenizer_path,
+                self.draft_forward_grpc_certfile,
+                self.draft_forward_grpc_keyfile,
+                self.draft_forward_grpc_ca_certs,
             )
-            if any(value is not None for value in tli_fields) or self.tli_grpc_use_tls:
+            if (
+                any(value is not None for value in draft_forward_fields)
+                or self.draft_forward_grpc_use_tls
+            ):
                 raise ValueError(
-                    "TLI disaggregation options require "
-                    "--tli-disaggregation-role target|draft."
+                    "Draft-forward disaggregation options require "
+                    "--draft-disaggregation-role target|draft."
                 )
             return
 
-        if self.tli_disaggregation_role not in ("target", "draft"):
+        if self.draft_disaggregation_role not in ("target", "draft"):
             raise ValueError(
-                f"Invalid tli_disaggregation_role={self.tli_disaggregation_role!r}"
+                f"Invalid draft disaggregation role={self.draft_disaggregation_role!r}"
             )
 
         if self.encoder_only or self.language_only:
             raise ValueError(
-                "TLI target/draft disaggregation cannot be combined with "
+                "Draft-forward target/draft disaggregation cannot be combined with "
                 "encoder-only or language-only disaggregation modes."
             )
 
         if self.disaggregation_mode != "null":
             raise ValueError(
-                "TLI target/draft disaggregation cannot be combined with PD "
+                "Draft-forward target/draft disaggregation cannot be combined with PD "
                 "--disaggregation-mode prefill/decode."
             )
 
-        if self.tli_rpc_timeout is not None and self.tli_rpc_timeout <= 0:
-            raise ValueError("--tli-rpc-timeout must be positive when set.")
+        if (
+            self.draft_forward_rpc_timeout is not None
+            and self.draft_forward_rpc_timeout <= 0
+        ):
+            raise ValueError("--draft-forward-rpc-timeout must be positive when set.")
 
         tls_paths = (
-            self.tli_grpc_certfile,
-            self.tli_grpc_keyfile,
-            self.tli_grpc_ca_certs,
+            self.draft_forward_grpc_certfile,
+            self.draft_forward_grpc_keyfile,
+            self.draft_forward_grpc_ca_certs,
         )
-        if any(path is not None for path in tls_paths) and not self.tli_grpc_use_tls:
+        if (
+            any(path is not None for path in tls_paths)
+            and not self.draft_forward_grpc_use_tls
+        ):
             raise ValueError(
-                "TLI gRPC certificate options require --tli-grpc-use-tls."
+                "DraftForward gRPC certificate options require "
+                "--draft-forward-grpc-use-tls."
             )
-        if self.tli_grpc_use_tls:
-            if bool(self.tli_grpc_certfile) != bool(self.tli_grpc_keyfile):
+        if self.draft_forward_grpc_use_tls:
+            if bool(self.draft_forward_grpc_certfile) != bool(
+                self.draft_forward_grpc_keyfile
+            ):
                 raise ValueError(
-                    "--tli-grpc-certfile and --tli-grpc-keyfile must be set together."
+                    "--draft-forward-grpc-certfile and --draft-forward-grpc-keyfile "
+                    "must be set together."
                 )
             for path in tls_paths:
                 if path is not None and not os.path.exists(path):
-                    raise ValueError(f"TLI gRPC TLS file does not exist: {path}")
+                    raise ValueError(
+                        f"DraftForward gRPC TLS file does not exist: {path}"
+                    )
 
-        if self.tli_disaggregation_role == "draft":
+        if self.draft_disaggregation_role == "draft":
             if not self.grpc_mode:
                 raise ValueError(
-                    "TLI draft role requires --grpc-mode so the draft model can "
+                    "Draft-forward draft role requires --grpc-mode so the draft model can "
                     "start its gRPC serving path and launch the DraftForward "
                     "sidecar independently."
                 )
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "A TLI draft node serves the draft model directly and must not "
+                    "A draft-forward draft node serves the draft model directly and must not "
                     "also enable --speculative-algorithm. The colocated TLI worker "
                     "would try to load a second draft model."
                 )
             if self.speculative_draft_model_path is not None:
                 raise ValueError(
-                    "Do not set --speculative-draft-model-path on a TLI draft node. "
+                    "Do not set --speculative-draft-model-path on a draft-forward draft node. "
                     "Use --model-path for the draft model."
                 )
-            if self.tli_draft_tp_size is not None:
+            if self.remote_draft_tp_size is not None:
                 raise ValueError(
-                    "--tli-draft-tp-size is only valid on the TLI target node."
+                    "--remote-draft-tp-size is only valid on the draft-forward target node."
                 )
-            if self.tli_draft_server_addr is not None:
+            if self.remote_draft_server_addr is not None:
                 raise ValueError(
-                    "--tli-draft-server-addr is only valid on the TLI target node."
+                    "--remote-draft-server-addr is only valid on the draft-forward target node."
                 )
-            if self.tli_service_port is None:
+            if self.draft_forward_service_port is None:
                 raise ValueError(
-                    "TLI draft role requires --tli-service-port so the "
+                    "Draft-forward draft role requires --draft-forward-service-port so the "
                     "DraftForward RPC never accidentally binds the main serving port."
                 )
-            if self.tli_service_port <= 0:
-                raise ValueError("--tli-service-port must be positive.")
-            if self.tli_target_tokenizer_path is None:
+            if self.draft_forward_service_port <= 0:
+                raise ValueError("--draft-forward-service-port must be positive.")
+            if self.draft_forward_target_tokenizer_path is None:
                 raise ValueError(
-                    "TLI draft role requires --tli-target-tokenizer-path so the "
+                    "Draft-forward draft role requires --draft-forward-target-tokenizer-path so the "
                     "draft node can initialize target/draft token translation."
                 )
-            if self.tli_grpc_use_tls and (
-                self.tli_grpc_certfile is None or self.tli_grpc_keyfile is None
+            if self.draft_forward_grpc_use_tls and (
+                self.draft_forward_grpc_certfile is None
+                or self.draft_forward_grpc_keyfile is None
             ):
                 raise ValueError(
-                    "TLI draft role with TLS requires --tli-grpc-certfile and "
-                    "--tli-grpc-keyfile."
+                    "Draft-forward draft role with TLS requires "
+                    "--draft-forward-grpc-certfile and --draft-forward-grpc-keyfile "
+                    "when TLS is enabled."
                 )
             return
 
         # Keep target and draft role-only options disjoint so a misconfigured
         # launch cannot accidentally look like a valid colocated setup.
         if self.speculative_algorithm != "TLI":
-            raise ValueError("TLI target role requires --speculative-algorithm TLI.")
-        if self.tli_draft_server_addr is None:
             raise ValueError(
-                "TLI target role requires --tli-draft-server-addr host:port."
+                "Draft-forward target role requires --speculative-algorithm TLI."
             )
-        if self.tli_draft_tokenizer_path is None:
+        if self.remote_draft_server_addr is None:
             raise ValueError(
-                "TLI target role requires --tli-draft-tokenizer-path so the "
+                "Draft-forward target role requires "
+                "--remote-draft-server-addr host:port."
+            )
+        if self.remote_draft_tokenizer_path is None:
+            raise ValueError(
+                "Draft-forward target role requires --remote-draft-tokenizer-path so the "
                 "target node can translate into the draft vocabulary."
             )
-        if self.tli_service_host is not None or self.tli_service_port is not None:
+        if (
+            self.draft_forward_service_host is not None
+            or self.draft_forward_service_port is not None
+        ):
             raise ValueError(
-                "--tli-service-host/--tli-service-port are only valid on the "
-                "TLI draft node."
+                "--draft-forward-service-host/--draft-forward-service-port are only "
+                "valid on the draft-forward draft node."
             )
-        if self.tli_draft_tp_size is None:
-            self.tli_draft_tp_size = self.tp_size
-        elif self.tli_draft_tp_size not in (1, self.tp_size):
+        if self.remote_draft_tp_size is None:
+            self.remote_draft_tp_size = self.tp_size
+        elif self.remote_draft_tp_size not in (1, self.tp_size):
             raise ValueError(
-                "--tli-draft-tp-size currently supports either 1 for an "
+                "--remote-draft-tp-size currently supports either 1 for an "
                 "asymmetric draft node or the target --tp size for the "
                 "existing symmetric TLI path."
             )
@@ -5614,97 +5639,109 @@ class ServerArgs:
             help="The quantization method for speculative model.",
         )
         parser.add_argument(
-            "--tli-disaggregation-role",
+            "--draft-disaggregation-role",
             type=str,
             choices=["none", "target", "draft"],
-            default=ServerArgs.tli_disaggregation_role,
+            dest="draft_disaggregation_role",
+            default=ServerArgs.draft_disaggregation_role,
             help=(
-                "Role for experimental disaggregated TLI. 'target' serves the "
+                "Role for experimental draft-forward disaggregation. 'target' serves the "
                 "target model and calls a remote draft service. 'draft' serves "
-                "the draft model and starts the TLI DraftForward service from "
-                "the gRPC serving path."
+                "the draft model and starts the DraftForward service from the "
+                "gRPC serving path."
             ),
         )
         parser.add_argument(
-            "--tli-draft-server-addr",
+            "--remote-draft-server-addr",
             type=str,
-            default=ServerArgs.tli_draft_server_addr,
+            dest="remote_draft_server_addr",
+            default=ServerArgs.remote_draft_server_addr,
             help=(
                 "Target role only. Draft server gRPC address in host:port form "
-                "for the TLI DraftForward RPC."
+                "for the DraftForward RPC."
             ),
         )
         parser.add_argument(
-            "--tli-draft-tokenizer-path",
+            "--remote-draft-tokenizer-path",
             type=str,
-            default=ServerArgs.tli_draft_tokenizer_path,
-            help="Target/TLI role only. Tokenizer path for the draft model.",
+            dest="remote_draft_tokenizer_path",
+            default=ServerArgs.remote_draft_tokenizer_path,
+            help="Target role only. Tokenizer path for the remote draft model.",
         )
         parser.add_argument(
-            "--tli-draft-tp-size",
+            "--remote-draft-tp-size",
             type=int,
-            default=ServerArgs.tli_draft_tp_size,
+            dest="remote_draft_tp_size",
+            default=ServerArgs.remote_draft_tp_size,
             help=(
                 "Target role only. Tensor-parallel size of the remote draft "
                 "node. Use 1 for the asymmetric disaggregated setup. If "
                 "omitted, defaults to the target --tp size for the existing "
-                "symmetric TLI path."
+                "symmetric path."
             ),
         )
         parser.add_argument(
-            "--tli-service-host",
+            "--draft-forward-service-host",
             type=str,
-            default=ServerArgs.tli_service_host,
+            dest="draft_forward_service_host",
+            default=ServerArgs.draft_forward_service_host,
             help=(
-                "Draft role only. Host/interface for the TLI DraftForward "
+                "Draft role only. Host/interface for the DraftForward "
                 "service. Defaults to --host."
             ),
         )
         parser.add_argument(
-            "--tli-service-port",
+            "--draft-forward-service-port",
             type=int,
-            default=ServerArgs.tli_service_port,
-            help="Draft role only. Port for the TLI DraftForward service.",
+            dest="draft_forward_service_port",
+            default=ServerArgs.draft_forward_service_port,
+            help="Draft role only. Port for the DraftForward service.",
         )
         parser.add_argument(
-            "--tli-rpc-timeout",
+            "--draft-forward-rpc-timeout",
             type=float,
-            default=ServerArgs.tli_rpc_timeout,
-            help="Optional timeout in seconds for target-to-draft TLI RPC calls.",
+            dest="draft_forward_rpc_timeout",
+            default=ServerArgs.draft_forward_rpc_timeout,
+            help="Optional timeout in seconds for target-to-draft DraftForward RPC calls.",
         )
         parser.add_argument(
-            "--tli-target-tokenizer-path",
+            "--draft-forward-target-tokenizer-path",
             type=str,
-            default=ServerArgs.tli_target_tokenizer_path,
+            dest="draft_forward_target_tokenizer_path",
+            default=ServerArgs.draft_forward_target_tokenizer_path,
             help="Draft role only. Tokenizer path for the target model.",
         )
         parser.add_argument(
-            "--tli-grpc-use-tls",
+            "--draft-forward-grpc-use-tls",
             action="store_true",
+            dest="draft_forward_grpc_use_tls",
             help=(
-                "Use TLS for the TLI gRPC transport. Provide --tli-grpc-ca-certs "
-                "on the target side and --tli-grpc-certfile/--tli-grpc-keyfile "
-                "on the draft side. If CA certs are provided on the draft side, "
-                "client certificate authentication is required."
+                "Use TLS for the DraftForward gRPC transport. Provide "
+                "--draft-forward-grpc-ca-certs on the target side and "
+                "--draft-forward-grpc-certfile/--draft-forward-grpc-keyfile on the "
+                "draft side."
             ),
         )
         parser.add_argument(
-            "--tli-grpc-certfile",
+            "--draft-forward-grpc-certfile",
             type=str,
-            default=ServerArgs.tli_grpc_certfile,
-            help="Certificate chain for TLI gRPC TLS/mTLS.",
+            dest="draft_forward_grpc_certfile",
+            default=ServerArgs.draft_forward_grpc_certfile,
+            help="Certificate chain for DraftForward gRPC TLS/mTLS.",
         )
         parser.add_argument(
-            "--tli-grpc-keyfile",
+            "--draft-forward-grpc-keyfile",
             type=str,
-            default=ServerArgs.tli_grpc_keyfile,
-            help="Private key for TLI gRPC TLS/mTLS.",
+            dest="draft_forward_grpc_keyfile",
+            default=ServerArgs.draft_forward_grpc_keyfile,
+            help="Private key for DraftForward gRPC TLS/mTLS.",
         )
         parser.add_argument(
-            "--tli-grpc-ca-certs",
+            "--draft-forward-grpc-ca-certs",
             type=str,
-            default=ServerArgs.tli_grpc_ca_certs,
-            help="CA certificate bundle for TLI gRPC TLS/mTLS.",
+            dest="draft_forward_grpc_ca_certs",
+            default=ServerArgs.draft_forward_grpc_ca_certs,
+            help="CA certificate bundle for DraftForward gRPC TLS/mTLS.",
         )
 
         # Speculative decoding (ngram)

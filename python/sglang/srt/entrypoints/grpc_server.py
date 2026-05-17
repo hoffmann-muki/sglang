@@ -1,6 +1,6 @@
 """Thin gRPC server wrapper — delegates to smg-grpc-servicer package.
 
-The wrapper keeps the serving node on the gRPC launch path and starts the TLI
+The wrapper keeps the serving node on the gRPC launch path and starts the
 DraftForward sidecar from an explicit request-manager construction hook.
 """
 
@@ -18,11 +18,11 @@ from aiohttp import web
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
-    TLIDraftForwardReqInput,
+    DraftForwardReqInput,
 )
-from sglang.srt.speculative.tli_disaggregation import (
-    start_tli_draft_service,
-    tli_draft_service_enabled,
+from sglang.srt.speculative.draft_disaggregation import (
+    draft_forward_service_enabled,
+    start_draft_forward_service,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.network import get_zmq_socket
@@ -214,12 +214,10 @@ def _install_request_manager_capture(smg_grpc_server, server_args=None):
             # replacing the socket later can miss an already-pending recv.
             if (
                 server_args is not None
-                and tli_draft_service_enabled(server_args)
-                and not hasattr(self, "_tli_draft_forward_bridge_restore")
+                and draft_forward_service_enabled(server_args)
+                and not hasattr(self, "_draft_forward_bridge_restore")
             ):
-                self._tli_draft_forward_bridge_restore = (
-                    _install_tli_draft_forward_bridge(self)
-                )
+                self._draft_forward_bridge_restore = _install_draft_forward_bridge(self)
             if not request_manager_future.done():
                 request_manager_future.set_result(self)
 
@@ -229,7 +227,7 @@ def _install_request_manager_capture(smg_grpc_server, server_args=None):
     if not patched_classes:
         raise RuntimeError(
             "Unable to locate a gRPC request-manager class to capture explicitly. "
-            "TLI draft startup requires smg-grpc-servicer to expose one of: "
+            "DraftForward startup requires smg-grpc-servicer to expose one of: "
             f"{', '.join(_REQUEST_MANAGER_CLASS_NAMES)}."
         )
 
@@ -240,26 +238,26 @@ def _install_request_manager_capture(smg_grpc_server, server_args=None):
     return request_manager_future, _restore_request_manager_capture
 
 
-def _install_tli_draft_forward_bridge(request_manager):
-    """Attach a TLI draft-forward bridge to the live request manager."""
+def _install_draft_forward_bridge(request_manager):
+    """Attach a draft-forward bridge to the live request manager."""
 
     pending_futures: dict[str, asyncio.Future] = {}
-    original_handle_tli_draft_forward = getattr(
-        request_manager, "handle_tli_draft_forward", None
+    original_handle_draft_forward = getattr(
+        request_manager, "handle_draft_forward", None
     )
-    original_tli_draft_forward_communicator = getattr(
-        request_manager, "tli_draft_forward_communicator", None
+    original_draft_forward_communicator = getattr(
+        request_manager, "draft_forward_communicator", None
     )
     reply_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     reply_socket = get_zmq_socket(
         request_manager.context, zmq.PULL, reply_ipc_name, bind=True
     )
 
-    request_manager._tli_draft_forward_pending_futures = pending_futures
-    request_manager._tli_draft_forward_reply_ipc_name = reply_ipc_name
-    request_manager._tli_draft_forward_reply_socket = reply_socket
+    request_manager._draft_forward_pending_futures = pending_futures
+    request_manager._draft_forward_reply_ipc_name = reply_ipc_name
+    request_manager._draft_forward_reply_socket = reply_socket
 
-    async def _poll_tli_draft_forward_replies():
+    async def _poll_draft_forward_replies():
         try:
             while True:
                 recv_obj = await reply_socket.recv_pyobj()
@@ -267,7 +265,7 @@ def _install_tli_draft_forward_bridge(request_manager):
                 pending = pending_futures.pop(rid, None)
                 if pending is None:
                     logger.warning(
-                        "Dropping orphan TLI DraftForward response with rid=%r.",
+                        "Dropping orphan DraftForward response with rid=%r.",
                         rid,
                     )
                 elif not pending.done():
@@ -275,10 +273,10 @@ def _install_tli_draft_forward_bridge(request_manager):
         except asyncio.CancelledError:
             raise
 
-    reply_poller_task = asyncio.create_task(_poll_tli_draft_forward_replies())
-    request_manager._tli_draft_forward_reply_poller_task = reply_poller_task
+    reply_poller_task = asyncio.create_task(_poll_draft_forward_replies())
+    request_manager._draft_forward_reply_poller_task = reply_poller_task
 
-    async def _handle_tli_draft_forward(self, recv_req: TLIDraftForwardReqInput):
+    async def _handle_draft_forward(self, recv_req: DraftForwardReqInput):
         rid = recv_req.rid or getattr(recv_req.request, "request_id", None)
         if rid is None:
             rid = f"tli-{uuid.uuid4().hex}"
@@ -290,7 +288,7 @@ def _install_tli_draft_forward_bridge(request_manager):
         pending_futures[rid] = future
         try:
             self.send_to_scheduler.send_pyobj(recv_req)
-            timeout = getattr(self.server_args, "tli_rpc_timeout", None)
+            timeout = self.server_args.draft_forward_rpc_timeout
             if timeout is not None:
                 result = await asyncio.wait_for(future, timeout=timeout)
             else:
@@ -299,43 +297,41 @@ def _install_tli_draft_forward_bridge(request_manager):
         finally:
             pending_futures.pop(rid, None)
 
-    request_manager.handle_tli_draft_forward = MethodType(
-        _handle_tli_draft_forward, request_manager
+    request_manager.handle_draft_forward = MethodType(
+        _handle_draft_forward, request_manager
     )
-    request_manager.tli_draft_forward_communicator = (
-        request_manager.handle_tli_draft_forward
-    )
+    request_manager.draft_forward_communicator = request_manager.handle_draft_forward
 
-    def _restore_tli_draft_forward_bridge():
-        if original_handle_tli_draft_forward is None:
-            if hasattr(request_manager, "handle_tli_draft_forward"):
-                delattr(request_manager, "handle_tli_draft_forward")
+    def _restore_draft_forward_bridge():
+        if original_handle_draft_forward is None:
+            if hasattr(request_manager, "handle_draft_forward"):
+                delattr(request_manager, "handle_draft_forward")
         else:
-            request_manager.handle_tli_draft_forward = original_handle_tli_draft_forward
-        if original_tli_draft_forward_communicator is None:
-            if hasattr(request_manager, "tli_draft_forward_communicator"):
-                delattr(request_manager, "tli_draft_forward_communicator")
+            request_manager.handle_draft_forward = original_handle_draft_forward
+        if original_draft_forward_communicator is None:
+            if hasattr(request_manager, "draft_forward_communicator"):
+                delattr(request_manager, "draft_forward_communicator")
         else:
-            request_manager.tli_draft_forward_communicator = (
-                original_tli_draft_forward_communicator
+            request_manager.draft_forward_communicator = (
+                original_draft_forward_communicator
             )
-        if hasattr(request_manager, "_tli_draft_forward_pending_futures"):
-            delattr(request_manager, "_tli_draft_forward_pending_futures")
-        if hasattr(request_manager, "_tli_draft_forward_reply_ipc_name"):
-            delattr(request_manager, "_tli_draft_forward_reply_ipc_name")
-        if hasattr(request_manager, "_tli_draft_forward_reply_socket"):
-            socket = request_manager._tli_draft_forward_reply_socket
-            delattr(request_manager, "_tli_draft_forward_reply_socket")
+        if hasattr(request_manager, "_draft_forward_pending_futures"):
+            delattr(request_manager, "_draft_forward_pending_futures")
+        if hasattr(request_manager, "_draft_forward_reply_ipc_name"):
+            delattr(request_manager, "_draft_forward_reply_ipc_name")
+        if hasattr(request_manager, "_draft_forward_reply_socket"):
+            socket = request_manager._draft_forward_reply_socket
+            delattr(request_manager, "_draft_forward_reply_socket")
             socket.close(linger=0)
-        if hasattr(request_manager, "_tli_draft_forward_reply_poller_task"):
-            task = request_manager._tli_draft_forward_reply_poller_task
-            delattr(request_manager, "_tli_draft_forward_reply_poller_task")
+        if hasattr(request_manager, "_draft_forward_reply_poller_task"):
+            task = request_manager._draft_forward_reply_poller_task
+            delattr(request_manager, "_draft_forward_reply_poller_task")
             if not task.done():
                 task.cancel()
-        if hasattr(request_manager, "_tli_draft_forward_bridge_restore"):
-            delattr(request_manager, "_tli_draft_forward_bridge_restore")
+        if hasattr(request_manager, "_draft_forward_bridge_restore"):
+            delattr(request_manager, "_draft_forward_bridge_restore")
 
-    return _restore_tli_draft_forward_bridge
+    return _restore_draft_forward_bridge
 
 
 async def _start_smg_sidecars_when_ready(
@@ -345,8 +341,8 @@ async def _start_smg_sidecars_when_ready(
     sidecar_host,
     sidecar_port,
 ):
-    restore_tli_draft_forward_bridge = None
-    tli_runner = None
+    restore_draft_forward_bridge = None
+    draft_forward_runner = None
     try:
         request_manager = await asyncio.wait_for(request_manager_future, timeout=120.0)
     except asyncio.TimeoutError as exc:
@@ -385,33 +381,35 @@ async def _start_smg_sidecars_when_ready(
         )
 
     try:
-        if tli_draft_service_enabled(server_args):
+        if draft_forward_service_enabled(server_args):
             try:
-                restore_tli_draft_forward_bridge = getattr(
-                    request_manager, "_tli_draft_forward_bridge_restore", None
+                restore_draft_forward_bridge = getattr(
+                    request_manager, "_draft_forward_bridge_restore", None
                 )
-                if restore_tli_draft_forward_bridge is None:
-                    restore_tli_draft_forward_bridge = (
-                        _install_tli_draft_forward_bridge(request_manager)
+                if restore_draft_forward_bridge is None:
+                    restore_draft_forward_bridge = _install_draft_forward_bridge(
+                        request_manager
                     )
-                tli_runner = await start_tli_draft_service(request_manager, server_args)
+                draft_forward_runner = await start_draft_forward_service(
+                    request_manager, server_args
+                )
             except Exception:
-                if restore_tli_draft_forward_bridge is not None:
+                if restore_draft_forward_bridge is not None:
                     try:
-                        restore_tli_draft_forward_bridge()
+                        restore_draft_forward_bridge()
                     except Exception:
                         logger.exception(
-                            "Failed to restore TLI draft bridge after startup failure."
+                            "Failed to restore DraftForward bridge after startup failure."
                         )
                 if sidecar_runner is not None:
                     try:
                         await sidecar_runner.cleanup()
                     except Exception:
                         logger.exception(
-                            "Failed to cleanly shut down HTTP sidecar server after TLI startup failure."
+                            "Failed to cleanly shut down HTTP sidecar server after DraftForward startup failure."
                         )
                 raise
-        return sidecar_runner, tli_runner, restore_tli_draft_forward_bridge
+        return sidecar_runner, draft_forward_runner, restore_draft_forward_bridge
     except asyncio.CancelledError:
         if sidecar_runner is not None:
             try:
@@ -420,12 +418,12 @@ async def _start_smg_sidecars_when_ready(
                 logger.exception(
                     "Failed to cleanly shut down HTTP sidecar server after cancellation."
                 )
-        if restore_tli_draft_forward_bridge is not None:
+        if restore_draft_forward_bridge is not None:
             try:
-                restore_tli_draft_forward_bridge()
+                restore_draft_forward_bridge()
             except Exception:
                 logger.exception(
-                    "Failed to restore TLI draft bridge after cancellation."
+                    "Failed to restore DraftForward bridge after cancellation."
                 )
         raise
 
@@ -445,8 +443,8 @@ async def serve_grpc(server_args, model_info=None):
     sidecar_app = web.Application()
     sidecar_runner = None
     grpc_task = None
-    tli_runner = None
-    restore_tli_draft_forward_bridge = None
+    draft_forward_runner = None
+    restore_draft_forward_bridge = None
     sidecar_task = None
     restore_request_manager_capture = None
     sidecar_port = (
@@ -474,7 +472,7 @@ async def serve_grpc(server_args, model_info=None):
             )
 
     def _capture_sidecar_result(task):
-        nonlocal sidecar_runner, tli_runner, restore_tli_draft_forward_bridge
+        nonlocal sidecar_runner, draft_forward_runner, restore_draft_forward_bridge
         if task.cancelled():
             return
         try:
@@ -487,9 +485,9 @@ async def serve_grpc(server_args, model_info=None):
         result = task.result()
         if result is None:
             return
-        sidecar_runner, tli_result, restore_tli_draft_forward_bridge = result
-        if tli_result is not None:
-            tli_runner = tli_result
+        sidecar_runner, draft_forward_result, restore_draft_forward_bridge = result
+        if draft_forward_result is not None:
+            draft_forward_runner = draft_forward_result
 
     try:
         request_manager_future, restore_request_manager_capture = (
@@ -508,7 +506,7 @@ async def serve_grpc(server_args, model_info=None):
             )
         )
         sidecar_task.add_done_callback(_capture_sidecar_result)
-        if tli_draft_service_enabled(server_args):
+        if draft_forward_service_enabled(server_args):
             while True:
                 done, _ = await asyncio.wait(
                     {grpc_task, sidecar_task},
@@ -525,9 +523,11 @@ async def serve_grpc(server_args, model_info=None):
                     exc = sidecar_task.exception()
                     if exc is not None:
                         raise exc
-                    sidecar_runner, tli_runner, restore_tli_draft_forward_bridge = (
-                        sidecar_task.result()
-                    )
+                    (
+                        sidecar_runner,
+                        draft_forward_runner,
+                        restore_draft_forward_bridge,
+                    ) = sidecar_task.result()
                     break
 
             if not grpc_task.done():
@@ -558,20 +558,20 @@ async def serve_grpc(server_args, model_info=None):
                 except Exception:
                     logger.exception("Sidecar startup failed.")
             elif not sidecar_task.cancelled() and sidecar_task.exception() is None:
-                sidecar_runner, tli_runner, restore_tli_draft_forward_bridge = (
+                sidecar_runner, draft_forward_runner, restore_draft_forward_bridge = (
                     sidecar_task.result()
                 )
-        if restore_tli_draft_forward_bridge is not None:
+        if restore_draft_forward_bridge is not None:
             try:
-                restore_tli_draft_forward_bridge()
+                restore_draft_forward_bridge()
             except Exception:
-                logger.exception("Failed to restore TLI draft bridge.")
-        if tli_runner is not None:
+                logger.exception("Failed to restore DraftForward bridge.")
+        if draft_forward_runner is not None:
             try:
-                await tli_runner.stop(grace=0)
+                await draft_forward_runner.stop(grace=0)
             except Exception as e:
                 logger.exception(
-                    "Failed to cleanly shut down TLI gRPC server: %s",
+                    "Failed to cleanly shut down DraftForward gRPC server: %s",
                     e,
                 )
         if sidecar_runner is not None:

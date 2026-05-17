@@ -100,9 +100,9 @@ class TLIWorker(StandaloneWorker):
         self.hot_token_id = None
 
         target_tokenizer_path = server_args.tokenizer_path
-        draft_tokenizer_path = server_args.tli_draft_tokenizer_path
+        draft_tokenizer_path = server_args.remote_draft_tokenizer_path
         if draft_tokenizer_path is None:
-            raise ValueError("TLIWorker requires --tli-draft-tokenizer-path.")
+            raise ValueError("TLIWorker requires --remote-draft-tokenizer-path.")
 
         target_tokenizer = get_tokenizer(
             target_tokenizer_path,
@@ -154,30 +154,32 @@ class TLIWorker(StandaloneWorker):
 
         intersection_ids = self.vocab_mapping.intersection_draft_ids
         full_vocab_size = self.vocab_mapping.draft_vocab_size
-        
+
         tp_size = getattr(self.draft_model_runner.tp_group, "world_size", 1)
         if tp_size > 1:
             if not hasattr(lm_head, "shard_indices"):
-                logger.warning("Draft LM head is tensor parallel but missing shard_indices; skipping LM head pruning.")
+                logger.warning(
+                    "Draft LM head is tensor parallel but missing shard_indices; skipping LM head pruning."
+                )
                 return
-                
+
             start_idx = lm_head.shard_indices.org_vocab_start_index
             end_idx = lm_head.shard_indices.org_vocab_end_index
-            
+
             # Keep only the intersection IDs that fall into this rank's partition
             mask = (intersection_ids >= start_idx) & (intersection_ids < end_idx)
             local_ids = intersection_ids[mask]
-            
+
             # Map global intersection IDs to indices within the local weight tensor
             intersection_ids_local = local_ids - start_idx
-            
+
             # The pruned reindex head must output the local pad length for all_gather to work
             full_vocab_size = lm_head.weight.data.shape[0]
             reindex_ids = intersection_ids_local
         else:
             reindex_ids = intersection_ids
             intersection_ids_local = intersection_ids
-            
+
         pruned_weight = lm_head.weight.data[intersection_ids_local].clone()
         pruned_bias = (
             lm_head.bias.data[intersection_ids_local].clone()
@@ -208,7 +210,9 @@ class TLIWorker(StandaloneWorker):
         mm_input_embeds=None,
     ):
         batch.input_ids = self.vocab_mapping.map_target_to_draft_ids(batch.input_ids)
-        draft_next_token_ids = self.vocab_mapping.map_target_to_draft_ids(next_token_ids)
+        draft_next_token_ids = self.vocab_mapping.map_target_to_draft_ids(
+            next_token_ids
+        )
         super().forward_draft_extend(
             batch, hidden_states, draft_next_token_ids, seq_lens_cpu, mm_input_embeds
         )

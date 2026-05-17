@@ -27,11 +27,11 @@ class TLITokenTranslator(VocabMapping):
         draft_ids_t = torch.as_tensor(draft_ids, dtype=torch.long, device=self.device)
         return self.translate_draft_to_target_ids(draft_ids_t).tolist()
 
-    # Backward-compatible API with colocated TLI worker usage.
+    # Keep the VocabMapping-style names because the colocated TLI worker calls them.
     def map_target_to_draft_ids(self, target_ids: torch.Tensor) -> torch.Tensor:
         return self.translate_target_to_draft_ids(target_ids)
 
-    # Backward-compatible API with colocated TLI worker usage.
+    # Keep the VocabMapping-style names because the colocated TLI worker calls them.
     def map_draft_to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return self.translate_draft_to_target_ids(draft_ids)
 

@@ -137,7 +137,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
 
-    def test_active_pool_idxs_ignores_tli_draft_executor_state(self):
+    def test_active_pool_idxs_ignores_remote_draft_executor_state(self):
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.last_batch.is_empty.return_value = False
@@ -147,12 +147,12 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         req2.req_pool_idx = None
         scheduler.last_batch.reqs = [req1, req2]
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.tli_draft_executor = MagicMock()
-        scheduler.tli_draft_executor.active_req_pool_idxs.return_value = {3, 7}
+        scheduler.remote_draft_executor = MagicMock()
+        scheduler.remote_draft_executor.active_req_pool_idxs.return_value = {3, 7}
 
         self.assertEqual(Scheduler._active_pool_idxs(scheduler), {5})
 
-    def test_session_held_counts_include_tli_draft_executor_state(self):
+    def test_session_held_counts_include_remote_draft_executor_state(self):
         scheduler = self._new_scheduler()
         scheduler.last_batch = None
         scheduler.running_batch.is_empty.return_value = True
@@ -160,11 +160,11 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.tree_cache.session_held_full_tokens.return_value = 11
         scheduler.tree_cache.session_held_swa_tokens.return_value = 5
         scheduler.tree_cache.session_held_req_count.return_value = 2
-        scheduler.tli_draft_executor = MagicMock()
-        scheduler.tli_draft_executor.active_req_pool_idxs.return_value = {3}
-        scheduler.tli_draft_executor.held_full_tokens.return_value = 7
-        scheduler.tli_draft_executor.held_swa_tokens.return_value = 4
-        scheduler.tli_draft_executor.held_req_count.return_value = 1
+        scheduler.remote_draft_executor = MagicMock()
+        scheduler.remote_draft_executor.active_req_pool_idxs.return_value = {3}
+        scheduler.remote_draft_executor.held_full_tokens.return_value = 7
+        scheduler.remote_draft_executor.held_swa_tokens.return_value = 4
+        scheduler.remote_draft_executor.held_req_count.return_value = 1
 
         self.assertEqual(Scheduler._session_held_tokens(scheduler), 18)
         self.assertEqual(Scheduler._session_held_full_tokens(scheduler), 18)

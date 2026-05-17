@@ -5,19 +5,21 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.speculative.tli_grpc_transport import (
-    TliSpeculativeServiceAdapter,
+from sglang.srt.speculative.draft_forward_grpc_transport import (
+    DraftForwardServiceAdapter,
     draft_request_from_proto,
     draft_request_to_proto,
     draft_response_from_proto,
     draft_response_to_proto,
     tensor_from_proto_tensor,
 )
-from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
+from sglang.srt.speculative.draft_forward_protocol import (
+    DraftForwardRequest,
+    DraftForwardResponse,
+)
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
@@ -82,6 +84,9 @@ class _FakeDraftRequest:
     seq_lens_for_draft_extend: _FakeTensorData | None = None
     seq_lens_for_draft_extend_cpu: _FakeTensorData | None = None
     mm_input_embeds: _FakeTensorData | None = None
+    round_ids: list[int] = field(default_factory=list)
+    token_positions: list[int] = field(default_factory=list)
+    prefix_versions: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -94,12 +99,15 @@ class _FakeDraftResponse:
     next_hidden_states: _FakeTensorData | None = None
     next_topk_p: _FakeTensorData | None = None
     next_topk_index: _FakeTensorData | None = None
+    round_ids: list[int] = field(default_factory=list)
+    token_positions: list[int] = field(default_factory=list)
+    prefix_versions: list[int] = field(default_factory=list)
 
 
 _FAKE_PROTO = SimpleNamespace(
     TensorData=_FakeTensorData,
-    TliDraftRequest=_FakeDraftRequest,
-    TliDraftResponse=_FakeDraftResponse,
+    DraftForwardRequest=_FakeDraftRequest,
+    DraftForwardResponse=_FakeDraftResponse,
 )
 
 
@@ -115,7 +123,7 @@ class _FakeContext:
         self.details = details
 
 
-class TestTLIGRPCTransport(CustomTestCase):
+class TestDraftForwardGrpcTransport(CustomTestCase):
     def setUp(self):
         self.translator = _make_translator(
             {"a": 0, "b": 1, "c": 2},
@@ -125,7 +133,7 @@ class TestTLIGRPCTransport(CustomTestCase):
     def test_tensor_round_trip(self):
         tensor = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
         encoded = draft_request_to_proto(
-            TLIDraftRequest(
+            DraftForwardRequest(
                 request_id="req-1",
                 verified_id=tensor,
                 hidden_states=torch.zeros(2, 3),
@@ -136,7 +144,7 @@ class TestTLIGRPCTransport(CustomTestCase):
         self.assertTrue(torch.equal(decoded, tensor))
 
     def test_response_proto_supports_empty_extend_tensors(self):
-        response = TLIDraftResponse(
+        response = DraftForwardResponse(
             request_id="req-empty-extend",
             mode="extend",
             parent_list=torch.empty((0,), dtype=torch.int64),
@@ -168,7 +176,7 @@ class TestTLIGRPCTransport(CustomTestCase):
         self.assertTrue(torch.equal(decoded.next_topk_index, response.next_topk_index))
 
     def test_request_proto_translation(self):
-        request = TLIDraftRequest(
+        request = DraftForwardRequest(
             request_id="req-1",
             mode="decode",
             verified_id=torch.tensor([0, 2, 1]),
@@ -182,6 +190,9 @@ class TestTLIGRPCTransport(CustomTestCase):
             speculative_num_draft_tokens=4,
             accept_length=torch.tensor([1, 2, 3]),
             accept_length_cpu=[1, 2, 3],
+            round_ids=[7, 8],
+            token_positions=[11, 12],
+            prefix_versions=[13, 14],
         )
 
         proto_request = draft_request_to_proto(
@@ -198,14 +209,20 @@ class TestTLIGRPCTransport(CustomTestCase):
         self.assertEqual(decoded.tp_rank, 1)
         self.assertEqual(decoded.tp_size, 3)
         self.assertEqual(decoded.accept_length_cpu, [1, 2, 3])
+        self.assertEqual(decoded.round_ids, [7, 8])
+        self.assertEqual(decoded.token_positions, [11, 12])
+        self.assertEqual(decoded.prefix_versions, [13, 14])
 
     def test_response_proto_translation(self):
-        response = TLIDraftResponse(
+        response = DraftForwardResponse(
             request_id="req-1",
             parent_list=torch.tensor([[0, 1], [1, 0]]),
             top_scores_index=torch.tensor([[1, 0], [0, 1]]),
             draft_token_ids=torch.tensor([0, 1, 2]),
             next_hidden_states=torch.zeros(3, 4),
+            round_ids=[5, 6],
+            token_positions=[8, 9],
+            prefix_versions=[13, 14],
         )
 
         proto_response = draft_response_to_proto(
@@ -224,18 +241,21 @@ class TestTLIGRPCTransport(CustomTestCase):
         self.assertTrue(
             torch.equal(decoded.top_scores_index, response.top_scores_index)
         )
+        self.assertEqual(decoded.round_ids, [5, 6])
+        self.assertEqual(decoded.token_positions, [8, 9])
+        self.assertEqual(decoded.prefix_versions, [13, 14])
 
     def test_service_adapter_round_trip(self):
         async def handler(request):
             self.assertEqual(request.verified_id.tolist(), [0, 0, 1])
-            return TLIDraftResponse(
+            return DraftForwardResponse(
                 request_id=request.request_id,
                 parent_list=torch.tensor([[0, 1]]),
                 top_scores_index=torch.tensor([[1, 0]]),
                 draft_token_ids=torch.tensor([0, 1, 2]),
             )
 
-        adapter = TliSpeculativeServiceAdapter(
+        adapter = DraftForwardServiceAdapter(
             handler,
             translator=self.translator,
             proto_module=_FAKE_PROTO,
@@ -244,7 +264,7 @@ class TestTLIGRPCTransport(CustomTestCase):
         )
 
         proto_request = draft_request_to_proto(
-            TLIDraftRequest(
+            DraftForwardRequest(
                 request_id="req-1",
                 mode="decode",
                 verified_id=torch.tensor([0, 2, 1]),
@@ -253,7 +273,9 @@ class TestTLIGRPCTransport(CustomTestCase):
             translator=self.translator,
             proto_module=_FAKE_PROTO,
         )
-        response_proto = asyncio.run(adapter.DraftForward(proto_request, _FakeContext()))
+        response_proto = asyncio.run(
+            adapter.DraftForward(proto_request, _FakeContext())
+        )
         response = draft_response_from_proto(
             response_proto,
             translator=self.translator,
@@ -265,13 +287,13 @@ class TestTLIGRPCTransport(CustomTestCase):
         async def handler(_request):
             raise RuntimeError("boom")
 
-        adapter = TliSpeculativeServiceAdapter(
+        adapter = DraftForwardServiceAdapter(
             handler,
             proto_module=_FAKE_PROTO,
         )
 
         proto_request = draft_request_to_proto(
-            TLIDraftRequest(
+            DraftForwardRequest(
                 request_id="req-err",
                 mode="decode",
                 verified_id=torch.tensor([0]),
@@ -281,6 +303,63 @@ class TestTLIGRPCTransport(CustomTestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "boom"):
             asyncio.run(adapter.DraftForward(proto_request, _FakeContext()))
+
+    def test_service_adapter_stream_completes_requests_out_of_order(self):
+        async def handler(request):
+            if request.request_id == "slow":
+                await asyncio.sleep(0.02)
+            return DraftForwardResponse(
+                request_id=request.request_id,
+                parent_list=torch.tensor([[0, 1]]),
+                top_scores_index=torch.tensor([[1, 0]]),
+                draft_token_ids=torch.tensor([0, 1]),
+                round_ids=request.round_ids,
+                token_positions=request.token_positions,
+                prefix_versions=request.prefix_versions,
+            )
+
+        async def request_stream():
+            for request_id, round_id in (("slow", 1), ("fast", 2)):
+                yield draft_request_to_proto(
+                    DraftForwardRequest(
+                        request_id=request_id,
+                        mode="decode",
+                        verified_id=torch.tensor([round_id]),
+                        hidden_states=torch.zeros(1, 2),
+                        round_ids=[round_id],
+                        token_positions=[round_id * 10],
+                        prefix_versions=[round_id * 100],
+                    ),
+                    proto_module=_FAKE_PROTO,
+                )
+
+        async def collect():
+            adapter = DraftForwardServiceAdapter(
+                handler,
+                proto_module=_FAKE_PROTO,
+            )
+            return [
+                draft_response_from_proto(response)
+                async for response in adapter.DraftForwardStream(
+                    request_stream(),
+                    _FakeContext(),
+                )
+            ]
+
+        responses = asyncio.run(collect())
+
+        self.assertEqual(
+            [response.request_id for response in responses], ["fast", "slow"]
+        )
+        self.assertEqual([response.round_ids for response in responses], [[2], [1]])
+        self.assertEqual(
+            [response.token_positions for response in responses],
+            [[20], [10]],
+        )
+        self.assertEqual(
+            [response.prefix_versions for response in responses],
+            [[200], [100]],
+        )
 
 
 if __name__ == "__main__":

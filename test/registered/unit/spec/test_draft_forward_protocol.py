@@ -2,11 +2,13 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
+from sglang.srt.speculative.draft_forward_protocol import (
+    DraftForwardRequest,
+    DraftForwardResponse,
+)
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
@@ -43,7 +45,7 @@ def _make_translator(target_vocab, draft_vocab):
     )
 
 
-class TestTLIProtocol(CustomTestCase):
+class TestDraftForwardProtocol(CustomTestCase):
     def setUp(self):
         self.translator = _make_translator(
             {"a": 0, "b": 1, "c": 2},
@@ -51,7 +53,7 @@ class TestTLIProtocol(CustomTestCase):
         )
 
     def test_request_translation(self):
-        request = TLIDraftRequest(
+        request = DraftForwardRequest(
             request_id="req-1",
             mode="decode",
             verified_id=torch.tensor([0, 2, 1]),
@@ -62,6 +64,9 @@ class TestTLIProtocol(CustomTestCase):
             speculative_num_draft_tokens=4,
             accept_length=torch.tensor([1, 2, 3]),
             accept_length_cpu=[1, 2, 3],
+            round_ids=[3, 4],
+            token_positions=[5, 6],
+            prefix_versions=[8, 9],
         )
 
         translated = request.to_draft_vocab(self.translator)
@@ -73,14 +78,20 @@ class TestTLIProtocol(CustomTestCase):
         self.assertEqual(translated.speculative_num_steps, 3)
         self.assertEqual(translated.speculative_num_draft_tokens, 4)
         self.assertEqual(translated.accept_length_cpu, [1, 2, 3])
+        self.assertEqual(translated.round_ids, [3, 4])
+        self.assertEqual(translated.token_positions, [5, 6])
+        self.assertEqual(translated.prefix_versions, [8, 9])
 
     def test_response_translation(self):
-        response = TLIDraftResponse(
+        response = DraftForwardResponse(
             request_id="req-1",
             parent_list=torch.tensor([[0, 1], [1, 0]]),
             top_scores_index=torch.tensor([[1, 0], [0, 1]]),
             draft_token_ids=torch.tensor([0, 1, 2]),
             next_hidden_states=torch.zeros(3, 4),
+            round_ids=[3, 4],
+            token_positions=[5, 6],
+            prefix_versions=[8, 9],
         )
 
         translated = response.to_target_vocab(self.translator)
@@ -94,6 +105,9 @@ class TestTLIProtocol(CustomTestCase):
         self.assertTrue(
             torch.equal(translated.next_hidden_states, response.next_hidden_states)
         )
+        self.assertEqual(translated.round_ids, [3, 4])
+        self.assertEqual(translated.token_positions, [5, 6])
+        self.assertEqual(translated.prefix_versions, [8, 9])
 
 
 if __name__ == "__main__":

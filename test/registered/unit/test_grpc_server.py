@@ -8,18 +8,20 @@ import zmq.asyncio
 
 from sglang.srt.entrypoints.grpc_server import (
     _install_request_manager_capture,
-    _install_tli_draft_forward_bridge,
+    _install_draft_forward_bridge,
     _start_smg_sidecars_when_ready,
 )
 from sglang.srt.managers.io_struct import (
-    TLIDraftForwardReqInput,
-    TLIDraftForwardReqOutput,
+    DraftForwardReqInput,
+    DraftForwardReqOutput,
 )
-from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
+from sglang.srt.speculative.draft_forward_protocol import (
+    DraftForwardRequest,
+    DraftForwardResponse,
+)
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
@@ -31,7 +33,7 @@ class _RequestManager:
 
 class _BridgeRequestManager:
     def __init__(self):
-        self.server_args = SimpleNamespace(tli_rpc_timeout=1.0)
+        self.server_args = SimpleNamespace(draft_forward_rpc_timeout=1.0)
         self.context = zmq.asyncio.Context(2)
         self.send_to_scheduler = _FakeSchedulerSocket(self.context)
         self.recv_from_scheduler = self.send_to_scheduler
@@ -48,12 +50,12 @@ class _FakeSchedulerSocket:
 
     def send_pyobj(self, obj):
         self.sent.append(obj)
-        if isinstance(obj, TLIDraftForwardReqInput):
-            output = TLIDraftForwardReqOutput(
+        if isinstance(obj, DraftForwardReqInput):
+            output = DraftForwardReqOutput(
                 rid=obj.rid,
                 success=True,
                 message="",
-                response=TLIDraftResponse(
+                response=DraftForwardResponse(
                     request_id=obj.request.request_id,
                     parent_list=[],
                     top_scores_index=[],
@@ -91,7 +93,9 @@ class TestGrpcServerCompat(CustomTestCase):
 
         asyncio.run(run_test())
 
-    def test_install_request_manager_capture_installs_tli_bridge_for_draft_role(self):
+    def test_install_request_manager_capture_installs_draft_forward_bridge_for_draft_role(
+        self,
+    ):
         async def run_test():
             with patch(
                 "sglang.srt.entrypoints.grpc_server._iter_request_manager_classes",
@@ -99,24 +103,20 @@ class TestGrpcServerCompat(CustomTestCase):
             ):
                 future, restore_capture = _install_request_manager_capture(
                     SimpleNamespace(),
-                    SimpleNamespace(tli_disaggregation_role="draft"),
+                    SimpleNamespace(draft_disaggregation_role="draft"),
                 )
                 request_manager = _BridgeRequestManager()
                 try:
                     self.assertIs(await future, request_manager)
+                    self.assertTrue(callable(request_manager.handle_draft_forward))
                     self.assertTrue(
-                        callable(request_manager.handle_tli_draft_forward)
+                        callable(request_manager.draft_forward_communicator)
                     )
                     self.assertTrue(
-                        callable(request_manager.tli_draft_forward_communicator)
-                    )
-                    self.assertTrue(
-                        callable(
-                            request_manager._tli_draft_forward_bridge_restore
-                        )
+                        callable(request_manager._draft_forward_bridge_restore)
                     )
                 finally:
-                    request_manager._tli_draft_forward_bridge_restore()
+                    request_manager._draft_forward_bridge_restore()
                     restore_capture()
 
         asyncio.run(run_test())
@@ -130,8 +130,10 @@ class TestGrpcServerCompat(CustomTestCase):
             started["sidecar"] = (host, port, app)
             return SimpleNamespace(cleanup=lambda: None)
 
-        async def fake_start_tli_draft_service(source, server_args, request_handler=None):
-            started["tli"] = (source, server_args, request_handler)
+        async def fake_start_draft_forward_service(
+            source, server_args, request_handler=None
+        ):
+            started["draft_forward"] = (source, server_args, request_handler)
             return SimpleNamespace(stop=lambda grace=0: None)
 
         async def run_test():
@@ -142,44 +144,49 @@ class TestGrpcServerCompat(CustomTestCase):
                 "sglang.srt.entrypoints.grpc_server._start_sidecar_server",
                 fake_start_sidecar_server,
             ), patch(
-                "sglang.srt.entrypoints.grpc_server.start_tli_draft_service",
-                fake_start_tli_draft_service,
+                "sglang.srt.entrypoints.grpc_server.start_draft_forward_service",
+                fake_start_draft_forward_service,
             ):
                 return await _start_smg_sidecars_when_ready(
                     SimpleNamespace(
                         host="127.0.0.1",
-                        tli_disaggregation_role="draft",
-                        tli_service_port=32001,
+                        draft_disaggregation_role="draft",
+                        draft_forward_service_port=32001,
                     ),
                     request_manager_future,
-                    SimpleNamespace(router=SimpleNamespace(add_get=lambda *args, **kwargs: None, add_post=lambda *args, **kwargs: None)),
+                    SimpleNamespace(
+                        router=SimpleNamespace(
+                            add_get=lambda *args, **kwargs: None,
+                            add_post=lambda *args, **kwargs: None,
+                        )
+                    ),
                     "127.0.0.1",
                     30001,
                 )
 
-        sidecar_runner, tli_runner, restore = asyncio.run(run_test())
+        sidecar_runner, draft_forward_runner, restore = asyncio.run(run_test())
 
         self.assertIn("sidecar", started)
-        self.assertIn("tli", started)
+        self.assertIn("draft_forward", started)
         self.assertEqual(started["sidecar"][0], "127.0.0.1")
         self.assertEqual(started["sidecar"][1], 30001)
-        self.assertIs(started["tli"][0], request_manager)
-        self.assertTrue(callable(started["tli"][0].handle_tli_draft_forward))
+        self.assertIs(started["draft_forward"][0], request_manager)
+        self.assertTrue(callable(started["draft_forward"][0].handle_draft_forward))
         self.assertTrue(
-            callable(started["tli"][0].tli_draft_forward_communicator)
+            callable(started["draft_forward"][0].draft_forward_communicator)
         )
         self.assertIsNotNone(sidecar_runner)
-        self.assertIsNotNone(tli_runner)
+        self.assertIsNotNone(draft_forward_runner)
         self.assertTrue(callable(restore))
 
-    def test_install_tli_draft_forward_bridge_round_trip(self):
+    def test_install_draft_forward_bridge_round_trip(self):
         request_manager = _BridgeRequestManager()
-        restore = _install_tli_draft_forward_bridge(request_manager)
+        restore = _install_draft_forward_bridge(request_manager)
 
         async def run_test():
-            request = TLIDraftForwardReqInput(
+            request = DraftForwardReqInput(
                 rid="draft-1",
-                request=TLIDraftRequest(
+                request=DraftForwardRequest(
                     request_id="req-1",
                     verified_id=torch.tensor([0, 1]),
                     hidden_states=torch.zeros(2, 3),
@@ -193,7 +200,7 @@ class TestGrpcServerCompat(CustomTestCase):
 
             consumer_task = asyncio.create_task(consume_scheduler_output())
             try:
-                response = await request_manager.handle_tli_draft_forward(request)
+                response = await request_manager.handle_draft_forward(request)
                 normal_output = await consumer_task
             finally:
                 restore()

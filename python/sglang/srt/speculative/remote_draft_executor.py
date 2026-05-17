@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scheduler-side draft executor for disaggregated TLI."""
+"""Scheduler-side draft executor for disaggregated draft forwarding."""
 
 from __future__ import annotations
 
@@ -34,7 +34,10 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
-from sglang.srt.speculative.tli_protocol import TLIDraftRequest, TLIDraftResponse
+from sglang.srt.speculative.draft_forward_protocol import (
+    DraftForwardRequest,
+    DraftForwardResponse,
+)
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.srt.utils import next_power_of_2
 from sglang.srt.utils.common import ceil_align
@@ -43,12 +46,12 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 logger = logging.getLogger(__name__)
 
 
-class TLIDraftExecutorNotReadyError(RuntimeError):
+class RemoteDraftExecutorNotReadyError(RuntimeError):
     """Raised when a safe draft-side execution invariant is not available yet."""
 
 
 @dataclass
-class TLIDraftRequestState:
+class RemoteDraftRequestState:
     """Per-request draft KV and speculative state."""
 
     request_id: str
@@ -60,10 +63,10 @@ class TLIDraftRequestState:
     hidden_states: Optional[torch.Tensor] = None
 
 
-class TLIDraftSchedulerExecutor:
-    """Owns draft-node request state for TLI DraftForward RPCs.
+class RemoteDraftSchedulerExecutor:
+    """Owns draft-node request state for DraftForward RPCs.
 
-    The decode path intentionally reuses colocated EAGLE/TLI paged allocation
+    The decode path intentionally reuses colocated EAGLE paged allocation
     helpers so draft-owned cache layout stays aligned with the local worker.
     """
 
@@ -78,7 +81,7 @@ class TLIDraftSchedulerExecutor:
         self.token_to_kv_pool_allocator = scheduler.token_to_kv_pool_allocator
         self.tree_cache = scheduler.tree_cache
         self.tp_rank = scheduler.tp_worker.tp_rank
-        self.states: dict[tuple[str, int], TLIDraftRequestState] = {}
+        self.states: dict[tuple[str, int], RemoteDraftRequestState] = {}
         self._sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         self._translator: Optional[TLITokenTranslator] = None
         self._topk: Optional[int] = None
@@ -91,13 +94,13 @@ class TLIDraftSchedulerExecutor:
         )
         self._extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        if self.server_args.tli_disaggregation_role != "draft":
+        if self.server_args.draft_disaggregation_role != "draft":
             raise ValueError(
-                "TLIDraftSchedulerExecutor can only run on "
-                "--tli-disaggregation-role draft."
+                "RemoteDraftSchedulerExecutor can only run on "
+                "--draft-disaggregation-role draft."
             )
 
-    def handle(self, request: TLIDraftRequest) -> TLIDraftResponse:
+    def handle(self, request: DraftForwardRequest) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
         self._validate_request(request)
         if request.mode == "release":
@@ -113,15 +116,15 @@ class TLIDraftSchedulerExecutor:
         elif request.mode == "extend_after_decode":
             response = self._handle_extend_after_decode(request)
         else:
-            raise ValueError(f"Unsupported TLI draft mode: {request.mode!r}")
+            raise ValueError(f"Unsupported DraftForward mode: {request.mode!r}")
 
-        return response
+        return self._with_request_ordering(response, request)
 
     def release(
         self, request_ids: list[str], tp_rank: int, *, cache_prefix: bool = False
     ) -> None:
         if cache_prefix:
-            raise TLIDraftExecutorNotReadyError(
+            raise RemoteDraftExecutorNotReadyError(
                 "Draft-side release does not insert prefixes into the radix cache. "
                 "The draft executor only frees its owned KV and request slots."
             )
@@ -167,26 +170,26 @@ class TLIDraftSchedulerExecutor:
             1 for state in self.states.values() if state.req.req_pool_idx is not None
         )
 
-    def _validate_request(self, request: TLIDraftRequest) -> None:
+    def _validate_request(self, request: DraftForwardRequest) -> None:
         if request.tp_rank != self.tp_rank:
             raise ValueError(
-                "TLI draft request was routed to the wrong TP rank: "
+                "DraftForward request was routed to the wrong TP rank: "
                 f"request={request.tp_rank}, local={self.tp_rank}"
             )
         if request.tp_size != self.server_args.tp_size:
             raise ValueError(
-                "TLI draft request tp_size does not match draft server tp_size: "
+                "DraftForward request tp_size does not match draft server tp_size: "
                 f"request={request.tp_size}, server={self.server_args.tp_size}"
             )
         if request.tp_rank < 0 or request.tp_rank >= request.tp_size:
             raise ValueError(
-                f"Invalid TLI draft request tp_rank={request.tp_rank}, "
+                f"Invalid DraftForward request tp_rank={request.tp_rank}, "
                 f"tp_size={request.tp_size}"
             )
         if request.mode not in ("extend", "decode", "extend_after_decode", "release"):
-            raise ValueError(f"Unsupported TLI draft mode: {request.mode!r}")
+            raise ValueError(f"Unsupported DraftForward mode: {request.mode!r}")
 
-    def _ensure_spec_config(self, request: TLIDraftRequest) -> None:
+    def _ensure_spec_config(self, request: DraftForwardRequest) -> None:
         spec_values = (
             request.topk,
             request.speculative_num_steps,
@@ -215,7 +218,7 @@ class TLIDraftSchedulerExecutor:
             self._speculative_num_draft_tokens,
         ):
             raise ValueError(
-                "TLI draft request speculative parameters changed within the "
+                "DraftForward request speculative parameters changed within the "
                 "same draft executor. Restart the draft service or route to a "
                 "separate executor for a different speculative shape: "
                 f"request={spec_values}, executor="
@@ -225,11 +228,12 @@ class TLIDraftSchedulerExecutor:
     def _translator_or_create(self) -> TLITokenTranslator:
         if self._translator is not None:
             return self._translator
-        target_tokenizer_path = self.server_args.tli_target_tokenizer_path
+        target_tokenizer_path = self.server_args.draft_forward_target_tokenizer_path
         if target_tokenizer_path is None:
             raise ValueError(
-                "Draft role requires --tli-target-tokenizer-path to constrain TLI "
-                "draft logits to the target/draft vocabulary intersection."
+                "Draft role requires --draft-forward-target-tokenizer-path "
+                "to constrain draft logits to the target/draft vocabulary "
+                "intersection."
             )
 
         target_tokenizer = get_tokenizer(
@@ -256,7 +260,7 @@ class TLIDraftSchedulerExecutor:
         )
         return self._translator
 
-    def _handle_extend(self, request: TLIDraftRequest) -> TLIDraftResponse:
+    def _handle_extend(self, request: DraftForwardRequest) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
         self.release(request_ids, request.tp_rank)
         batch = self._build_initial_extend_batch(request, request_ids)
@@ -293,13 +297,13 @@ class TLIDraftSchedulerExecutor:
             for state in self._states_from_batch(batch, request_ids):
                 self._release_request_state(state)
             raise
-        maybe_detect_nan(logits_output.next_token_logits, "tli_draft_extend")
+        maybe_detect_nan(logits_output.next_token_logits, "draft_forward_extend")
         self._capture_for_decode(logits_output, forward_batch.spec_info)
         self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
         return self._state_response(request, forward_batch.spec_info)
 
-    def _handle_decode(self, request: TLIDraftRequest) -> TLIDraftResponse:
+    def _handle_decode(self, request: DraftForwardRequest) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
         batch = self._build_decode_batch(request, request_ids)
         spec_info = batch.spec_info
@@ -313,7 +317,7 @@ class TLIDraftSchedulerExecutor:
             self._draft_attn_backend.init_forward_metadata(forward_batch)
 
         parent_list, top_scores_index, draft_tokens = self._draft_forward(forward_batch)
-        return TLIDraftResponse(
+        return DraftForwardResponse(
             request_id=request.request_id,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
@@ -321,7 +325,9 @@ class TLIDraftSchedulerExecutor:
             mode=request.mode,
         )
 
-    def _handle_extend_after_decode(self, request: TLIDraftRequest) -> TLIDraftResponse:
+    def _handle_extend_after_decode(
+        self, request: DraftForwardRequest
+    ) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
         batch, states, new_seq_lens = self._build_extend_after_decode_batch(
             request, request_ids
@@ -354,7 +360,7 @@ class TLIDraftSchedulerExecutor:
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
             raise
         maybe_detect_nan(
-            logits_output.next_token_logits, "tli_draft_extend_after_decode"
+            logits_output.next_token_logits, "draft_forward_extend_after_decode"
         )
         self._capture_for_decode(logits_output, forward_batch.spec_info)
         self._commit_extend_after_decode_state(states, new_seq_lens)
@@ -363,24 +369,26 @@ class TLIDraftSchedulerExecutor:
         return self._state_response(request, forward_batch.spec_info)
 
     def _build_initial_extend_batch(
-        self, request: TLIDraftRequest, request_ids: list[str]
+        self, request: DraftForwardRequest, request_ids: list[str]
     ) -> ScheduleBatch:
         if request.input_ids is None:
-            raise ValueError("TLI draft extend requires flattened input_ids.")
+            raise ValueError("DraftForward extend requires flattened input_ids.")
         if request.seq_lens_for_draft_extend_cpu is None:
-            raise ValueError("TLI draft extend requires seq_lens_for_draft_extend_cpu.")
+            raise ValueError(
+                "DraftForward extend requires seq_lens_for_draft_extend_cpu."
+            )
 
         seq_lens_cpu = request.seq_lens_for_draft_extend_cpu.cpu().tolist()
         if len(seq_lens_cpu) != len(request_ids):
             raise ValueError(
-                "TLI draft extend request_ids and seq_lens length mismatch: "
+                "DraftForward extend request_ids and seq_lens length mismatch: "
                 f"{len(request_ids)} request ids vs {len(seq_lens_cpu)} sequence lengths."
             )
 
         input_ids = request.input_ids.to("cpu").tolist()
         if sum(seq_lens_cpu) != len(input_ids):
-            raise TLIDraftExecutorNotReadyError(
-                "TLI draft extend requires the target to send the full current "
+            raise RemoteDraftExecutorNotReadyError(
+                "DraftForward extend requires the target to send the full current "
                 "token prefix for each request so the draft node can reconstruct "
                 "draft-owned KV independently. Got "
                 f"sum(seq_lens)={sum(seq_lens_cpu)} but len(input_ids)={len(input_ids)}."
@@ -393,7 +401,7 @@ class TLIDraftSchedulerExecutor:
             offset += seq_len
             if len(token_ids) == 0:
                 raise ValueError(
-                    f"TLI draft extend got empty input for {request_id!r}."
+                    f"DraftForward extend got empty input for {request_id!r}."
                 )
             req = Req(
                 rid=request_id,
@@ -420,7 +428,7 @@ class TLIDraftSchedulerExecutor:
         return batch
 
     def _align_extend_hidden_states(
-        self, request: TLIDraftRequest, batch: ScheduleBatch
+        self, request: DraftForwardRequest, batch: ScheduleBatch
     ) -> torch.Tensor:
         hidden_states = request.hidden_states.to(self.device, non_blocking=True)
         if hidden_states.shape[0] == batch.extend_num_tokens:
@@ -428,8 +436,8 @@ class TLIDraftSchedulerExecutor:
 
         seq_lens_cpu = request.seq_lens_for_draft_extend_cpu.cpu().tolist()
         if hidden_states.shape[0] != sum(seq_lens_cpu):
-            raise TLIDraftExecutorNotReadyError(
-                "TLI draft extend cannot align target hidden states with "
+            raise RemoteDraftExecutorNotReadyError(
+                "DraftForward extend cannot align target hidden states with "
                 "draft-owned prefix cache state. The target sent "
                 f"{hidden_states.shape[0]} hidden rows, while the draft needs "
                 f"{batch.extend_num_tokens} uncached rows and the full prefix "
@@ -444,7 +452,7 @@ class TLIDraftSchedulerExecutor:
         return torch.cat(parts, dim=0) if parts else hidden_states[:0]
 
     def _build_decode_batch(
-        self, request: TLIDraftRequest, request_ids: list[str]
+        self, request: DraftForwardRequest, request_ids: list[str]
     ) -> ScheduleBatch:
         states = self._states_for_request(request, request_ids)
         for state in states:
@@ -454,7 +462,7 @@ class TLIDraftSchedulerExecutor:
                 or state.hidden_states is None
             ):
                 raise RuntimeError(
-                    f"TLI draft state for {state.request_id!r} is missing next "
+                    f"DraftForward state for {state.request_id!r} is missing next "
                     "draft probabilities; an extend or extend_after_decode RPC "
                     "must succeed before decode."
                 )
@@ -474,18 +482,20 @@ class TLIDraftSchedulerExecutor:
         return batch
 
     def _build_extend_after_decode_batch(
-        self, request: TLIDraftRequest, request_ids: list[str]
-    ) -> tuple[ScheduleBatch, list[TLIDraftRequestState], list[int]]:
+        self, request: DraftForwardRequest, request_ids: list[str]
+    ) -> tuple[ScheduleBatch, list[RemoteDraftRequestState], list[int]]:
         states = self._states_for_request(request, request_ids)
         if request.accept_length_cpu is None:
             if request.accept_length is None:
-                raise ValueError("TLI extend_after_decode requires accept_length.")
+                raise ValueError(
+                    "DraftForward extend_after_decode requires accept_length."
+                )
             accept_length_cpu = request.accept_length.cpu().tolist()
         else:
             accept_length_cpu = request.accept_length_cpu
         if len(accept_length_cpu) != len(states):
             raise ValueError(
-                "TLI extend_after_decode accept_length length mismatch: "
+                "DraftForward extend_after_decode accept_length length mismatch: "
                 f"{len(accept_length_cpu)} values for {len(states)} requests."
             )
 
@@ -534,7 +544,7 @@ class TLIDraftSchedulerExecutor:
 
     def _commit_extend_after_decode_state(
         self,
-        states: list[TLIDraftRequestState],
+        states: list[RemoteDraftRequestState],
         new_seq_lens: list[int],
     ) -> None:
         for state, new_seq_len in zip(states, new_seq_lens):
@@ -543,7 +553,7 @@ class TLIDraftSchedulerExecutor:
             state.seq_len = new_seq_len
 
     def _base_batch_from_states(
-        self, states: list[TLIDraftRequestState]
+        self, states: list[RemoteDraftRequestState]
     ) -> ScheduleBatch:
         reqs = [state.req for state in states]
         batch = ScheduleBatch.init_new(
@@ -575,7 +585,7 @@ class TLIDraftSchedulerExecutor:
 
     def _alloc_extend_after_decode_slots(
         self,
-        states: list[TLIDraftRequestState],
+        states: list[RemoteDraftRequestState],
         old_seq_lens: list[int],
         extend_lens: list[int],
     ) -> torch.Tensor:
@@ -755,7 +765,7 @@ class TLIDraftSchedulerExecutor:
             spec_info.hidden_states,
         )
 
-        maybe_detect_nan(topk_p, "tli_draft_forward: NaN in initial topk_p")
+        maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p")
 
         out_cache_loc = out_cache_loc.reshape(
             forward_batch.batch_size, self._topk, self._speculative_num_steps
@@ -792,9 +802,7 @@ class TLIDraftSchedulerExecutor:
             logits_output = self.model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            maybe_detect_nan(
-                logits_output.next_token_logits, f"tli_draft_forward step {i}"
-            )
+            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             constrained_logits = translator.constrain_draft_logits(
                 logits_output.next_token_logits
             )
@@ -804,7 +812,7 @@ class TLIDraftSchedulerExecutor:
                 topk_index,
                 0,
                 constrained_logits.shape[-1],
-                f"tli_draft_forward step {i}: topk_index OOB",
+                f"draft_forward step {i}: topk_index OOB",
             )
             hidden_states = logits_output.hidden_states
 
@@ -829,11 +837,11 @@ class TLIDraftSchedulerExecutor:
         spec_info: EagleDraftInput,
     ) -> None:
         if len(request_ids) != len(batch.reqs):
-            raise ValueError("TLI draft state/request batch size mismatch.")
+            raise ValueError("DraftForward state/request batch size mismatch.")
         for i, request_id in enumerate(request_ids):
             state = self.states.get((request_id, self.tp_rank))
             if state is None:
-                state = TLIDraftRequestState(
+                state = RemoteDraftRequestState(
                     request_id=request_id,
                     tp_rank=self.tp_rank,
                     req=batch.reqs[i],
@@ -847,12 +855,14 @@ class TLIDraftSchedulerExecutor:
             self._assert_state_kv_invariant(state)
 
     @staticmethod
-    def _assert_state_kv_invariant(state: TLIDraftRequestState) -> None:
+    def _assert_state_kv_invariant(state: RemoteDraftRequestState) -> None:
         if state.req.req_pool_idx is None:
-            raise RuntimeError(f"TLI draft state {state.request_id!r} has no req slot.")
+            raise RuntimeError(
+                f"DraftForward state {state.request_id!r} has no req slot."
+            )
         if state.seq_len < len(state.req.origin_input_ids):
             raise RuntimeError(
-                "TLI draft request sequence length regressed below its prompt "
+                "DraftForward request sequence length regressed below its prompt "
                 f"length: request_id={state.request_id!r}, seq_len={state.seq_len}, "
                 f"prompt_len={len(state.req.origin_input_ids)}"
             )
@@ -861,13 +871,13 @@ class TLIDraftSchedulerExecutor:
             or state.req.kv_allocated_len != state.seq_len
         ):
             raise RuntimeError(
-                "TLI draft KV accounting mismatch: "
+                "DraftForward KV accounting mismatch: "
                 f"request_id={state.request_id!r}, seq_len={state.seq_len}, "
                 f"committed={state.req.kv_committed_len}, "
                 f"allocated={state.req.kv_allocated_len}"
             )
 
-    def _release_request_state(self, state: TLIDraftRequestState) -> None:
+    def _release_request_state(self, state: RemoteDraftRequestState) -> None:
         req = state.req
         req_pool_idx = req.req_pool_idx
         if req_pool_idx is None:
@@ -877,7 +887,7 @@ class TLIDraftSchedulerExecutor:
             or req.kv_allocated_len != state.seq_len
         ):
             raise RuntimeError(
-                "TLI draft release saw mismatched KV accounting: "
+                "DraftForward release saw mismatched KV accounting: "
                 f"request_id={state.request_id!r}, seq_len={state.seq_len}, "
                 f"committed={req.kv_committed_len}, allocated={req.kv_allocated_len}"
             )
@@ -895,14 +905,14 @@ class TLIDraftSchedulerExecutor:
         req.kv_committed_len = 0
         req.kv_allocated_len = 0
 
-    def _held_full_tokens_for_state(self, state: TLIDraftRequestState) -> int:
+    def _held_full_tokens_for_state(self, state: RemoteDraftRequestState) -> int:
         req = state.req
         if req.req_pool_idx is None:
             return 0
         allocated = ceil_align(req.kv_allocated_len, self.server_args.page_size)
         return allocated - req.cache_protected_len
 
-    def _held_swa_tokens_for_state(self, state: TLIDraftRequestState) -> int:
+    def _held_swa_tokens_for_state(self, state: RemoteDraftRequestState) -> int:
         if not self.tree_cache.supports_swa():
             return 0
         req = state.req
@@ -913,14 +923,14 @@ class TLIDraftSchedulerExecutor:
 
     def _states_from_batch(
         self, batch: ScheduleBatch, request_ids: list[str]
-    ) -> list[TLIDraftRequestState]:
+    ) -> list[RemoteDraftRequestState]:
         if len(request_ids) != len(batch.reqs):
-            raise ValueError("TLI draft state/request batch size mismatch.")
-        states: list[TLIDraftRequestState] = []
+            raise ValueError("DraftForward state/request batch size mismatch.")
+        states: list[RemoteDraftRequestState] = []
         for i, request_id in enumerate(request_ids):
             state = self.states.get((request_id, self.tp_rank))
             if state is None:
-                state = TLIDraftRequestState(
+                state = RemoteDraftRequestState(
                     request_id=request_id,
                     tp_rank=self.tp_rank,
                     req=batch.reqs[i],
@@ -932,22 +942,22 @@ class TLIDraftSchedulerExecutor:
         return states
 
     def _states_for_request(
-        self, request: TLIDraftRequest, request_ids: list[str]
-    ) -> list[TLIDraftRequestState]:
+        self, request: DraftForwardRequest, request_ids: list[str]
+    ) -> list[RemoteDraftRequestState]:
         states = []
         for request_id in request_ids:
             state = self.states.get((request_id, request.tp_rank))
             if state is None:
                 raise RuntimeError(
-                    f"TLI draft state for request {request_id!r} does not exist."
+                    f"DraftForward state for request {request_id!r} does not exist."
                 )
             states.append(state)
         return states
 
     def _state_response(
-        self, request: TLIDraftRequest, spec_info: EagleDraftInput
-    ) -> TLIDraftResponse:
-        return TLIDraftResponse(
+        self, request: DraftForwardRequest, spec_info: EagleDraftInput
+    ) -> DraftForwardResponse:
+        return DraftForwardResponse(
             request_id=request.request_id,
             parent_list=torch.empty((0,), dtype=torch.int64, device=self.device),
             top_scores_index=torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -956,15 +966,31 @@ class TLIDraftSchedulerExecutor:
             next_hidden_states=spec_info.hidden_states,
             next_topk_p=spec_info.topk_p,
             next_topk_index=spec_info.topk_index,
+            round_ids=request.round_ids,
+            token_positions=request.token_positions,
+            prefix_versions=request.prefix_versions,
         )
 
     @staticmethod
-    def _empty_response(request: TLIDraftRequest) -> TLIDraftResponse:
+    def _empty_response(request: DraftForwardRequest) -> DraftForwardResponse:
         empty_i64 = torch.empty((0,), dtype=torch.int64)
-        return TLIDraftResponse(
+        return DraftForwardResponse(
             request_id=request.request_id,
             parent_list=empty_i64,
             top_scores_index=empty_i64,
             draft_token_ids=empty_i64,
             mode=request.mode,
+            round_ids=request.round_ids,
+            token_positions=request.token_positions,
+            prefix_versions=request.prefix_versions,
         )
+
+    @staticmethod
+    def _with_request_ordering(
+        response: DraftForwardResponse,
+        request: DraftForwardRequest,
+    ) -> DraftForwardResponse:
+        response.round_ids = request.round_ids
+        response.token_positions = request.token_positions
+        response.prefix_versions = request.prefix_versions
+        return response

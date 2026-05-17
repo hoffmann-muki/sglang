@@ -48,7 +48,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
-class TestTLIDisaggregationServerArgs(unittest.TestCase):
+class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
     @patch(
         "sglang.srt.server_args._resolve_or_download",
         side_effect=lambda path, **kwargs: path,
@@ -57,13 +57,13 @@ class TestTLIDisaggregationServerArgs(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             grpc_mode=True,
-            tli_disaggregation_role="target",
+            draft_disaggregation_role="target",
             speculative_algorithm="TLI",
-            tli_draft_server_addr="127.0.0.1:31000",
-            tli_draft_tokenizer_path="draft-tokenizer",
+            remote_draft_server_addr="127.0.0.1:31000",
+            remote_draft_tokenizer_path="draft-tokenizer",
             tp_size=4,
         )
-        self.assertEqual(server_args.tli_draft_tp_size, 4)
+        self.assertEqual(server_args.remote_draft_tp_size, 4)
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
@@ -73,14 +73,14 @@ class TestTLIDisaggregationServerArgs(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             grpc_mode=True,
-            tli_disaggregation_role="target",
+            draft_disaggregation_role="target",
             speculative_algorithm="TLI",
-            tli_draft_server_addr="127.0.0.1:31000",
-            tli_draft_tokenizer_path="draft-tokenizer",
-            tli_draft_tp_size=1,
+            remote_draft_server_addr="127.0.0.1:31000",
+            remote_draft_tokenizer_path="draft-tokenizer",
+            remote_draft_tp_size=1,
             tp_size=4,
         )
-        self.assertEqual(server_args.tli_draft_tp_size, 1)
+        self.assertEqual(server_args.remote_draft_tp_size, 1)
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
@@ -91,14 +91,14 @@ class TestTLIDisaggregationServerArgs(unittest.TestCase):
             ServerArgs(
                 model_path="dummy",
                 grpc_mode=True,
-                tli_disaggregation_role="target",
+                draft_disaggregation_role="target",
                 speculative_algorithm="TLI",
-                tli_draft_server_addr="127.0.0.1:31000",
-                tli_draft_tokenizer_path="draft-tokenizer",
-                tli_draft_tp_size=2,
+                remote_draft_server_addr="127.0.0.1:31000",
+                remote_draft_tokenizer_path="draft-tokenizer",
+                remote_draft_tp_size=2,
                 tp_size=4,
             )
-        self.assertIn("tli-draft-tp-size", str(context.exception))
+        self.assertIn("remote-draft-tp-size", str(context.exception))
 
 
 class TestPortArgs(unittest.TestCase):
