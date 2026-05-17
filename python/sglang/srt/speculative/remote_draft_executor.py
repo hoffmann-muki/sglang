@@ -417,7 +417,7 @@ class RemoteDraftSchedulerExecutor:
         self, request: DraftForwardRequest
     ) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
-        batch, states, new_seq_lens = self._build_extend_after_decode_batch(
+        batch, states, new_seq_lens, extend_lens = self._build_extend_after_decode_batch(
             request, request_ids
         )
         model_worker_batch = batch.get_model_worker_batch()
@@ -451,7 +451,12 @@ class RemoteDraftSchedulerExecutor:
             logits_output.next_token_logits, "draft_forward_extend_after_decode"
         )
         self._capture_for_decode(logits_output, forward_batch.spec_info)
-        self._commit_extend_after_decode_state(states, new_seq_lens)
+        self._commit_extend_after_decode_state(
+            states,
+            new_seq_lens,
+            extend_lens,
+            request.verified_id,
+        )
         self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
         return self._state_response(request, forward_batch.spec_info)
@@ -631,7 +636,7 @@ class RemoteDraftSchedulerExecutor:
 
     def _build_extend_after_decode_batch(
         self, request: DraftForwardRequest, request_ids: list[str]
-    ) -> tuple[ScheduleBatch, list[RemoteDraftRequestState], list[int]]:
+    ) -> tuple[ScheduleBatch, list[RemoteDraftRequestState], list[int], list[int]]:
         states = self._states_for_request(request, request_ids)
         if request.accept_length_cpu is None:
             if request.accept_length is None:
@@ -688,14 +693,27 @@ class RemoteDraftSchedulerExecutor:
             batch,
             self._speculative_num_steps,
         )
-        return batch, states, new_seq_lens
+        return batch, states, new_seq_lens, extend_lens
 
     def _commit_extend_after_decode_state(
         self,
         states: list[RemoteDraftRequestState],
         new_seq_lens: list[int],
+        extend_lens: list[int],
+        verified_id: torch.Tensor,
     ) -> None:
-        for state, new_seq_len in zip(states, new_seq_lens):
+        verified_ids = verified_id.to("cpu").tolist()
+        if len(verified_ids) != sum(extend_lens):
+            raise ValueError(
+                "DraftForward extend_after_decode verified_id length mismatch: "
+                f"{len(verified_ids)} ids for extend_lens={extend_lens}."
+            )
+
+        offset = 0
+        for state, new_seq_len, extend_len in zip(states, new_seq_lens, extend_lens):
+            new_output_ids = verified_ids[offset : offset + extend_len]
+            offset += extend_len
+            state.req.output_ids.extend(new_output_ids)
             state.req.kv_committed_len = new_seq_len
             state.req.kv_allocated_len = new_seq_len
             state.seq_len = new_seq_len

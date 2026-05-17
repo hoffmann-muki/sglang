@@ -516,7 +516,7 @@ class RadixCache(BasePrefixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         radix_key = RadixKey(
