@@ -83,10 +83,12 @@ class _FakeDraftRequest:
     accept_length_cpu: list[int] = field(default_factory=list)
     seq_lens_for_draft_extend: _FakeTensorData | None = None
     seq_lens_for_draft_extend_cpu: _FakeTensorData | None = None
+    target_prefix_lens_for_draft_extend_cpu: _FakeTensorData | None = None
     mm_input_embeds: _FakeTensorData | None = None
     round_ids: list[int] = field(default_factory=list)
     token_positions: list[int] = field(default_factory=list)
     prefix_versions: list[int] = field(default_factory=list)
+    cache_prefix_on_release: bool = False
 
 
 @dataclass
@@ -190,9 +192,12 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
             speculative_num_draft_tokens=4,
             accept_length=torch.tensor([1, 2, 3]),
             accept_length_cpu=[1, 2, 3],
+            seq_lens_for_draft_extend_cpu=torch.tensor([4, 5]),
+            target_prefix_lens_for_draft_extend_cpu=torch.tensor([1, 2]),
             round_ids=[7, 8],
             token_positions=[11, 12],
             prefix_versions=[13, 14],
+            cache_prefix_on_release=True,
         )
 
         proto_request = draft_request_to_proto(
@@ -209,9 +214,15 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
         self.assertEqual(decoded.tp_rank, 1)
         self.assertEqual(decoded.tp_size, 3)
         self.assertEqual(decoded.accept_length_cpu, [1, 2, 3])
+        self.assertEqual(decoded.seq_lens_for_draft_extend_cpu.tolist(), [4, 5])
+        self.assertEqual(
+            decoded.target_prefix_lens_for_draft_extend_cpu.tolist(),
+            [1, 2],
+        )
         self.assertEqual(decoded.round_ids, [7, 8])
         self.assertEqual(decoded.token_positions, [11, 12])
         self.assertEqual(decoded.prefix_versions, [13, 14])
+        self.assertTrue(decoded.cache_prefix_on_release)
 
     def test_response_proto_translation(self):
         response = DraftForwardResponse(

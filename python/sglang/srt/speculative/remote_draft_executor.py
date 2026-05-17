@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
+    release_kv_cache,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -48,6 +49,65 @@ logger = logging.getLogger(__name__)
 
 class RemoteDraftExecutorNotReadyError(RuntimeError):
     """Raised when a safe draft-side execution invariant is not available yet."""
+
+
+def _slice_extend_hidden_states_for_prefixes(
+    hidden_states: torch.Tensor,
+    *,
+    seq_lens: list[int],
+    target_prefix_lens: list[int],
+    draft_prefix_lens: list[int],
+) -> torch.Tensor:
+    if not (len(seq_lens) == len(target_prefix_lens) == len(draft_prefix_lens)):
+        raise ValueError(
+            "DraftForward extend prefix metadata length mismatch: "
+            f"seq_lens={len(seq_lens)}, target_prefix_lens={len(target_prefix_lens)}, "
+            f"draft_prefix_lens={len(draft_prefix_lens)}."
+        )
+
+    expected_hidden_rows = 0
+    for seq_len, target_prefix_len, draft_prefix_len in zip(
+        seq_lens, target_prefix_lens, draft_prefix_lens
+    ):
+        if target_prefix_len < 0 or draft_prefix_len < 0:
+            raise ValueError("DraftForward extend prefix lengths must be non-negative.")
+        if target_prefix_len > seq_len or draft_prefix_len > seq_len:
+            raise ValueError(
+                "DraftForward extend prefix length exceeds sequence length: "
+                f"seq_len={seq_len}, target_prefix_len={target_prefix_len}, "
+                f"draft_prefix_len={draft_prefix_len}."
+            )
+        expected_hidden_rows += seq_len - target_prefix_len
+
+    if hidden_states.shape[0] != expected_hidden_rows:
+        raise RemoteDraftExecutorNotReadyError(
+            "DraftForward extend received hidden states that do not match target "
+            "prefix metadata: target sent "
+            f"{hidden_states.shape[0]} hidden rows but target_prefix_lens imply "
+            f"{expected_hidden_rows} rows for seq_lens={seq_lens} and "
+            f"target_prefix_lens={target_prefix_lens}."
+        )
+
+    parts = []
+    offset = 0
+    for seq_len, target_prefix_len, draft_prefix_len in zip(
+        seq_lens, target_prefix_lens, draft_prefix_lens
+    ):
+        target_hidden_len = seq_len - target_prefix_len
+        if draft_prefix_len < target_prefix_len:
+            raise RemoteDraftExecutorNotReadyError(
+                "DraftForward extend cannot reuse target-side prefix cache because "
+                "the draft node does not own the same prefix: "
+                f"seq_len={seq_len}, target_prefix_len={target_prefix_len}, "
+                f"draft_prefix_len={draft_prefix_len}."
+            )
+
+        start = offset + (draft_prefix_len - target_prefix_len)
+        end = offset + target_hidden_len
+        parts.append(hidden_states[start:end])
+        offset += target_hidden_len
+
+    return torch.cat(parts, dim=0) if parts else hidden_states[:0]
 
 
 @dataclass
@@ -104,7 +164,11 @@ class RemoteDraftSchedulerExecutor:
         request_ids = request.request_ids or [request.request_id]
         self._validate_request(request)
         if request.mode == "release":
-            self.release(request_ids, request.tp_rank)
+            self.release(
+                request_ids,
+                request.tp_rank,
+                cache_prefix=request.cache_prefix_on_release,
+            )
             return self._empty_response(request)
 
         self._ensure_spec_config(request)
@@ -123,15 +187,10 @@ class RemoteDraftSchedulerExecutor:
     def release(
         self, request_ids: list[str], tp_rank: int, *, cache_prefix: bool = False
     ) -> None:
-        if cache_prefix:
-            raise RemoteDraftExecutorNotReadyError(
-                "Draft-side release does not insert prefixes into the radix cache. "
-                "The draft executor only frees its owned KV and request slots."
-            )
         for request_id in request_ids:
             state = self.states.pop((request_id, tp_rank), None)
             if state is not None:
-                self._release_request_state(state)
+                self._release_request_state(state, cache_prefix=cache_prefix)
 
     def clear(self) -> None:
         for state in list(self.states.values()):
@@ -263,45 +322,46 @@ class RemoteDraftSchedulerExecutor:
     def _handle_extend(self, request: DraftForwardRequest) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
         self.release(request_ids, request.tp_rank)
-        batch = self._build_initial_extend_batch(request, request_ids)
-        hidden_states = self._align_extend_hidden_states(request, batch)
-        verified_id = request.verified_id.to(self.device, non_blocking=True)
-
-        batch.spec_info = EagleDraftInput(
-            hidden_states=hidden_states,
-            verified_id=verified_id,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-        )
-        batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=request.seq_lens_for_draft_extend_cpu
-        )
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        forward_batch.return_logprob = False
-        if request.mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = request.mm_input_embeds.to(
-                self.device, non_blocking=True
-            )
-
+        batch = None
         try:
+            batch = self._build_initial_extend_batch(request, request_ids)
+            hidden_states = self._align_extend_hidden_states(request, batch)
+            verified_id = request.verified_id.to(self.device, non_blocking=True)
+
+            batch.spec_info = EagleDraftInput(
+                hidden_states=hidden_states,
+                verified_id=verified_id,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+            batch.return_hidden_states = False
+            batch.spec_info.prepare_for_extend(batch)
+            batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+            model_worker_batch = batch.get_model_worker_batch(
+                seq_lens_cpu_cache=request.seq_lens_for_draft_extend_cpu
+            )
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch.return_logprob = False
+            if request.mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = request.mm_input_embeds.to(
+                    self.device, non_blocking=True
+                )
+
             logits_output = self.model_runner.forward(forward_batch).logits_output
+            maybe_detect_nan(logits_output.next_token_logits, "draft_forward_extend")
+            self._capture_for_decode(logits_output, forward_batch.spec_info)
+            self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
+
+            return self._state_response(request, forward_batch.spec_info)
         except Exception:
             logger.exception(
-                "extend forward failed request_id=%r tp_rank=%s",
+                "extend failed request_id=%r tp_rank=%s",
                 request.request_id,
                 request.tp_rank,
             )
-            for state in self._states_from_batch(batch, request_ids):
-                self._release_request_state(state)
+            if batch is not None:
+                self._release_batch_states(batch, request_ids)
             raise
-        maybe_detect_nan(logits_output.next_token_logits, "draft_forward_extend")
-        self._capture_for_decode(logits_output, forward_batch.spec_info)
-        self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
-
-        return self._state_response(request, forward_batch.spec_info)
 
     def _handle_decode(self, request: DraftForwardRequest) -> DraftForwardResponse:
         request_ids = request.request_ids or [request.request_id]
@@ -431,25 +491,55 @@ class RemoteDraftSchedulerExecutor:
         self, request: DraftForwardRequest, batch: ScheduleBatch
     ) -> torch.Tensor:
         hidden_states = request.hidden_states.to(self.device, non_blocking=True)
-        if hidden_states.shape[0] == batch.extend_num_tokens:
-            return hidden_states
-
         seq_lens_cpu = request.seq_lens_for_draft_extend_cpu.cpu().tolist()
-        if hidden_states.shape[0] != sum(seq_lens_cpu):
+        target_prefix_lens = self._target_prefix_lens_for_extend(
+            request,
+            seq_lens_cpu,
+            hidden_states.shape[0],
+        )
+        draft_prefix_lens = list(batch.prefix_lens)
+        hidden_states = _slice_extend_hidden_states_for_prefixes(
+            hidden_states,
+            seq_lens=seq_lens_cpu,
+            target_prefix_lens=target_prefix_lens,
+            draft_prefix_lens=draft_prefix_lens,
+        )
+        if hidden_states.shape[0] != batch.extend_num_tokens:
             raise RemoteDraftExecutorNotReadyError(
-                "DraftForward extend cannot align target hidden states with "
-                "draft-owned prefix cache state. The target sent "
-                f"{hidden_states.shape[0]} hidden rows, while the draft needs "
-                f"{batch.extend_num_tokens} uncached rows and the full prefix "
-                f"length is {sum(seq_lens_cpu)}."
+                "DraftForward extend hidden-state alignment produced the wrong "
+                "number of draft rows: "
+                f"aligned={hidden_states.shape[0]}, expected={batch.extend_num_tokens}, "
+                f"seq_lens={seq_lens_cpu}, target_prefix_lens={target_prefix_lens}, "
+                f"draft_prefix_lens={draft_prefix_lens}."
             )
+        return hidden_states
 
-        parts = []
-        offset = 0
-        for seq_len, prefix_len in zip(seq_lens_cpu, batch.prefix_lens):
-            parts.append(hidden_states[offset + prefix_len : offset + seq_len])
-            offset += seq_len
-        return torch.cat(parts, dim=0) if parts else hidden_states[:0]
+    def _target_prefix_lens_for_extend(
+        self,
+        request: DraftForwardRequest,
+        seq_lens_cpu: list[int],
+        hidden_rows: int,
+    ) -> list[int]:
+        if request.target_prefix_lens_for_draft_extend_cpu is not None:
+            target_prefix_lens = (
+                request.target_prefix_lens_for_draft_extend_cpu.cpu().tolist()
+            )
+            if len(target_prefix_lens) != len(seq_lens_cpu):
+                raise ValueError(
+                    "DraftForward extend target prefix length mismatch: "
+                    f"{len(target_prefix_lens)} prefix lengths for "
+                    f"{len(seq_lens_cpu)} requests."
+                )
+            return target_prefix_lens
+
+        if hidden_rows == sum(seq_lens_cpu):
+            return [0] * len(seq_lens_cpu)
+
+        raise RemoteDraftExecutorNotReadyError(
+            "DraftForward extend received prefix-cached hidden states without "
+            "target_prefix_lens_for_draft_extend_cpu metadata. "
+            f"hidden_rows={hidden_rows}, full_prefix_rows={sum(seq_lens_cpu)}."
+        )
 
     def _build_decode_batch(
         self, request: DraftForwardRequest, request_ids: list[str]
@@ -877,7 +967,9 @@ class RemoteDraftSchedulerExecutor:
                 f"allocated={state.req.kv_allocated_len}"
             )
 
-    def _release_request_state(self, state: RemoteDraftRequestState) -> None:
+    def _release_request_state(
+        self, state: RemoteDraftRequestState, *, cache_prefix: bool = False
+    ) -> None:
         req = state.req
         req_pool_idx = req.req_pool_idx
         if req_pool_idx is None:
@@ -892,6 +984,12 @@ class RemoteDraftSchedulerExecutor:
                 f"committed={req.kv_committed_len}, allocated={req.kv_allocated_len}"
             )
 
+        if cache_prefix:
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+            req.kv_committed_len = 0
+            req.kv_allocated_len = 0
+            return
+
         if req.mamba_pool_idx is not None and hasattr(
             self.req_to_token_pool, "free_mamba_cache"
         ):
@@ -904,6 +1002,21 @@ class RemoteDraftSchedulerExecutor:
         self.req_to_token_pool.free(req)
         req.kv_committed_len = 0
         req.kv_allocated_len = 0
+
+    def _release_batch_states(
+        self, batch: ScheduleBatch, request_ids: list[str]
+    ) -> None:
+        for state in self._states_from_batch(batch, request_ids):
+            self.states.pop((state.request_id, state.tp_rank), None)
+            try:
+                self._release_request_state(state)
+            except Exception:
+                logger.exception(
+                    "failed to clean up DraftForward state after extend failure: "
+                    "request_id=%r tp_rank=%s",
+                    state.request_id,
+                    state.tp_rank,
+                )
 
     def _held_full_tokens_for_state(self, state: RemoteDraftRequestState) -> int:
         req = state.req

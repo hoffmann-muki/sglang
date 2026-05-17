@@ -96,6 +96,8 @@ message DraftForwardRequest {
   repeated int64 round_ids = 20;
   repeated int64 token_positions = 21;
   repeated int64 prefix_versions = 22;
+  TensorData target_prefix_lens_for_draft_extend_cpu = 23;
+  bool cache_prefix_on_release = 24;
 }
 
 message DraftForwardResponse {

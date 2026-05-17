@@ -38,10 +38,12 @@ class DraftForwardRequest:
     accept_length_cpu: Optional[List[int]] = None
     seq_lens_for_draft_extend: Optional[torch.Tensor] = None
     seq_lens_for_draft_extend_cpu: Optional[torch.Tensor] = None
+    target_prefix_lens_for_draft_extend_cpu: Optional[torch.Tensor] = None
     mm_input_embeds: Optional[torch.Tensor] = None
     round_ids: Optional[List[int]] = None
     token_positions: Optional[List[int]] = None
     prefix_versions: Optional[List[int]] = None
+    cache_prefix_on_release: bool = False
 
     def to_draft_vocab(self, translator: TLITokenTranslator) -> DraftForwardRequest:
         """Translate token-id payloads into draft vocabulary.

@@ -64,9 +64,12 @@ class TestDraftForwardProtocol(CustomTestCase):
             speculative_num_draft_tokens=4,
             accept_length=torch.tensor([1, 2, 3]),
             accept_length_cpu=[1, 2, 3],
+            seq_lens_for_draft_extend_cpu=torch.tensor([4, 5]),
+            target_prefix_lens_for_draft_extend_cpu=torch.tensor([1, 2]),
             round_ids=[3, 4],
             token_positions=[5, 6],
             prefix_versions=[8, 9],
+            cache_prefix_on_release=True,
         )
 
         translated = request.to_draft_vocab(self.translator)
@@ -78,9 +81,15 @@ class TestDraftForwardProtocol(CustomTestCase):
         self.assertEqual(translated.speculative_num_steps, 3)
         self.assertEqual(translated.speculative_num_draft_tokens, 4)
         self.assertEqual(translated.accept_length_cpu, [1, 2, 3])
+        self.assertEqual(translated.seq_lens_for_draft_extend_cpu.tolist(), [4, 5])
+        self.assertEqual(
+            translated.target_prefix_lens_for_draft_extend_cpu.tolist(),
+            [1, 2],
+        )
         self.assertEqual(translated.round_ids, [3, 4])
         self.assertEqual(translated.token_positions, [5, 6])
         self.assertEqual(translated.prefix_versions, [8, 9])
+        self.assertTrue(translated.cache_prefix_on_release)
 
     def test_response_translation(self):
         response = DraftForwardResponse(

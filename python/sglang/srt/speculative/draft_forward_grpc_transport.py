@@ -249,6 +249,7 @@ def draft_request_to_proto(
         num_tokens_for_logprob_per_req=request.num_tokens_for_logprob_per_req,
         tp_rank=request.tp_rank,
         tp_size=request.tp_size,
+        cache_prefix_on_release=request.cache_prefix_on_release,
     )
     if request.round_ids is not None:
         message.round_ids.extend(list(request.round_ids))
@@ -298,6 +299,18 @@ def draft_request_to_proto(
             )
         else:
             message.seq_lens_for_draft_extend_cpu = seq_lens_for_draft_extend_cpu
+    if request.target_prefix_lens_for_draft_extend_cpu is not None:
+        target_prefix_lens_for_draft_extend_cpu = tensor_to_proto_tensor(
+            request.target_prefix_lens_for_draft_extend_cpu, proto_module
+        )
+        if hasattr(message.target_prefix_lens_for_draft_extend_cpu, "CopyFrom"):
+            message.target_prefix_lens_for_draft_extend_cpu.CopyFrom(
+                target_prefix_lens_for_draft_extend_cpu
+            )
+        else:
+            message.target_prefix_lens_for_draft_extend_cpu = (
+                target_prefix_lens_for_draft_extend_cpu
+            )
     if request.mm_input_embeds is not None:
         mm_input_embeds = tensor_to_proto_tensor(request.mm_input_embeds, proto_module)
         if hasattr(message.mm_input_embeds, "CopyFrom"):
@@ -364,6 +377,16 @@ def draft_request_from_proto(
             if _message_has_field(proto_request, "seq_lens_for_draft_extend_cpu")
             else None
         ),
+        target_prefix_lens_for_draft_extend_cpu=(
+            tensor_from_proto_tensor(
+                proto_request.target_prefix_lens_for_draft_extend_cpu
+            )
+            if _message_has_field(
+                proto_request,
+                "target_prefix_lens_for_draft_extend_cpu",
+            )
+            else None
+        ),
         mm_input_embeds=(
             tensor_from_proto_tensor(proto_request.mm_input_embeds)
             if _message_has_field(proto_request, "mm_input_embeds")
@@ -383,6 +406,9 @@ def draft_request_from_proto(
             list(proto_request.prefix_versions)
             if len(getattr(proto_request, "prefix_versions", [])) > 0
             else None
+        ),
+        cache_prefix_on_release=bool(
+            getattr(proto_request, "cache_prefix_on_release", False)
         ),
     )
 

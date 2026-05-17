@@ -153,7 +153,7 @@ class RemoteDraftWorker(EAGLEWorker):
         raise RuntimeError("RemoteDraftWorker does not own a local draft model runner.")
 
     def clear_cache_pool(self):
-        self._release_request_ids(sorted(self.active_request_ids))
+        self._release_request_ids(sorted(self.active_request_ids), cache_prefix=False)
         self._request_ordering.clear()
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
@@ -354,6 +354,12 @@ class RemoteDraftWorker(EAGLEWorker):
         full_input_ids = list(chain.from_iterable(req.fill_ids for req in batch.reqs))
         return torch.tensor(full_input_ids, dtype=torch.int64, device=self.device)
 
+    def _target_prefix_lens_for_draft_extend(self, batch) -> torch.Tensor:
+        prefix_lens = getattr(batch, "prefix_lens", None)
+        if prefix_lens is None:
+            prefix_lens = [0] * len(batch.reqs)
+        return torch.tensor(prefix_lens, dtype=torch.int64)
+
     def _apply_next_draft_state(
         self,
         draft_input: EagleDraftInput,
@@ -373,7 +379,9 @@ class RemoteDraftWorker(EAGLEWorker):
         draft_input.topk_index = response.next_topk_index.to(self.device)
         draft_input.hidden_states = response.next_hidden_states.to(self.device)
 
-    def _release_request_ids(self, request_ids: list[str]) -> None:
+    def _release_request_ids(
+        self, request_ids: list[str], *, cache_prefix: bool = True
+    ) -> None:
         if not request_ids:
             return
         release_request = DraftForwardRequest(
@@ -384,6 +392,7 @@ class RemoteDraftWorker(EAGLEWorker):
             mode="release",
             tp_rank=self._draft_tp_rank(),
             tp_size=self._draft_tp_size(),
+            cache_prefix_on_release=cache_prefix,
         )
         self._run_rank0_broadcasted_draft_forward(
             release_request,
@@ -440,7 +449,7 @@ class RemoteDraftWorker(EAGLEWorker):
             or batch.spec_info.verified_id.numel() > 0
         ):
             self.forward_draft_extend_after_decode(batch)
-        self._release_request_ids(finished_request_ids)
+        self._release_request_ids(finished_request_ids, cache_prefix=True)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
@@ -483,6 +492,9 @@ class RemoteDraftWorker(EAGLEWorker):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             seq_lens_for_draft_extend=batch.seq_lens,
             seq_lens_for_draft_extend_cpu=seq_lens_cpu,
+            target_prefix_lens_for_draft_extend_cpu=(
+                self._target_prefix_lens_for_draft_extend(batch)
+            ),
             mm_input_embeds=mm_input_embeds,
         )
         self._attach_ordering_metadata(

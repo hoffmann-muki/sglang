@@ -8,8 +8,10 @@ import torch
 
 from sglang.srt.speculative import draft_disaggregation
 from sglang.srt.speculative.remote_draft_executor import (
+    RemoteDraftExecutorNotReadyError,
     RemoteDraftRequestState,
     RemoteDraftSchedulerExecutor,
+    _slice_extend_hidden_states_for_prefixes,
 )
 from sglang.srt.speculative.eagle_utils import (
     _normalize_verified_id_for_tree_build,
@@ -267,6 +269,60 @@ class TestDraftDisaggregation(CustomTestCase):
         self.assertEqual(executor.held_full_tokens(), 27)
         self.assertEqual(executor.held_swa_tokens(), 23)
         self.assertEqual(executor.held_req_count(), 2)
+
+    def test_extend_hidden_state_slicing_uses_target_and_draft_prefixes(self):
+        hidden_states = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+
+        aligned = _slice_extend_hidden_states_for_prefixes(
+            hidden_states,
+            seq_lens=[5],
+            target_prefix_lens=[1],
+            draft_prefix_lens=[3],
+        )
+
+        self.assertTrue(torch.equal(aligned, torch.tensor([[2.0], [3.0]])))
+
+    def test_extend_hidden_state_slicing_supports_batched_requests(self):
+        hidden_states = torch.arange(7, dtype=torch.float32).reshape(7, 1)
+
+        aligned = _slice_extend_hidden_states_for_prefixes(
+            hidden_states,
+            seq_lens=[5, 4],
+            target_prefix_lens=[1, 2],
+            draft_prefix_lens=[3, 2],
+        )
+
+        self.assertTrue(
+            torch.equal(aligned, torch.tensor([[2.0], [3.0], [4.0], [5.0]]))
+        )
+
+    def test_extend_hidden_state_slicing_rejects_missing_draft_prefix(self):
+        hidden_states = torch.arange(3, dtype=torch.float32).reshape(3, 1)
+
+        with self.assertRaisesRegex(
+            RemoteDraftExecutorNotReadyError,
+            "draft node does not own the same prefix",
+        ):
+            _slice_extend_hidden_states_for_prefixes(
+                hidden_states,
+                seq_lens=[5],
+                target_prefix_lens=[2],
+                draft_prefix_lens=[1],
+            )
+
+    def test_extend_hidden_state_slicing_rejects_bad_target_metadata(self):
+        hidden_states = torch.arange(3, dtype=torch.float32).reshape(3, 1)
+
+        with self.assertRaisesRegex(
+            RemoteDraftExecutorNotReadyError,
+            "do not match target prefix metadata",
+        ):
+            _slice_extend_hidden_states_for_prefixes(
+                hidden_states,
+                seq_lens=[5],
+                target_prefix_lens=[1],
+                draft_prefix_lens=[1],
+            )
 
     def test_start_draft_forward_service_starts_sidecar(self):
         fake_server = _FakeServer(
