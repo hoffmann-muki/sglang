@@ -543,11 +543,14 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "[CACHE-DEBUG] release_kv_cache enter rid=%r is_insert=%s "
-            "req_pool_idx=%s kv_committed_len=%s kv_allocated_len=%s "
-            "cache_protected_len=%s swa_evicted_seqlen=%s mamba_pool_idx=%s",
+            "req_pool_idx=%s origin_input_len=%s output_ids_len=%s "
+            "kv_committed_len=%s kv_allocated_len=%s cache_protected_len=%s "
+            "swa_evicted_seqlen=%s mamba_pool_idx=%s",
             getattr(req, "rid", None),
             is_insert,
             getattr(req, "req_pool_idx", None),
+            len(getattr(req, "origin_input_ids", []) or []),
+            len(getattr(req, "output_ids", []) or []),
             getattr(req, "kv_committed_len", None),
             getattr(req, "kv_allocated_len", None),
             getattr(req, "cache_protected_len", None),
@@ -572,9 +575,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "[CACHE-DEBUG] release_kv_cache after cache_finished_req rid=%r "
-            "req_pool_idx=%s kv_committed_len=%s kv_allocated_len=%s",
+            "req_pool_idx=%s origin_input_len=%s output_ids_len=%s "
+            "kv_committed_len=%s kv_allocated_len=%s",
             getattr(req, "rid", None),
             getattr(req, "req_pool_idx", None),
+            len(getattr(req, "origin_input_ids", []) or []),
+            len(getattr(req, "output_ids", []) or []),
             getattr(req, "kv_committed_len", None),
             getattr(req, "kv_allocated_len", None),
         )
@@ -593,12 +599,16 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "[CACHE-DEBUG] release_kv_cache pop_overallocated rid=%r "
-            "start_p=%s end_p=%s page_size=%s spec_algo=%s",
+            "start_p=%s end_p=%s page_size=%s spec_algo=%s "
+            "origin_input_len=%s output_ids_len=%s kv_commit_len=%s",
             getattr(req, "rid", None),
             start_p,
             end_p,
             page_size,
             spec_algo,
+            len(getattr(req, "origin_input_ids", []) or []),
+            len(getattr(req, "output_ids", []) or []),
+            getattr(req, "kv_committed_len", None),
         )
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
@@ -638,10 +648,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "[CACHE-DEBUG] release_kv_cache exit rid=%r req_pool_idx=%s "
-            "kv_committed_len=%s kv_allocated_len=%s available=%s evictable=%s "
-            "protected=%s",
+            "origin_input_len=%s output_ids_len=%s kv_committed_len=%s "
+            "kv_allocated_len=%s available=%s evictable=%s protected=%s",
             getattr(req, "rid", None),
             getattr(req, "req_pool_idx", None),
+            len(getattr(req, "origin_input_ids", []) or []),
+            len(getattr(req, "output_ids", []) or []),
             getattr(req, "kv_committed_len", None),
             getattr(req, "kv_allocated_len", None),
             tree_cache.available_size(),

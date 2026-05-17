@@ -1037,7 +1037,8 @@ class RemoteDraftSchedulerExecutor:
                 "[CACHE-DEBUG] draft release enter request_id=%r tp_rank=%s "
                 "cache_prefix=%s seq_len=%s req_pool_idx=%s kv_committed_len=%s "
                 "kv_allocated_len=%s cache_protected_len=%s swa_evicted_seqlen=%s "
-                "pool_available=%s pool_evictable=%s pool_protected=%s",
+                "origin_input_len=%s output_ids_len=%s pool_available=%s "
+                "pool_evictable=%s pool_protected=%s",
                 state.request_id,
                 state.tp_rank,
                 cache_prefix,
@@ -1047,6 +1048,8 @@ class RemoteDraftSchedulerExecutor:
                 req.kv_allocated_len,
                 getattr(req, "cache_protected_len", None),
                 getattr(req, "swa_evicted_seqlen", None),
+                len(getattr(req, "origin_input_ids", []) or []),
+                len(getattr(req, "output_ids", []) or []),
                 self.tree_cache.available_size(),
                 self.tree_cache.evictable_size(),
                 self.tree_cache.protected_size(),
@@ -1069,14 +1072,16 @@ class RemoteDraftSchedulerExecutor:
                 logger.info(
                     "[CACHE-DEBUG] draft release exit request_id=%r tp_rank=%s "
                     "cache_prefix=%s req_pool_idx=%s kv_committed_len=%s "
-                    "kv_allocated_len=%s pool_available=%s pool_evictable=%s "
-                    "pool_protected=%s",
+                    "kv_allocated_len=%s origin_input_len=%s output_ids_len=%s "
+                    "pool_available=%s pool_evictable=%s pool_protected=%s",
                     state.request_id,
                     state.tp_rank,
                     cache_prefix,
                     req_pool_idx,
                     req.kv_committed_len,
                     req.kv_allocated_len,
+                    len(getattr(req, "origin_input_ids", []) or []),
+                    len(getattr(req, "output_ids", []) or []),
                     self.tree_cache.available_size(),
                     self.tree_cache.evictable_size(),
                     self.tree_cache.protected_size(),
@@ -1099,14 +1104,16 @@ class RemoteDraftSchedulerExecutor:
             logger.info(
                 "[CACHE-DEBUG] draft release exit request_id=%r tp_rank=%s "
                 "cache_prefix=%s req_pool_idx=%s kv_committed_len=%s "
-                "kv_allocated_len=%s pool_available=%s pool_evictable=%s "
-                "pool_protected=%s",
+                "kv_allocated_len=%s origin_input_len=%s output_ids_len=%s "
+                "pool_available=%s pool_evictable=%s pool_protected=%s",
                 state.request_id,
                 state.tp_rank,
                 cache_prefix,
                 req_pool_idx,
                 req.kv_committed_len,
                 req.kv_allocated_len,
+                len(getattr(req, "origin_input_ids", []) or []),
+                len(getattr(req, "output_ids", []) or []),
                 self.tree_cache.available_size(),
                 self.tree_cache.evictable_size(),
                 self.tree_cache.protected_size(),
