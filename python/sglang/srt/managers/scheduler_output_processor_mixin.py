@@ -571,6 +571,7 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+            self._release_remote_draft_request_ids([req.rid], cache_prefix=True)
 
             req.time_stats.set_completion_time()
 

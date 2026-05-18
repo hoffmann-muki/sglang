@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.speculative.remote_draft_worker import (
     RemoteDraftWorker,
     _BroadcastedDraftResult,
@@ -20,7 +22,9 @@ class TestRemoteDraftWorker(CustomTestCase):
         worker.remote_draft_tp_size = draft_tp_size
         worker.server_args = SimpleNamespace(draft_forward_rpc_timeout=3.0)
         worker.client = SimpleNamespace(draft_forward=Mock())
+        worker.active_request_ids = set()
         worker._request_ordering = {}
+        worker.model_config = SimpleNamespace(dtype=torch.float32)
         worker.target_worker = SimpleNamespace(
             world_group=SimpleNamespace(
                 rank=rank,
@@ -118,6 +122,46 @@ class TestRemoteDraftWorker(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "ordering metadata mismatch"):
             RemoteDraftWorker._validate_ordering_response(request, response)
+
+    def test_release_request_ids_filters_inactive_requests(self):
+        worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
+        worker.active_request_ids = {"req-a", "req-b"}
+        worker._request_ordering = {
+            "req-a": object(),
+            "req-b": object(),
+            "inactive": object(),
+        }
+        worker._run_rank0_broadcasted_draft_forward = Mock(
+            return_value=SimpleNamespace(
+                round_ids=None,
+                token_positions=None,
+                prefix_versions=None,
+            )
+        )
+
+        worker.release_request_ids(
+            ["req-a", "inactive", "req-a"],
+            cache_prefix=False,
+        )
+
+        worker._run_rank0_broadcasted_draft_forward.assert_called_once()
+        release_request = worker._run_rank0_broadcasted_draft_forward.call_args.args[0]
+        self.assertEqual(release_request.mode, "release")
+        self.assertEqual(release_request.request_ids, ["req-a"])
+        self.assertFalse(release_request.cache_prefix_on_release)
+        self.assertEqual(worker.active_request_ids, {"req-b"})
+        self.assertNotIn("req-a", worker._request_ordering)
+        self.assertIn("req-b", worker._request_ordering)
+        self.assertIn("inactive", worker._request_ordering)
+
+    def test_release_request_ids_noops_without_active_matches(self):
+        worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
+        worker.active_request_ids = {"req-a"}
+        worker._run_rank0_broadcasted_draft_forward = Mock()
+
+        worker.release_request_ids(["req-b"], cache_prefix=True)
+
+        worker._run_rank0_broadcasted_draft_forward.assert_not_called()
 
 
 if __name__ == "__main__":

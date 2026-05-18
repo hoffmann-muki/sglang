@@ -1,6 +1,7 @@
 import unittest
 from collections import deque
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -30,6 +31,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
         scheduler.result_queue = deque()
+        scheduler.draft_worker = None
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
@@ -114,11 +116,18 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.running_batch.retract_all.return_value = retracted
         scheduler.running_batch.filter_batch = MagicMock()
         scheduler.server_args = MagicMock()
+        for idx, req in enumerate(retracted):
+            req.rid = f"req-{idx}"
+        scheduler.draft_worker = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
         scheduler.running_batch.retract_all.assert_called_once()
+        scheduler.draft_worker.release_request_ids.assert_called_once_with(
+            ["req-0", "req-1"],
+            cache_prefix=False,
+        )
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
         self.assertIsNone(scheduler.chunked_req)
 
@@ -170,6 +179,56 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(Scheduler._session_held_full_tokens(scheduler), 18)
         self.assertEqual(Scheduler._session_held_swa_tokens(scheduler), 9)
         self.assertEqual(Scheduler._session_held_req_count(scheduler), 3)
+
+    def test_remote_draft_release_helper_deduplicates_request_ids(self):
+        scheduler = self._new_scheduler()
+        scheduler.draft_worker = MagicMock()
+
+        Scheduler._release_remote_draft_request_ids(
+            scheduler,
+            ["req-a", "req-b", "req-a"],
+            cache_prefix=False,
+        )
+
+        scheduler.draft_worker.release_request_ids.assert_called_once_with(
+            ["req-a", "req-b"],
+            cache_prefix=False,
+        )
+
+    def test_remote_draft_release_helper_ignores_local_draft_workers(self):
+        scheduler = self._new_scheduler()
+        scheduler.draft_worker = object()
+
+        Scheduler._release_remote_draft_request_ids(
+            scheduler,
+            ["req-a"],
+            cache_prefix=True,
+        )
+
+    @patch("sglang.srt.managers.scheduler_output_processor_mixin.release_kv_cache")
+    def test_finished_request_releases_remote_draft_state(self, mock_release_kv_cache):
+        scheduler = self._new_scheduler()
+        scheduler.server_args = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False
+        )
+        scheduler.enable_hisparse = False
+        scheduler.maybe_collect_routed_experts = MagicMock()
+        scheduler.maybe_collect_customized_info = MagicMock()
+        scheduler._release_remote_draft_request_ids = MagicMock()
+        req = MagicMock()
+        req.rid = "req-a"
+        req.finished.return_value = True
+        req.multimodal_inputs = None
+        req.session = None
+        req.time_stats = MagicMock()
+
+        Scheduler._handle_finished_req(scheduler, req, 0, MagicMock())
+
+        mock_release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
+        scheduler._release_remote_draft_request_ids.assert_called_once_with(
+            ["req-a"],
+            cache_prefix=True,
+        )
 
 
 if __name__ == "__main__":

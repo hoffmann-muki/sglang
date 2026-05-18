@@ -491,21 +491,6 @@ class RadixCache(BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] radix cache_finished_req enter rid=%r is_insert=%s "
-                "req_pool_idx=%s origin_input_len=%s output_ids_len=%s "
-                "kv_committed_len=%s kv_allocated_len=%s cache_protected_len=%s",
-                getattr(req, "rid", None),
-                is_insert,
-                getattr(req, "req_pool_idx", None),
-                len(getattr(req, "origin_input_ids", []) or []),
-                len(getattr(req, "output_ids", []) or []),
-                getattr(req, "kv_committed_len", None),
-                getattr(req, "kv_allocated_len", None),
-                getattr(req, "cache_protected_len", None),
-            )
-
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -525,19 +510,6 @@ class RadixCache(BasePrefixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] radix cache_finished_req prepared rid=%r "
-                "committed_len=%s token_ids_len=%s key_len=%s values_len=%s "
-                "req_pool_idx=%s",
-                getattr(req, "rid", None),
-                kv_committed_len,
-                len(token_ids),
-                key_len,
-                len(values),
-                getattr(req, "req_pool_idx", None),
-            )
-
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
@@ -549,51 +521,15 @@ class RadixCache(BasePrefixCache):
             dup_free_start = req.cache_protected_len
             dup_free_end = new_prefix_len
             self.token_to_kv_pool_allocator.free(kv_indices[dup_free_start:dup_free_end])
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] radix cache_finished_req insert exit rid=%r "
-                    "new_prefix_len=%s dup_free_start=%s dup_free_end=%s "
-                    "tail_free_start=%s tail_free_end=%s",
-                    getattr(req, "rid", None),
-                    new_prefix_len,
-                    dup_free_start,
-                    dup_free_end,
-                    key_len,
-                    len(kv_indices),
-                )
         else:
             free_start = req.cache_protected_len
             self.token_to_kv_pool_allocator.free(kv_indices[free_start:key_len])
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] radix cache_finished_req no-insert exit rid=%r "
-                    "free_start=%s free_end=%s key_len=%s kv_len=%s",
-                    getattr(req, "rid", None),
-                    free_start,
-                    key_len,
-                    key_len,
-                    len(kv_indices),
-                )
 
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
-
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] radix cache_finished_req exit rid=%r "
-                "req_pool_idx=%s kv_committed_len=%s kv_allocated_len=%s "
-                "key_len=%s token_ids_len=%s new_req_pool_idx=%s",
-                getattr(req, "rid", None),
-                getattr(req, "req_pool_idx", None),
-                getattr(req, "kv_committed_len", None),
-                getattr(req, "kv_allocated_len", None),
-                key_len,
-                len(token_ids),
-                req.req_pool_idx,
-            )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

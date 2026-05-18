@@ -156,6 +156,16 @@ class RemoteDraftWorker(EAGLEWorker):
         self._release_request_ids(sorted(self.active_request_ids), cache_prefix=False)
         self._request_ordering.clear()
 
+    def release_request_ids(
+        self, request_ids: list[str], *, cache_prefix: bool = True
+    ) -> None:
+        active_request_ids = [
+            request_id
+            for request_id in dict.fromkeys(request_ids)
+            if request_id in self.active_request_ids
+        ]
+        self._release_request_ids(active_request_ids, cache_prefix=cache_prefix)
+
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
         constrained_logits = self.vocab_mapping.constrain_draft_logits(
             logits_output.next_token_logits
@@ -449,21 +459,7 @@ class RemoteDraftWorker(EAGLEWorker):
             or batch.spec_info.verified_id.numel() > 0
         ):
             self.forward_draft_extend_after_decode(batch)
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] target releasing finished draft requests request_ids=%s "
-                "finished_request_ids=%s batch_size=%s accept_length=%s",
-                [req.rid for req in batch.reqs],
-                finished_request_ids,
-                len(batch.reqs),
-                getattr(batch.spec_info, "accept_length", None),
-            )
         self._release_request_ids(finished_request_ids, cache_prefix=True)
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] target released finished draft requests request_ids=%s",
-                finished_request_ids,
-            )
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
@@ -661,13 +657,5 @@ class RemoteDraftWorker(EAGLEWorker):
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
         )
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] target draft extend-after-decode complete request_ids=%s "
-                "accept_length=%s next_prefix_versions=%s",
-                request_ids,
-                accept_length_cpu,
-                next_prefix_versions,
-            )
         self._commit_prefix_versions(request_ids, next_prefix_versions)
         self._apply_next_draft_state(spec_info, response, "extend_after_decode")

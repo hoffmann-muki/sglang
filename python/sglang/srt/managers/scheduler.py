@@ -2741,6 +2741,14 @@ class Scheduler(
                     ),
                 )
             self.new_token_ratio = new_token_ratio
+            self._release_remote_draft_request_ids(
+                [req.rid for req in retracted_reqs],
+                cache_prefix=False,
+            )
+            self._release_remote_draft_request_ids(
+                [req.rid for req in reqs_to_abort],
+                cache_prefix=False,
+            )
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
@@ -3524,6 +3532,26 @@ class Scheduler(
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
 
+    def _release_remote_draft_request_ids(
+        self, request_ids: List[str], *, cache_prefix: bool = True
+    ) -> None:
+        if not request_ids:
+            return
+
+        draft_worker = getattr(self, "draft_worker", None)
+        release_request_ids = getattr(draft_worker, "release_request_ids", None)
+        if release_request_ids is None:
+            return
+
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        try:
+            release_request_ids(unique_request_ids, cache_prefix=cache_prefix)
+        except Exception:
+            logger.exception(
+                "Failed to release remote draft state for request_ids=%s",
+                unique_request_ids,
+            )
+
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
@@ -3570,6 +3598,10 @@ class Scheduler(
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
+                self._release_remote_draft_request_ids(
+                    [req.rid for req in retracted_reqs],
+                    cache_prefix=False,
+                )
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 

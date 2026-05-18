@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -269,6 +269,39 @@ class TestDraftDisaggregation(CustomTestCase):
         self.assertEqual(executor.held_full_tokens(), 27)
         self.assertEqual(executor.held_swa_tokens(), 23)
         self.assertEqual(executor.held_req_count(), 2)
+
+    def test_remote_draft_executor_release_clears_mixed_request_states(self):
+        executor = RemoteDraftSchedulerExecutor.__new__(RemoteDraftSchedulerExecutor)
+        states = {
+            ("req-a", 0): RemoteDraftRequestState(
+                request_id="req-a",
+                tp_rank=0,
+                req=SimpleNamespace(req_pool_idx=1),
+                seq_len=8,
+            ),
+            ("req-b", 0): RemoteDraftRequestState(
+                request_id="req-b",
+                tp_rank=0,
+                req=SimpleNamespace(req_pool_idx=2),
+                seq_len=9,
+            ),
+            ("req-a", 1): RemoteDraftRequestState(
+                request_id="req-a",
+                tp_rank=1,
+                req=SimpleNamespace(req_pool_idx=3),
+                seq_len=10,
+            ),
+        }
+        executor.states = dict(states)
+        executor._release_request_state = Mock()
+
+        executor.release(["req-a", "req-missing"], tp_rank=0, cache_prefix=False)
+
+        executor._release_request_state.assert_called_once_with(
+            states[("req-a", 0)],
+            cache_prefix=False,
+        )
+        self.assertEqual(set(executor.states), {("req-b", 0), ("req-a", 1)})
 
     def test_extend_hidden_state_slicing_uses_target_and_draft_prefixes(self):
         hidden_states = torch.arange(4, dtype=torch.float32).reshape(4, 1)

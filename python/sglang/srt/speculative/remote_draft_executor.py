@@ -354,34 +354,6 @@ class RemoteDraftSchedulerExecutor:
 
             return self._state_response(request, forward_batch.spec_info)
         except Exception:
-            seq_lens_cpu = (
-                request.seq_lens_for_draft_extend_cpu.cpu().tolist()
-                if request.seq_lens_for_draft_extend_cpu is not None
-                else None
-            )
-            target_prefix_lens = (
-                request.target_prefix_lens_for_draft_extend_cpu.cpu().tolist()
-                if request.target_prefix_lens_for_draft_extend_cpu is not None
-                else None
-            )
-            draft_prefix_lens = list(batch.prefix_lens) if batch is not None else None
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] extend failed pre-cleanup request_id=%r "
-                    "request_ids=%s seq_lens=%s hidden_rows=%s target_prefix_lens=%s "
-                    "draft_prefix_lens=%s extend_num_tokens=%s",
-                    request.request_id,
-                    request_ids,
-                    seq_lens_cpu,
-                    (
-                        None
-                        if request.hidden_states is None
-                        else request.hidden_states.shape[0]
-                    ),
-                    target_prefix_lens,
-                    draft_prefix_lens,
-                    None if batch is None else batch.extend_num_tokens,
-                )
             logger.exception(
                 "extend failed request_id=%r tp_rank=%s",
                 request.request_id,
@@ -537,19 +509,6 @@ class RemoteDraftSchedulerExecutor:
             target_prefix_lens=target_prefix_lens,
             draft_prefix_lens=draft_prefix_lens,
         )
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] extend aligned hidden states request_id=%r "
-                "input_rows=%s aligned_rows=%s seq_lens=%s target_prefix_lens=%s "
-                "draft_prefix_lens=%s extend_num_tokens=%s",
-                request.request_id,
-                request.hidden_states.shape[0],
-                hidden_states.shape[0],
-                seq_lens_cpu,
-                target_prefix_lens,
-                draft_prefix_lens,
-                batch.extend_num_tokens,
-            )
         if hidden_states.shape[0] != batch.extend_num_tokens:
             raise RemoteDraftExecutorNotReadyError(
                 "DraftForward extend hidden-state alignment produced the wrong "
@@ -576,26 +535,9 @@ class RemoteDraftSchedulerExecutor:
                     f"{len(target_prefix_lens)} prefix lengths for "
                     f"{len(seq_lens_cpu)} requests."
                 )
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] extend target prefix metadata request_id=%r "
-                    "seq_lens=%s target_prefix_lens=%s hidden_rows=%s",
-                    request.request_id,
-                    seq_lens_cpu,
-                    target_prefix_lens,
-                    hidden_rows,
-                )
             return target_prefix_lens
 
         if hidden_rows == sum(seq_lens_cpu):
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] extend using implicit zero target prefixes "
-                    "request_id=%r seq_lens=%s hidden_rows=%s",
-                    request.request_id,
-                    seq_lens_cpu,
-                    hidden_rows,
-                )
             return [0] * len(seq_lens_cpu)
 
         raise RemoteDraftExecutorNotReadyError(
@@ -1050,28 +992,6 @@ class RemoteDraftSchedulerExecutor:
         req_pool_idx = req.req_pool_idx
         if req_pool_idx is None:
             return
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] draft release enter request_id=%r tp_rank=%s "
-                "cache_prefix=%s seq_len=%s req_pool_idx=%s kv_committed_len=%s "
-                "kv_allocated_len=%s cache_protected_len=%s swa_evicted_seqlen=%s "
-                "origin_input_len=%s output_ids_len=%s pool_available=%s "
-                "pool_evictable=%s pool_protected=%s",
-                state.request_id,
-                state.tp_rank,
-                cache_prefix,
-                state.seq_len,
-                req_pool_idx,
-                req.kv_committed_len,
-                req.kv_allocated_len,
-                getattr(req, "cache_protected_len", None),
-                getattr(req, "swa_evicted_seqlen", None),
-                len(getattr(req, "origin_input_ids", []) or []),
-                len(getattr(req, "output_ids", []) or []),
-                self.tree_cache.available_size(),
-                self.tree_cache.evictable_size(),
-                self.tree_cache.protected_size(),
-            )
         if (
             req.kv_committed_len != state.seq_len
             or req.kv_allocated_len != state.seq_len
@@ -1086,24 +1006,6 @@ class RemoteDraftSchedulerExecutor:
             release_kv_cache(req, self.tree_cache, is_insert=True)
             req.kv_committed_len = 0
             req.kv_allocated_len = 0
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] draft release exit request_id=%r tp_rank=%s "
-                    "cache_prefix=%s req_pool_idx=%s kv_committed_len=%s "
-                    "kv_allocated_len=%s origin_input_len=%s output_ids_len=%s "
-                    "pool_available=%s pool_evictable=%s pool_protected=%s",
-                    state.request_id,
-                    state.tp_rank,
-                    cache_prefix,
-                    req_pool_idx,
-                    req.kv_committed_len,
-                    req.kv_allocated_len,
-                    len(getattr(req, "origin_input_ids", []) or []),
-                    len(getattr(req, "output_ids", []) or []),
-                    self.tree_cache.available_size(),
-                    self.tree_cache.evictable_size(),
-                    self.tree_cache.protected_size(),
-                )
             return
 
         if req.mamba_pool_idx is not None and hasattr(
@@ -1118,38 +1020,11 @@ class RemoteDraftSchedulerExecutor:
         self.req_to_token_pool.free(req)
         req.kv_committed_len = 0
         req.kv_allocated_len = 0
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[CACHE-DEBUG] draft release exit request_id=%r tp_rank=%s "
-                "cache_prefix=%s req_pool_idx=%s kv_committed_len=%s "
-                "kv_allocated_len=%s origin_input_len=%s output_ids_len=%s "
-                "pool_available=%s pool_evictable=%s pool_protected=%s",
-                state.request_id,
-                state.tp_rank,
-                cache_prefix,
-                req_pool_idx,
-                req.kv_committed_len,
-                req.kv_allocated_len,
-                len(getattr(req, "origin_input_ids", []) or []),
-                len(getattr(req, "output_ids", []) or []),
-                self.tree_cache.available_size(),
-                self.tree_cache.evictable_size(),
-                self.tree_cache.protected_size(),
-            )
 
     def _release_batch_states(
         self, batch: ScheduleBatch, request_ids: list[str]
     ) -> None:
         for state in self._states_from_batch(batch, request_ids):
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(
-                    "[CACHE-DEBUG] draft release cleanup state request_id=%r "
-                    "tp_rank=%s seq_len=%s req_pool_idx=%s",
-                    state.request_id,
-                    state.tp_rank,
-                    state.seq_len,
-                    state.req.req_pool_idx,
-                )
             self.states.pop((state.request_id, state.tp_rank), None)
             try:
                 self._release_request_state(state)
