@@ -2375,11 +2375,17 @@ class Scheduler(
             # Reset batch_is_full so the scheduler can schedule more prefills.
             self.running_batch.batch_is_full = False
 
-        if (
+        last_batch_is_extend = (
             not self.enable_hisparse
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
+        )
+        if last_batch_is_extend and not (
+            self._drain_ready_remote_draft_state_for_running_batch()
         ):
+            return None
+
+        if last_batch_is_extend:
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -2414,6 +2420,10 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        remote_draft_state_ready = (
+            self._drain_ready_remote_draft_state_for_running_batch()
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2431,6 +2441,8 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+        elif not remote_draft_state_ready:
+            ret = None
         else:
             # Run decode (skip for prefill-only batches)
             if (
@@ -3598,6 +3610,38 @@ class Scheduler(
                 "Failed to drain remote draft state for request_ids=%s",
                 unique_request_ids,
             )
+
+    def _drain_ready_remote_draft_state_for_running_batch(self) -> bool:
+        if self.running_batch.is_empty():
+            return True
+
+        draft_worker = getattr(self, "draft_worker", None)
+        has_pending_request_ids = getattr(
+            draft_worker, "has_pending_request_ids", None
+        )
+        pending_request_ids_ready = getattr(
+            draft_worker, "pending_request_ids_ready", None
+        )
+        drain_pending_request_ids = getattr(
+            draft_worker, "drain_pending_request_ids", None
+        )
+        if (
+            has_pending_request_ids is None
+            or pending_request_ids_ready is None
+            or drain_pending_request_ids is None
+        ):
+            return True
+
+        request_ids = list(dict.fromkeys(req.rid for req in self.running_batch.reqs))
+        if not has_pending_request_ids(request_ids):
+            return True
+        if not pending_request_ids_ready(request_ids):
+            return False
+
+        # Let errors surface here. Unlike abort/pause cleanup, this is on the
+        # live generation path and continuing with stale draft state is unsafe.
+        drain_pending_request_ids(request_ids)
+        return True
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

@@ -17,8 +17,12 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class _StaticFuture:
-    def __init__(self, result):
+    def __init__(self, result, *, done=True):
         self._result = result
+        self._done = done
+
+    def done(self):
+        return self._done
 
     def result(self, timeout=None):
         del timeout
@@ -325,6 +329,85 @@ class TestRemoteDraftWorker(CustomTestCase):
 
         worker._finish_pending_extend_after_decode.assert_called_once_with(pending_a)
         self.assertEqual(worker._pending_extend_after_decode, [pending_b])
+
+    def test_pending_request_ids_ready_checks_matching_future_state(self):
+        worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
+        pending_a = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-a"),
+            request_ids=["req-a"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[2],
+            future=_StaticFuture("response", done=False),
+            timeout=3.0,
+        )
+        pending_b = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-b"),
+            request_ids=["req-b"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[3],
+            future=_StaticFuture("response", done=True),
+            timeout=3.0,
+        )
+        worker._pending_extend_after_decode = [pending_a, pending_b]
+
+        self.assertTrue(worker.has_pending_request_ids(["req-a"]))
+        self.assertFalse(worker.pending_request_ids_ready(["req-a"]))
+        self.assertTrue(worker.pending_request_ids_ready(["req-b"]))
+        self.assertFalse(worker.has_pending_request_ids(["req-c"]))
+        self.assertTrue(worker.pending_request_ids_ready(["req-c"]))
+
+    def test_pending_request_ids_ready_reduces_root_state(self):
+        worker = self._make_worker(rank=0, tp_size=4, draft_tp_size=1)
+        worker._pending_extend_after_decode = [
+            _PendingExtendAfterDecode(
+                request=SimpleNamespace(request_id="extend_after_decode:req-a"),
+                request_ids=["req-a"],
+                spec_info=SimpleNamespace(),
+                prefix_versions=[2],
+                future=_StaticFuture("response", done=False),
+                timeout=3.0,
+            )
+        ]
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            self.assertEqual(tensor.item(), 0)
+            self.assertIs(op, torch.distributed.ReduceOp.MIN)
+            self.assertIs(group, worker.target_worker.world_group.cpu_group)
+
+        with patch(
+            "sglang.srt.speculative.remote_draft_worker.torch.distributed.all_reduce",
+            side_effect=fake_all_reduce,
+        ) as mock_all_reduce:
+            self.assertFalse(worker.pending_request_ids_ready(["req-a"]))
+
+        mock_all_reduce.assert_called_once()
+
+    def test_pending_request_ids_ready_non_root_uses_reduced_state(self):
+        worker = self._make_worker(rank=2, tp_size=4, draft_tp_size=1)
+        worker._pending_extend_after_decode = [
+            _PendingExtendAfterDecode(
+                request=SimpleNamespace(request_id="extend_after_decode:req-a"),
+                request_ids=["req-a"],
+                spec_info=SimpleNamespace(),
+                prefix_versions=[2],
+                future=None,
+                timeout=3.0,
+            )
+        ]
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            self.assertEqual(tensor.item(), 1)
+            self.assertIs(op, torch.distributed.ReduceOp.MIN)
+            self.assertIs(group, worker.target_worker.world_group.cpu_group)
+            tensor.fill_(0)
+
+        with patch(
+            "sglang.srt.speculative.remote_draft_worker.torch.distributed.all_reduce",
+            side_effect=fake_all_reduce,
+        ) as mock_all_reduce:
+            self.assertFalse(worker.pending_request_ids_ready(["req-a"]))
+
+        mock_all_reduce.assert_called_once()
 
     def test_drain_pending_extend_after_decode_keeps_pending_on_failure(self):
         worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)

@@ -478,6 +478,43 @@ class RemoteDraftWorker(EAGLEWorker):
         )
         self._pending_extend_after_decode.append(pending)
 
+    def _pending_extend_after_decode_for_request_ids(
+        self,
+        request_ids: list[str],
+    ) -> list[_PendingExtendAfterDecode]:
+        if not request_ids or not self._pending_extend_after_decode:
+            return []
+
+        request_id_set = set(request_ids)
+        return [
+            pending
+            for pending in self._pending_extend_after_decode
+            if request_id_set.intersection(pending.request_ids)
+        ]
+
+    def has_pending_request_ids(self, request_ids: list[str]) -> bool:
+        return bool(self._pending_extend_after_decode_for_request_ids(request_ids))
+
+    def pending_request_ids_ready(self, request_ids: list[str]) -> bool:
+        pending_work = self._pending_extend_after_decode_for_request_ids(request_ids)
+        if not pending_work:
+            return True
+
+        local_ready = all(
+            pending.future is None or pending.future.done() for pending in pending_work
+        )
+        if self.tp_size <= 1:
+            return local_ready
+
+        world_group = self.target_worker.world_group
+        ready_tensor = torch.tensor([int(local_ready)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            ready_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=world_group.cpu_group,
+        )
+        return bool(ready_tensor.item())
+
     def _finish_pending_extend_after_decode(
         self,
         pending: _PendingExtendAfterDecode,
@@ -494,7 +531,7 @@ class RemoteDraftWorker(EAGLEWorker):
         self,
         request_ids: list[str],
     ) -> None:
-        if not request_ids or not self._pending_extend_after_decode:
+        if not self._pending_extend_after_decode_for_request_ids(request_ids):
             return
 
         request_id_set = set(request_ids)

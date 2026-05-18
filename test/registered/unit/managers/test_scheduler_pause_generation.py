@@ -233,6 +233,103 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
             cache_prefix=True,
         )
 
+    def test_running_remote_draft_state_gate_waits_until_ready(self):
+        scheduler = self._new_scheduler()
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.reqs = [
+            SimpleNamespace(rid="req-a"),
+            SimpleNamespace(rid="req-b"),
+            SimpleNamespace(rid="req-a"),
+        ]
+        scheduler.draft_worker = MagicMock()
+        scheduler.draft_worker.has_pending_request_ids.return_value = True
+        scheduler.draft_worker.pending_request_ids_ready.return_value = False
+
+        ready = Scheduler._drain_ready_remote_draft_state_for_running_batch(scheduler)
+
+        self.assertFalse(ready)
+        scheduler.draft_worker.has_pending_request_ids.assert_called_once_with(
+            ["req-a", "req-b"]
+        )
+        scheduler.draft_worker.pending_request_ids_ready.assert_called_once_with(
+            ["req-a", "req-b"]
+        )
+        scheduler.draft_worker.drain_pending_request_ids.assert_not_called()
+
+    def test_running_remote_draft_state_gate_drains_when_ready(self):
+        scheduler = self._new_scheduler()
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.reqs = [
+            SimpleNamespace(rid="req-a"),
+            SimpleNamespace(rid="req-b"),
+            SimpleNamespace(rid="req-a"),
+        ]
+        scheduler.draft_worker = MagicMock()
+        scheduler.draft_worker.has_pending_request_ids.return_value = True
+        scheduler.draft_worker.pending_request_ids_ready.return_value = True
+
+        ready = Scheduler._drain_ready_remote_draft_state_for_running_batch(scheduler)
+
+        self.assertTrue(ready)
+        scheduler.draft_worker.drain_pending_request_ids.assert_called_once_with(
+            ["req-a", "req-b"]
+        )
+
+    def test_running_remote_draft_state_gate_ignores_non_remote_worker(self):
+        scheduler = self._new_scheduler()
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.reqs = [SimpleNamespace(rid="req-a")]
+        scheduler.draft_worker = object()
+
+        self.assertTrue(
+            Scheduler._drain_ready_remote_draft_state_for_running_batch(scheduler)
+        )
+
+    def test_get_next_batch_to_run_can_prefill_while_remote_state_is_pending(self):
+        scheduler = self._new_scheduler()
+        scheduler._abort_on_waiting_timeout = MagicMock()
+        scheduler._abort_on_running_timeout = MagicMock()
+        scheduler.dllm_config = None
+        scheduler.enable_hisparse = False
+        scheduler.require_mlp_sync = False
+        scheduler.running_batch.is_prefill_only = False
+        scheduler._drain_ready_remote_draft_state_for_running_batch = MagicMock(
+            return_value=False
+        )
+        new_batch = MagicMock()
+        scheduler.get_new_batch_prefill = MagicMock(return_value=new_batch)
+        scheduler.maybe_prepare_mlp_sync_batch = MagicMock(
+            side_effect=lambda ret, **_: ret
+        )
+        scheduler._maybe_prepare_ngram_embedding = MagicMock(
+            side_effect=lambda ret: ret
+        )
+
+        ret = Scheduler.get_next_batch_to_run(scheduler)
+
+        self.assertIs(ret, new_batch)
+        scheduler.get_new_batch_prefill.assert_called_once()
+
+    def test_get_next_batch_to_run_defers_unmerged_prefill_until_remote_state_ready(
+        self,
+    ):
+        scheduler = self._new_scheduler()
+        scheduler._abort_on_waiting_timeout = MagicMock()
+        scheduler._abort_on_running_timeout = MagicMock()
+        scheduler.dllm_config = None
+        scheduler.enable_hisparse = False
+        scheduler.last_batch = MagicMock()
+        scheduler.last_batch.forward_mode.is_extend.return_value = True
+        scheduler._drain_ready_remote_draft_state_for_running_batch = MagicMock(
+            return_value=False
+        )
+        scheduler.get_new_batch_prefill = MagicMock()
+
+        ret = Scheduler.get_next_batch_to_run(scheduler)
+
+        self.assertIsNone(ret)
+        scheduler.get_new_batch_prefill.assert_not_called()
+
     @patch("sglang.srt.managers.scheduler_output_processor_mixin.release_kv_cache")
     def test_finished_request_releases_remote_draft_state(self, mock_release_kv_cache):
         scheduler = self._new_scheduler()
