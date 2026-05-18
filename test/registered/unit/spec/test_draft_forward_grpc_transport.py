@@ -372,6 +372,126 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
             [[200], [100]],
         )
 
+    def test_service_adapter_stream_micro_batches_compatible_requests(self):
+        seen_requests = []
+
+        async def handler(request):
+            seen_requests.append(request)
+            return DraftForwardResponse(
+                request_id=request.request_id,
+                parent_list=torch.tensor([[0, 1], [2, 3]]),
+                top_scores_index=torch.tensor([[1, 0], [0, 1]]),
+                draft_token_ids=torch.tensor([[11, 12], [21, 22]]),
+                round_ids=request.round_ids,
+                token_positions=request.token_positions,
+                prefix_versions=request.prefix_versions,
+            )
+
+        async def request_stream():
+            for request_id, round_id in (("req-a", 1), ("req-b", 2)):
+                yield draft_request_to_proto(
+                    DraftForwardRequest(
+                        request_id=request_id,
+                        request_ids=[request_id],
+                        mode="decode",
+                        verified_id=torch.tensor([round_id]),
+                        hidden_states=torch.zeros(1, 2),
+                        round_ids=[round_id],
+                        token_positions=[round_id * 10],
+                        prefix_versions=[round_id * 100],
+                    ),
+                    proto_module=_FAKE_PROTO,
+                )
+
+        async def collect():
+            adapter = DraftForwardServiceAdapter(
+                handler,
+                proto_module=_FAKE_PROTO,
+                stream_batch_window_s=0.001,
+                stream_batch_max_requests=2,
+                stream_batch_max_proposed_tokens=4,
+            )
+            return [
+                draft_response_from_proto(response)
+                async for response in adapter.DraftForwardStream(
+                    request_stream(),
+                    _FakeContext(),
+                )
+            ]
+
+        responses = asyncio.run(collect())
+
+        self.assertEqual(len(seen_requests), 1)
+        self.assertEqual(seen_requests[0].request_ids, ["req-a", "req-b"])
+        self.assertEqual(
+            [response.request_id for response in responses],
+            ["req-a", "req-b"],
+        )
+        self.assertEqual(responses[0].draft_token_ids.tolist(), [[11, 12]])
+        self.assertEqual(responses[1].draft_token_ids.tolist(), [[21, 22]])
+        self.assertEqual([response.round_ids for response in responses], [[1], [2]])
+
+    def test_service_adapter_stream_flushes_at_proposed_token_cap(self):
+        seen_requests = []
+
+        async def handler(request):
+            seen_requests.append(request)
+            token_id = 100 + len(seen_requests)
+            return DraftForwardResponse(
+                request_id=request.request_id,
+                parent_list=torch.tensor([[0]]),
+                top_scores_index=torch.tensor([[0]]),
+                draft_token_ids=torch.tensor([[token_id]]),
+                round_ids=request.round_ids,
+                token_positions=request.token_positions,
+                prefix_versions=request.prefix_versions,
+            )
+
+        async def request_stream():
+            for request_id, round_id in (("req-a", 1), ("req-b", 2)):
+                yield draft_request_to_proto(
+                    DraftForwardRequest(
+                        request_id=request_id,
+                        request_ids=[request_id],
+                        mode="decode",
+                        verified_id=torch.tensor([round_id]),
+                        hidden_states=torch.zeros(1, 2),
+                        speculative_num_draft_tokens=4,
+                        round_ids=[round_id],
+                        token_positions=[round_id],
+                        prefix_versions=[round_id],
+                    ),
+                    proto_module=_FAKE_PROTO,
+                )
+
+        async def collect():
+            adapter = DraftForwardServiceAdapter(
+                handler,
+                proto_module=_FAKE_PROTO,
+                stream_batch_window_s=0.1,
+                stream_batch_max_requests=2,
+                stream_batch_max_proposed_tokens=4,
+            )
+            return [
+                draft_response_from_proto(response)
+                async for response in adapter.DraftForwardStream(
+                    request_stream(),
+                    _FakeContext(),
+                )
+            ]
+
+        responses = asyncio.run(collect())
+
+        self.assertEqual(len(seen_requests), 2)
+        self.assertEqual(
+            [request.request_ids for request in seen_requests],
+            [["req-a"], ["req-b"]],
+        )
+        self.assertEqual(
+            [response.request_id for response in responses],
+            ["req-a", "req-b"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -5,6 +5,9 @@ import torch
 from sglang.srt.speculative.draft_forward_protocol import (
     DraftForwardRequest,
     DraftForwardResponse,
+    can_merge_draft_forward_requests,
+    merge_draft_forward_requests,
+    split_merged_draft_forward_response,
 )
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -117,6 +120,89 @@ class TestDraftForwardProtocol(CustomTestCase):
         self.assertEqual(translated.round_ids, [3, 4])
         self.assertEqual(translated.token_positions, [5, 6])
         self.assertEqual(translated.prefix_versions, [8, 9])
+
+    def test_merge_and_split_decode_requests(self):
+        req_a = DraftForwardRequest(
+            request_id="decode:req-a",
+            request_ids=["req-a"],
+            verified_id=torch.tensor([10]),
+            hidden_states=torch.zeros(1, 4),
+            mode="decode",
+            topk=2,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            num_tokens_per_req=2,
+            num_tokens_for_logprob_per_req=2,
+            round_ids=[1],
+            token_positions=[7],
+            prefix_versions=[3],
+        )
+        req_b = DraftForwardRequest(
+            request_id="decode:req-b",
+            request_ids=["req-b"],
+            verified_id=torch.tensor([20]),
+            hidden_states=torch.ones(1, 4),
+            mode="decode",
+            topk=2,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            num_tokens_per_req=2,
+            num_tokens_for_logprob_per_req=2,
+            round_ids=[2],
+            token_positions=[8],
+            prefix_versions=[4],
+        )
+
+        self.assertTrue(can_merge_draft_forward_requests([req_a, req_b]))
+        merged = merge_draft_forward_requests([req_a, req_b])
+
+        self.assertEqual(merged.request_ids, ["req-a", "req-b"])
+        self.assertEqual(merged.verified_id.tolist(), [10, 20])
+        self.assertEqual(merged.round_ids, [1, 2])
+        self.assertEqual(merged.token_positions, [7, 8])
+        self.assertEqual(merged.prefix_versions, [3, 4])
+
+        merged_response = DraftForwardResponse(
+            request_id=merged.request_id,
+            parent_list=torch.tensor([[0, 1], [2, 3]]),
+            top_scores_index=torch.tensor([[1, 0], [0, 1]]),
+            draft_token_ids=torch.tensor([[11, 12], [21, 22]]),
+            mode="decode",
+            round_ids=merged.round_ids,
+            token_positions=merged.token_positions,
+            prefix_versions=merged.prefix_versions,
+        )
+        split = split_merged_draft_forward_response(
+            merged_response,
+            [req_a, req_b],
+        )
+
+        self.assertEqual(
+            [response.request_id for response in split],
+            ["decode:req-a", "decode:req-b"],
+        )
+        self.assertEqual(split[0].draft_token_ids.tolist(), [[11, 12]])
+        self.assertEqual(split[1].draft_token_ids.tolist(), [[21, 22]])
+        self.assertEqual(split[0].round_ids, [1])
+        self.assertEqual(split[1].prefix_versions, [4])
+
+    def test_merge_rejects_mismatched_modes(self):
+        req_a = DraftForwardRequest(
+            request_id="decode:req-a",
+            request_ids=["req-a"],
+            verified_id=torch.tensor([10]),
+            hidden_states=torch.zeros(1, 4),
+            mode="decode",
+        )
+        req_b = DraftForwardRequest(
+            request_id="extend:req-b",
+            request_ids=["req-b"],
+            verified_id=torch.tensor([20]),
+            hidden_states=torch.ones(1, 4),
+            mode="extend",
+        )
+
+        self.assertFalse(can_merge_draft_forward_requests([req_a, req_b]))
 
 
 if __name__ == "__main__":

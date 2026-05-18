@@ -528,6 +528,11 @@ class ServerArgs:
     draft_forward_service_host: Optional[str] = None
     draft_forward_service_port: Optional[int] = None
     draft_forward_rpc_timeout: Optional[float] = None
+    draft_forward_stream_batch_window_ms: float = 0.5
+    draft_forward_stream_batch_max_requests: int = 2
+    draft_forward_stream_batch_max_proposed_tokens: int = 4
+    target_scheduler_batch_window_ms: float = 2.0
+    target_scheduler_batch_max_requests: int = 8
     draft_forward_target_tokenizer_path: Optional[str] = None
     draft_forward_grpc_use_tls: bool = False
     draft_forward_grpc_certfile: Optional[str] = None
@@ -790,6 +795,7 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        self._validate_asymmetric_batching_policy()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3705,6 +3711,7 @@ class ServerArgs:
             and self.draft_forward_rpc_timeout <= 0
         ):
             raise ValueError("--draft-forward-rpc-timeout must be positive when set.")
+        self._validate_asymmetric_batching_policy()
 
         tls_paths = (
             self.draft_forward_grpc_certfile,
@@ -3813,6 +3820,24 @@ class ServerArgs:
                 "--remote-draft-tp-size currently supports either 1 for an "
                 "asymmetric draft node or the target --tp size for the "
                 "existing symmetric TLI path."
+            )
+
+    def _validate_asymmetric_batching_policy(self):
+        if self.draft_forward_stream_batch_window_ms < 0:
+            raise ValueError(
+                "--draft-forward-stream-batch-window-ms must be non-negative."
+            )
+        if self.target_scheduler_batch_window_ms < 0:
+            raise ValueError("--target-scheduler-batch-window-ms must be non-negative.")
+        if self.draft_forward_stream_batch_max_requests <= 0:
+            raise ValueError(
+                "--draft-forward-stream-batch-max-requests must be positive."
+            )
+        if self.target_scheduler_batch_max_requests <= 0:
+            raise ValueError("--target-scheduler-batch-max-requests must be positive.")
+        if self.draft_forward_stream_batch_max_proposed_tokens <= 0:
+            raise ValueError(
+                "--draft-forward-stream-batch-max-proposed-tokens must be positive."
             )
 
     def _handle_load_format(self):
@@ -4675,6 +4700,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.prefill_max_requests,
             help="The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+        )
+        parser.add_argument(
+            "--target-scheduler-batch-window-ms",
+            type=float,
+            default=ServerArgs.target_scheduler_batch_window_ms,
+            help=(
+                "Collect ready target-side requests for up to this many milliseconds "
+                "before scheduling, unless the target request cap is reached earlier."
+            ),
+        )
+        parser.add_argument(
+            "--target-scheduler-batch-max-requests",
+            type=int,
+            default=ServerArgs.target_scheduler_batch_max_requests,
+            help=(
+                "Default maximum requests admitted into a target scheduler prefill "
+                "batch when --prefill-max-requests is not set."
+            ),
         )
         parser.add_argument(
             "--enable-dynamic-chunking",
@@ -5703,6 +5746,31 @@ class ServerArgs:
             dest="draft_forward_rpc_timeout",
             default=ServerArgs.draft_forward_rpc_timeout,
             help="Optional timeout in seconds for target-to-draft DraftForward RPC calls.",
+        )
+        parser.add_argument(
+            "--draft-forward-stream-batch-window-ms",
+            type=float,
+            default=ServerArgs.draft_forward_stream_batch_window_ms,
+            help=(
+                "Draft role only. Collect ready DraftForward stream requests for up "
+                "to this many milliseconds before dispatching the draft scheduler "
+                "batch, unless a draft-side cap is reached earlier."
+            ),
+        )
+        parser.add_argument(
+            "--draft-forward-stream-batch-max-requests",
+            type=int,
+            default=ServerArgs.draft_forward_stream_batch_max_requests,
+            help="Draft role only. Maximum requests to merge into one draft scheduler batch.",
+        )
+        parser.add_argument(
+            "--draft-forward-stream-batch-max-proposed-tokens",
+            type=int,
+            default=ServerArgs.draft_forward_stream_batch_max_proposed_tokens,
+            help=(
+                "Draft role only. Maximum total proposed decode draft tokens to "
+                "merge into one draft scheduler batch."
+            ),
         )
         parser.add_argument(
             "--draft-forward-target-tokenizer-path",

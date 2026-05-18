@@ -261,6 +261,22 @@ async def start_draft_forward_service(
         port=port,
         request_handler=handler,
         server_credentials=credentials,
+        stream_batch_window_s=getattr(
+            server_args,
+            "draft_forward_stream_batch_window_ms",
+            0.5,
+        )
+        / 1000.0,
+        stream_batch_max_requests=getattr(
+            server_args,
+            "draft_forward_stream_batch_max_requests",
+            2,
+        ),
+        stream_batch_max_proposed_tokens=getattr(
+            server_args,
+            "draft_forward_stream_batch_max_proposed_tokens",
+            4,
+        ),
     )
     scheme = "mTLS/TLS" if credentials is not None else "insecure"
     logger.info(

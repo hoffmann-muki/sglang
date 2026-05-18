@@ -131,6 +131,11 @@ class SchedulerDllmMixin:
 
     def _create_dllm_prefill_adder(self: Scheduler, running_bs: int) -> PrefillAdder:
         """Create a prefill adder configured for DLLM scheduling."""
+        prefill_max_requests = (
+            self.server_args.prefill_max_requests
+            if self.server_args.prefill_max_requests is not None
+            else self.target_scheduler_batch_max_requests
+        )
         return PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -141,7 +146,7 @@ class SchedulerDllmMixin:
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             dllm_config=self.dllm_config,
         )
 

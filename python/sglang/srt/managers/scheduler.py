@@ -387,6 +387,14 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.target_scheduler_batch_window_s = (
+            getattr(server_args, "target_scheduler_batch_window_ms", 2.0) / 1000.0
+        )
+        self.target_scheduler_batch_max_requests = getattr(
+            server_args,
+            "target_scheduler_batch_max_requests",
+            8,
+        )
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
@@ -1518,9 +1526,23 @@ class Scheduler(
         return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
+        if self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll:
+            return True
+        return num_recv_reqs >= self.target_scheduler_batch_max_requests
+
+    def _poll_ready_recv_requests(self, recv_reqs: list[Any]) -> bool:
+        made_progress = False
+        recv_sockets = (self.recv_from_tokenizer, self.recv_from_rpc)
+
+        for recv_socket in recv_sockets:
+            while not self.recv_limit_reached(len(recv_reqs)):
+                try:
+                    recv_reqs.append(recv_socket.recv_pyobj(zmq.NOBLOCK))
+                    made_progress = True
+                except zmq.ZMQError:
+                    break
+
+        return made_progress
 
     def recv_requests(
         self,
@@ -1537,24 +1559,24 @@ class Scheduler(
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 recv_reqs = []
+                deadline = None
 
                 while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
+                    made_progress = self._poll_ready_recv_requests(recv_reqs)
+                    if self.recv_limit_reached(len(recv_reqs)):
                         break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
+                    if not recv_reqs or self.target_scheduler_batch_window_s <= 0:
                         break
-                    recv_reqs.append(recv_rpc)
+                    if deadline is None:
+                        deadline = time.perf_counter() + (
+                            self.target_scheduler_batch_window_s
+                        )
+                    if made_progress:
+                        continue
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 0.0001))
             else:
                 recv_reqs = None
         else:
@@ -2509,6 +2531,12 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        prefill_max_requests = (
+            self.server_args.prefill_max_requests
+            if self.server_args.prefill_max_requests is not None
+            else self.target_scheduler_batch_max_requests
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -2521,7 +2549,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )

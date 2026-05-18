@@ -18,6 +18,9 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.draft_forward_protocol import (
     DraftForwardRequest,
     DraftForwardResponse,
+    can_merge_draft_forward_requests,
+    merge_draft_forward_requests,
+    split_merged_draft_forward_response,
 )
 from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 
@@ -543,18 +546,29 @@ class DraftForwardServiceAdapter:
         proto_module=None,
         translate_requests_to_draft_vocab: bool = False,
         translate_responses_to_target_vocab: bool = False,
+        stream_batch_window_s: float = 0.0005,
+        stream_batch_max_requests: int = 2,
+        stream_batch_max_proposed_tokens: int = 4,
     ):
+        if stream_batch_window_s < 0:
+            raise ValueError("stream_batch_window_s must be non-negative.")
+        if stream_batch_max_requests <= 0:
+            raise ValueError("stream_batch_max_requests must be positive.")
+        if stream_batch_max_proposed_tokens <= 0:
+            raise ValueError("stream_batch_max_proposed_tokens must be positive.")
         self.request_handler = request_handler
         self.translator = translator
         self.proto_module = proto_module
         self.translate_requests_to_draft_vocab = translate_requests_to_draft_vocab
         self.translate_responses_to_target_vocab = translate_responses_to_target_vocab
+        self.stream_batch_window_s = stream_batch_window_s
+        self.stream_batch_max_requests = stream_batch_max_requests
+        self.stream_batch_max_proposed_tokens = stream_batch_max_proposed_tokens
 
-    async def _draft_forward_response(self, request):
-        draft_request = draft_request_from_proto(request)
-        if self.translator is not None and self.translate_requests_to_draft_vocab:
-            draft_request = draft_request.to_draft_vocab(self.translator)
-
+    async def _handle_draft_forward_request(
+        self,
+        draft_request: DraftForwardRequest,
+    ) -> DraftForwardResponse:
         response = self.request_handler(draft_request)
         if inspect.isawaitable(response):
             response = await response
@@ -563,9 +577,92 @@ class DraftForwardServiceAdapter:
                 "DraftForward request handler must return DraftForwardResponse, got "
                 f"{type(response).__name__}"
             )
+        return response
+
+    def _request_from_proto(self, request) -> DraftForwardRequest:
+        draft_request = draft_request_from_proto(request)
+        if self.translator is not None and self.translate_requests_to_draft_vocab:
+            draft_request = draft_request.to_draft_vocab(self.translator)
+        return draft_request
+
+    def _response_to_proto(self, response: DraftForwardResponse):
         if self.translator is not None and self.translate_responses_to_target_vocab:
             response = response.to_target_vocab(self.translator)
         return draft_response_to_proto(response, proto_module=self.proto_module)
+
+    async def _draft_forward_response(self, request):
+        draft_request = self._request_from_proto(request)
+        response = await self._handle_draft_forward_request(draft_request)
+        return self._response_to_proto(response)
+
+    async def _draft_forward_responses_from_requests(self, draft_requests):
+        if can_merge_draft_forward_requests(draft_requests):
+            merged_request = merge_draft_forward_requests(draft_requests)
+            merged_response = await self._handle_draft_forward_request(merged_request)
+            responses = split_merged_draft_forward_response(
+                merged_response,
+                draft_requests,
+            )
+        else:
+            responses = [
+                await self._handle_draft_forward_request(draft_request)
+                for draft_request in draft_requests
+            ]
+        return [self._response_to_proto(response) for response in responses]
+
+    async def _draft_forward_responses(self, requests):
+        draft_requests = [self._request_from_proto(request) for request in requests]
+        return await self._draft_forward_responses_from_requests(draft_requests)
+
+    def _draft_forward_batch_request_count(
+        self, requests: list[DraftForwardRequest]
+    ) -> int:
+        return sum(
+            len(request.request_ids or [request.request_id]) for request in requests
+        )
+
+    def _draft_forward_batch_proposed_tokens(
+        self, requests: list[DraftForwardRequest]
+    ) -> int:
+        return sum(
+            len(request.request_ids or [request.request_id])
+            * max(int(request.speculative_num_draft_tokens), 0)
+            for request in requests
+            if request.mode == "decode"
+        )
+
+    def _can_add_to_draft_forward_batch(
+        self,
+        pending_requests: list[DraftForwardRequest],
+        request: DraftForwardRequest,
+    ) -> bool:
+        candidate = [*pending_requests, request]
+        if (
+            self._draft_forward_batch_request_count(candidate)
+            > self.stream_batch_max_requests
+        ):
+            return False
+        proposed_tokens = self._draft_forward_batch_proposed_tokens(candidate)
+        return (
+            proposed_tokens == 0
+            or proposed_tokens <= self.stream_batch_max_proposed_tokens
+        )
+
+    def _draft_forward_batch_cap_reached(
+        self, requests: list[DraftForwardRequest]
+    ) -> bool:
+        if not requests:
+            return False
+        if (
+            self._draft_forward_batch_request_count(requests)
+            >= self.stream_batch_max_requests
+        ):
+            return True
+        proposed_tokens = self._draft_forward_batch_proposed_tokens(requests)
+        return (
+            proposed_tokens > 0
+            and proposed_tokens >= self.stream_batch_max_proposed_tokens
+        )
 
     def _set_context_error(self, context, exc: Exception):
         if context is None:
@@ -595,25 +692,75 @@ class DraftForwardServiceAdapter:
         tasks = set()
         sentinel = object()
 
-        async def run_one(request):
+        async def run_many(requests):
             try:
-                response = await self._draft_forward_response(request)
-                await queue.put((response, None))
+                responses = await self._draft_forward_responses_from_requests(requests)
+                for response in responses:
+                    await queue.put((response, None))
             except Exception as exc:  # pragma: no cover - exercised via caller
                 await queue.put((None, exc))
 
-        async def produce():
+        async def produce_batched():
+            pending_requests = []
+            flush_task = None
+
+            async def flush_pending():
+                nonlocal pending_requests
+                requests = pending_requests
+                pending_requests = []
+                if not requests:
+                    return
+                task = asyncio.create_task(run_many(requests))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+
+            async def timed_flush():
+                if self.stream_batch_window_s > 0:
+                    await asyncio.sleep(self.stream_batch_window_s)
+                await flush_pending()
+
+            async def cancel_flush_timer():
+                nonlocal flush_task
+                if flush_task is None or flush_task.done():
+                    flush_task = None
+                    return
+                flush_task.cancel()
+                try:
+                    await flush_task
+                except asyncio.CancelledError:
+                    pass
+                flush_task = None
+
             try:
                 async for request in request_iterator:
-                    task = asyncio.create_task(run_one(request))
-                    tasks.add(task)
-                    task.add_done_callback(tasks.discard)
+                    draft_request = self._request_from_proto(request)
+                    if pending_requests and not self._can_add_to_draft_forward_batch(
+                        pending_requests,
+                        draft_request,
+                    ):
+                        await cancel_flush_timer()
+                        await flush_pending()
+
+                    pending_requests.append(draft_request)
+                    if self._draft_forward_batch_cap_reached(pending_requests):
+                        await cancel_flush_timer()
+                        await flush_pending()
+                        continue
+
+                    if flush_task is None or flush_task.done():
+                        flush_task = asyncio.create_task(timed_flush())
+                if flush_task is not None:
+                    try:
+                        await flush_task
+                    except asyncio.CancelledError:
+                        pass
+                await flush_pending()
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 await queue.put((sentinel, None))
 
-        producer = asyncio.create_task(produce())
+        producer = asyncio.create_task(produce_batched())
         try:
             while True:
                 response, exc = await queue.get()
@@ -1028,6 +1175,9 @@ async def serve_draft_forward_service(
     translator: TLITokenTranslator | None = None,
     translate_requests_to_draft_vocab: bool = False,
     translate_responses_to_target_vocab: bool = False,
+    stream_batch_window_s: float = 0.0005,
+    stream_batch_max_requests: int = 2,
+    stream_batch_max_proposed_tokens: int = 4,
     server_credentials=None,
     options=None,
 ):
@@ -1040,6 +1190,9 @@ async def serve_draft_forward_service(
         proto_module=None,
         translate_requests_to_draft_vocab=translate_requests_to_draft_vocab,
         translate_responses_to_target_vocab=translate_responses_to_target_vocab,
+        stream_batch_window_s=stream_batch_window_s,
+        stream_batch_max_requests=stream_batch_max_requests,
+        stream_batch_max_proposed_tokens=stream_batch_max_proposed_tokens,
     )
     server = grpc.aio.server(options=options)
     add_draft_forward_service_to_server(servicer, server)

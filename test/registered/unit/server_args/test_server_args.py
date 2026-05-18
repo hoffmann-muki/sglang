@@ -100,6 +100,66 @@ class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
             )
         self.assertIn("remote-draft-tp-size", str(context.exception))
 
+    def test_asymmetric_batching_policy_defaults(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.draft_forward_stream_batch_window_ms, 0.5)
+        self.assertEqual(server_args.draft_forward_stream_batch_max_requests, 2)
+        self.assertEqual(
+            server_args.draft_forward_stream_batch_max_proposed_tokens,
+            4,
+        )
+        self.assertEqual(server_args.target_scheduler_batch_window_ms, 2.0)
+        self.assertEqual(server_args.target_scheduler_batch_max_requests, 8)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_draft_accepts_stream_batch_policy(self, _mock_resolve):
+        server_args = ServerArgs(
+            model_path="dummy",
+            grpc_mode=True,
+            draft_disaggregation_role="draft",
+            speculative_algorithm="TLI",
+            draft_forward_service_port=31000,
+            draft_forward_target_tokenizer_path="target-tokenizer",
+            draft_forward_stream_batch_window_ms=1.0,
+            draft_forward_stream_batch_max_requests=3,
+            draft_forward_stream_batch_max_proposed_tokens=6,
+        )
+        self.assertEqual(server_args.draft_forward_stream_batch_window_ms, 1.0)
+        self.assertEqual(server_args.draft_forward_stream_batch_max_requests, 3)
+        self.assertEqual(server_args.draft_forward_stream_batch_max_proposed_tokens, 6)
+
+    def test_stream_batch_policy_must_be_valid(self):
+        invalid_cases = [
+            (
+                {"draft_forward_stream_batch_window_ms": -1},
+                "draft-forward-stream-batch-window-ms",
+            ),
+            (
+                {"target_scheduler_batch_window_ms": -1},
+                "target-scheduler-batch-window-ms",
+            ),
+            (
+                {"draft_forward_stream_batch_max_requests": 0},
+                "draft-forward-stream-batch-max-requests",
+            ),
+            (
+                {"target_scheduler_batch_max_requests": 0},
+                "target-scheduler-batch-max-requests",
+            ),
+            (
+                {"draft_forward_stream_batch_max_proposed_tokens": 0},
+                "draft-forward-stream-batch-max-proposed-tokens",
+            ),
+        ]
+        for kwargs, expected_message in invalid_cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError) as context:
+                    ServerArgs(model_path="dummy", **kwargs)
+                self.assertIn(expected_message, str(context.exception))
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
