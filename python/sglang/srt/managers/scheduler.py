@@ -2718,6 +2718,7 @@ class Scheduler(
             old_mamba_available = (
                 mamba_pool.available_size() if mamba_pool is not None else None
             )
+            self._drain_remote_draft_request_ids([req.rid for req in batch.reqs])
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
@@ -3552,6 +3553,24 @@ class Scheduler(
                 unique_request_ids,
             )
 
+    def _drain_remote_draft_request_ids(self, request_ids: List[str]) -> None:
+        if not request_ids:
+            return
+
+        draft_worker = getattr(self, "draft_worker", None)
+        drain_request_ids = getattr(draft_worker, "drain_pending_request_ids", None)
+        if drain_request_ids is None:
+            return
+
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        try:
+            drain_request_ids(unique_request_ids)
+        except Exception:
+            logger.exception(
+                "Failed to drain remote draft state for request_ids=%s",
+                unique_request_ids,
+            )
+
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
@@ -3597,6 +3616,9 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
+                self._drain_remote_draft_request_ids(
+                    [req.rid for req in self.running_batch.reqs]
+                )
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 self._release_remote_draft_request_ids(
                     [req.rid for req in retracted_reqs],

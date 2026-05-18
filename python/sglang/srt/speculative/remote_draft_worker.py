@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import chain
 from typing import Optional
@@ -60,6 +61,18 @@ class _TargetRequestOrdering:
     prefix_version: int = 0
 
 
+@dataclass(slots=True, eq=False)
+class _PendingExtendAfterDecode:
+    """Remote draft extend-after-decode RPC that has been submitted but not applied."""
+
+    request: DraftForwardRequest
+    request_ids: list[str]
+    spec_info: EagleDraftInput
+    prefix_versions: list[int]
+    future: Future[DraftForwardResponse] | None
+    timeout: float | None
+
+
 class RemoteDraftWorker(EAGLEWorker):
     """Target-side worker that talks to a remote draft/speculator service."""
 
@@ -97,6 +110,11 @@ class RemoteDraftWorker(EAGLEWorker):
         )
         self.active_request_ids: set[str] = set()
         self._request_ordering: dict[str, _TargetRequestOrdering] = {}
+        self._pending_extend_after_decode: list[_PendingExtendAfterDecode] = []
+        self._draft_forward_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix=f"remote-draft-forward-tp{tp_rank}",
+        )
         self.remote_draft_tp_size = server_args.remote_draft_tp_size or self.tp_size
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -153,6 +171,7 @@ class RemoteDraftWorker(EAGLEWorker):
         raise RuntimeError("RemoteDraftWorker does not own a local draft model runner.")
 
     def clear_cache_pool(self):
+        self._drain_all_pending_extend_after_decode()
         self._release_request_ids(sorted(self.active_request_ids), cache_prefix=False)
         self._request_ordering.clear()
 
@@ -165,6 +184,14 @@ class RemoteDraftWorker(EAGLEWorker):
             if request_id in self.active_request_ids
         ]
         self._release_request_ids(active_request_ids, cache_prefix=cache_prefix)
+
+    def drain_pending_request_ids(self, request_ids: list[str]) -> None:
+        active_request_ids = [
+            request_id
+            for request_id in dict.fromkeys(request_ids)
+            if request_id in self.active_request_ids
+        ]
+        self._drain_pending_extend_after_decode_for_request_ids(active_request_ids)
 
     def capture_for_decode(self, logits_output, draft_input: EagleDraftInput):
         constrained_logits = self.vocab_mapping.constrain_draft_logits(
@@ -359,6 +386,144 @@ class RemoteDraftWorker(EAGLEWorker):
         self._validate_ordering_response(request, broadcasted.response)
         return broadcasted.response
 
+    def _submit_draft_forward_async(
+        self,
+        request: DraftForwardRequest,
+        *,
+        timeout: float | None,
+        translate_request_to_draft_vocab: bool,
+        translate_response_to_target_vocab: bool,
+    ) -> Future[DraftForwardResponse] | None:
+        if self.uses_rank0_broadcast and not self.target_worker.world_group.is_first_rank:
+            return None
+
+        # Only the network RPC runs in the executor. TP collectives stay on the
+        # scheduler thread when the pending work is resolved.
+        return self._draft_forward_executor.submit(
+            self.client.draft_forward,
+            request,
+            timeout=timeout,
+            translate_request_to_draft_vocab=translate_request_to_draft_vocab,
+            translate_response_to_target_vocab=translate_response_to_target_vocab,
+        )
+
+    def _resolve_draft_forward_async(
+        self,
+        pending: _PendingExtendAfterDecode,
+    ) -> DraftForwardResponse:
+        if not self.uses_rank0_broadcast:
+            if pending.future is None:
+                raise RuntimeError("Non-broadcast DraftForward RPC has no future.")
+            response = pending.future.result(timeout=pending.timeout)
+            self._validate_ordering_response(pending.request, response)
+            return response
+
+        world_group = self.target_worker.world_group
+        payload: list[_BroadcastedDraftResult]
+        if world_group.is_first_rank:
+            try:
+                if pending.future is None:
+                    raise RuntimeError("Root-rank DraftForward RPC has no future.")
+                response = pending.future.result(timeout=pending.timeout)
+                payload = [_BroadcastedDraftResult(ok=True, response=response)]
+            except Exception:
+                logger.exception("DraftForward RPC failed on target root rank.")
+                payload = [
+                    _BroadcastedDraftResult(
+                        ok=False,
+                        error=traceback.format_exc(),
+                    )
+                ]
+        else:
+            payload = []
+
+        broadcasted = broadcast_pyobj(
+            payload,
+            world_group.rank,
+            world_group.cpu_group,
+            src=world_group.first_rank,
+        )[0]
+        if not broadcasted.ok:
+            raise RuntimeError(
+                "DraftForward RPC failed on the target root rank:\n"
+                f"{broadcasted.error}"
+            )
+        if broadcasted.response is None:
+            raise RuntimeError(
+                "DraftForward RPC succeeded but returned no response payload."
+            )
+        self._validate_ordering_response(pending.request, broadcasted.response)
+        return broadcasted.response
+
+    def _queue_extend_after_decode(
+        self,
+        request: DraftForwardRequest,
+        *,
+        request_ids: list[str],
+        spec_info: EagleDraftInput,
+        prefix_versions: list[int],
+    ) -> None:
+        pending = _PendingExtendAfterDecode(
+            request=request,
+            request_ids=request_ids,
+            spec_info=spec_info,
+            prefix_versions=prefix_versions,
+            future=self._submit_draft_forward_async(
+                request,
+                timeout=self.server_args.draft_forward_rpc_timeout,
+                translate_request_to_draft_vocab=True,
+                translate_response_to_target_vocab=True,
+            ),
+            timeout=self.server_args.draft_forward_rpc_timeout,
+        )
+        self._pending_extend_after_decode.append(pending)
+
+    def _finish_pending_extend_after_decode(
+        self,
+        pending: _PendingExtendAfterDecode,
+    ) -> None:
+        response = self._resolve_draft_forward_async(pending)
+        self._commit_prefix_versions(pending.request_ids, pending.prefix_versions)
+        self._apply_next_draft_state(
+            pending.spec_info,
+            response,
+            "extend_after_decode",
+        )
+
+    def _drain_pending_extend_after_decode_for_request_ids(
+        self,
+        request_ids: list[str],
+    ) -> None:
+        if not request_ids or not self._pending_extend_after_decode:
+            return
+
+        request_id_set = set(request_ids)
+        remaining = []
+        pending_work = self._pending_extend_after_decode
+        self._pending_extend_after_decode = []
+        for index, pending in enumerate(pending_work):
+            if request_id_set.intersection(pending.request_ids):
+                try:
+                    self._finish_pending_extend_after_decode(pending)
+                except Exception:
+                    self._pending_extend_after_decode = (
+                        remaining + pending_work[index:]
+                    )
+                    raise
+            else:
+                remaining.append(pending)
+        self._pending_extend_after_decode = remaining
+
+    def _drain_all_pending_extend_after_decode(self) -> None:
+        pending_work = self._pending_extend_after_decode
+        self._pending_extend_after_decode = []
+        for index, pending in enumerate(pending_work):
+            try:
+                self._finish_pending_extend_after_decode(pending)
+            except Exception:
+                self._pending_extend_after_decode = pending_work[index:]
+                raise
+
     def _draft_extend_input_ids(self, batch) -> torch.Tensor:
         """Return the full current token prefix for draft-side KV reconstruction."""
         full_input_ids = list(chain.from_iterable(req.fill_ids for req in batch.reqs))
@@ -394,6 +559,7 @@ class RemoteDraftWorker(EAGLEWorker):
     ) -> None:
         if not request_ids:
             return
+        self._drain_pending_extend_after_decode_for_request_ids(request_ids)
         release_request = DraftForwardRequest(
             request_id=f"release:{','.join(request_ids)}",
             request_ids=request_ids,
@@ -479,6 +645,7 @@ class RemoteDraftWorker(EAGLEWorker):
         mm_input_embeds=None,
     ):
         request_ids = self._request_ids(batch)
+        self._drain_pending_extend_after_decode_for_request_ids(request_ids)
         req_by_id = self._request_by_id(batch)
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
@@ -539,6 +706,7 @@ class RemoteDraftWorker(EAGLEWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         request_ids = self._request_ids(batch)
+        self._drain_pending_extend_after_decode_for_request_ids(request_ids)
         req_by_id = self._request_by_id(batch)
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
@@ -651,11 +819,9 @@ class RemoteDraftWorker(EAGLEWorker):
             advance_round=True,
             prefix_versions=next_prefix_versions,
         )
-        response = self._run_rank0_broadcasted_draft_forward(
+        self._queue_extend_after_decode(
             request,
-            timeout=self.server_args.draft_forward_rpc_timeout,
-            translate_request_to_draft_vocab=True,
-            translate_response_to_target_vocab=True,
+            request_ids=request_ids,
+            spec_info=spec_info,
+            prefix_versions=next_prefix_versions,
         )
-        self._commit_prefix_versions(request_ids, next_prefix_versions)
-        self._apply_next_draft_state(spec_info, response, "extend_after_decode")

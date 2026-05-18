@@ -7,11 +7,22 @@ import torch
 from sglang.srt.speculative.remote_draft_worker import (
     RemoteDraftWorker,
     _BroadcastedDraftResult,
+    _PendingExtendAfterDecode,
 )
+from sglang.srt.speculative.draft_forward_protocol import DraftForwardResponse
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
+
+class _StaticFuture:
+    def __init__(self, result):
+        self._result = result
+
+    def result(self, timeout=None):
+        del timeout
+        return self._result
 
 
 class TestRemoteDraftWorker(CustomTestCase):
@@ -24,6 +35,8 @@ class TestRemoteDraftWorker(CustomTestCase):
         worker.client = SimpleNamespace(draft_forward=Mock())
         worker.active_request_ids = set()
         worker._request_ordering = {}
+        worker._pending_extend_after_decode = []
+        worker._draft_forward_executor = Mock()
         worker.model_config = SimpleNamespace(dtype=torch.float32)
         worker.target_worker = SimpleNamespace(
             world_group=SimpleNamespace(
@@ -162,6 +175,215 @@ class TestRemoteDraftWorker(CustomTestCase):
         worker.release_request_ids(["req-b"], cache_prefix=True)
 
         worker._run_rank0_broadcasted_draft_forward.assert_not_called()
+
+    def test_async_draft_forward_submits_rpc_on_root_only(self):
+        response = DraftForwardResponse(
+            request_id="extend_after_decode:req-a",
+            parent_list=torch.empty((0,), dtype=torch.int64),
+            top_scores_index=torch.empty((0,), dtype=torch.int64),
+            draft_token_ids=torch.empty((0,), dtype=torch.int64),
+            round_ids=[1],
+            token_positions=[8],
+            prefix_versions=[2],
+        )
+
+        root_worker = self._make_worker(rank=0, tp_size=4, draft_tp_size=1)
+        root_future = _StaticFuture(response)
+        root_worker._draft_forward_executor.submit.return_value = root_future
+        request = SimpleNamespace(
+            request_id="extend_after_decode:req-a",
+            round_ids=[1],
+            token_positions=[8],
+            prefix_versions=[2],
+        )
+
+        future = root_worker._submit_draft_forward_async(
+            request,
+            timeout=3.0,
+            translate_request_to_draft_vocab=True,
+            translate_response_to_target_vocab=True,
+        )
+
+        self.assertIs(future, root_future)
+        root_worker._draft_forward_executor.submit.assert_called_once_with(
+            root_worker.client.draft_forward,
+            request,
+            timeout=3.0,
+            translate_request_to_draft_vocab=True,
+            translate_response_to_target_vocab=True,
+        )
+
+        non_root_worker = self._make_worker(rank=2, tp_size=4, draft_tp_size=1)
+
+        future = non_root_worker._submit_draft_forward_async(
+            request,
+            timeout=3.0,
+            translate_request_to_draft_vocab=True,
+            translate_response_to_target_vocab=True,
+        )
+
+        self.assertIsNone(future)
+        non_root_worker._draft_forward_executor.submit.assert_not_called()
+
+    def test_resolve_async_draft_forward_broadcasts_root_result(self):
+        worker = self._make_worker(rank=0, tp_size=4, draft_tp_size=1)
+        response = DraftForwardResponse(
+            request_id="extend_after_decode:req-a",
+            parent_list=torch.empty((0,), dtype=torch.int64),
+            top_scores_index=torch.empty((0,), dtype=torch.int64),
+            draft_token_ids=torch.empty((0,), dtype=torch.int64),
+            round_ids=[1],
+            token_positions=[8],
+            prefix_versions=[2],
+        )
+        request = SimpleNamespace(
+            request_id="extend_after_decode:req-a",
+            round_ids=[1],
+            token_positions=[8],
+            prefix_versions=[2],
+        )
+        pending = _PendingExtendAfterDecode(
+            request=request,
+            request_ids=["req-a"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[2],
+            future=_StaticFuture(response),
+            timeout=3.0,
+        )
+
+        with patch(
+            "sglang.srt.speculative.remote_draft_worker.broadcast_pyobj",
+            side_effect=lambda data, *args, **kwargs: data,
+        ) as mock_broadcast:
+            resolved = worker._resolve_draft_forward_async(pending)
+
+        self.assertIs(resolved, response)
+        mock_broadcast.assert_called_once()
+
+    def test_resolve_async_draft_forward_receives_non_root_broadcast(self):
+        worker = self._make_worker(rank=2, tp_size=4, draft_tp_size=1)
+        response = DraftForwardResponse(
+            request_id="extend_after_decode:req-a",
+            parent_list=torch.empty((0,), dtype=torch.int64),
+            top_scores_index=torch.empty((0,), dtype=torch.int64),
+            draft_token_ids=torch.empty((0,), dtype=torch.int64),
+            round_ids=[1],
+            token_positions=[8],
+            prefix_versions=[2],
+        )
+        pending = _PendingExtendAfterDecode(
+            request=SimpleNamespace(
+                request_id="extend_after_decode:req-a",
+                round_ids=[1],
+                token_positions=[8],
+                prefix_versions=[2],
+            ),
+            request_ids=["req-a"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[2],
+            future=None,
+            timeout=3.0,
+        )
+
+        def fake_broadcast(data, rank, dist_group=None, src=0, force_cpu_device=True):
+            del rank, dist_group, src, force_cpu_device
+            if data:
+                return data
+            return [_BroadcastedDraftResult(ok=True, response=response)]
+
+        with patch(
+            "sglang.srt.speculative.remote_draft_worker.broadcast_pyobj",
+            side_effect=fake_broadcast,
+        ) as mock_broadcast:
+            resolved = worker._resolve_draft_forward_async(pending)
+
+        self.assertIs(resolved, response)
+        mock_broadcast.assert_called_once()
+
+    def test_drain_pending_extend_after_decode_only_matching_requests(self):
+        worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
+        pending_a = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-a"),
+            request_ids=["req-a"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[2],
+            future=None,
+            timeout=3.0,
+        )
+        pending_b = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-b"),
+            request_ids=["req-b"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[3],
+            future=None,
+            timeout=3.0,
+        )
+        worker._pending_extend_after_decode = [pending_a, pending_b]
+        worker._finish_pending_extend_after_decode = Mock()
+
+        worker._drain_pending_extend_after_decode_for_request_ids(["req-a"])
+
+        worker._finish_pending_extend_after_decode.assert_called_once_with(pending_a)
+        self.assertEqual(worker._pending_extend_after_decode, [pending_b])
+
+    def test_drain_pending_extend_after_decode_keeps_pending_on_failure(self):
+        worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
+        pending_a = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-a"),
+            request_ids=["req-a"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[2],
+            future=None,
+            timeout=3.0,
+        )
+        pending_b = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-b"),
+            request_ids=["req-b"],
+            spec_info=SimpleNamespace(),
+            prefix_versions=[3],
+            future=None,
+            timeout=3.0,
+        )
+        worker._pending_extend_after_decode = [pending_a, pending_b]
+        worker._finish_pending_extend_after_decode = Mock(
+            side_effect=RuntimeError("boom")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            worker._drain_pending_extend_after_decode_for_request_ids(["req-a"])
+
+        self.assertEqual(worker._pending_extend_after_decode, [pending_a, pending_b])
+
+    def test_finish_pending_extend_after_decode_commits_and_applies_state(self):
+        worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
+        response = DraftForwardResponse(
+            request_id="extend_after_decode:req-a",
+            parent_list=torch.empty((0,), dtype=torch.int64),
+            top_scores_index=torch.empty((0,), dtype=torch.int64),
+            draft_token_ids=torch.empty((0,), dtype=torch.int64),
+        )
+        spec_info = SimpleNamespace()
+        pending = _PendingExtendAfterDecode(
+            request=SimpleNamespace(request_id="extend_after_decode:req-a"),
+            request_ids=["req-a"],
+            spec_info=spec_info,
+            prefix_versions=[4],
+            future=None,
+            timeout=3.0,
+        )
+        worker._resolve_draft_forward_async = Mock(return_value=response)
+        worker._commit_prefix_versions = Mock()
+        worker._apply_next_draft_state = Mock()
+
+        worker._finish_pending_extend_after_decode(pending)
+
+        worker._resolve_draft_forward_async.assert_called_once_with(pending)
+        worker._commit_prefix_versions.assert_called_once_with(["req-a"], [4])
+        worker._apply_next_draft_state.assert_called_once_with(
+            spec_info,
+            response,
+            "extend_after_decode",
+        )
 
 
 if __name__ == "__main__":

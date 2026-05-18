@@ -106,7 +106,10 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         """retract mode should retract all requests from running_batch."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = None
-        scheduler.running_batch.reqs = [MagicMock(), MagicMock()]
+        running_reqs = [MagicMock(), MagicMock()]
+        for idx, req in enumerate(running_reqs):
+            req.rid = f"running-req-{idx}"
+        scheduler.running_batch.reqs = running_reqs
         scheduler.running_batch.__len__ = lambda self: len(self.reqs)
         scheduler.running_batch.is_empty.return_value = False
         scheduler.waiting_queue = []
@@ -124,6 +127,9 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         self.assertTrue(scheduler._engine_paused)
         scheduler.running_batch.retract_all.assert_called_once()
+        scheduler.draft_worker.drain_pending_request_ids.assert_called_once_with(
+            ["running-req-0", "running-req-1"]
+        )
         scheduler.draft_worker.release_request_ids.assert_called_once_with(
             ["req-0", "req-1"],
             cache_prefix=False,
@@ -193,6 +199,28 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.draft_worker.release_request_ids.assert_called_once_with(
             ["req-a", "req-b"],
             cache_prefix=False,
+        )
+
+    def test_remote_draft_drain_helper_deduplicates_request_ids(self):
+        scheduler = self._new_scheduler()
+        scheduler.draft_worker = MagicMock()
+
+        Scheduler._drain_remote_draft_request_ids(
+            scheduler,
+            ["req-a", "req-b", "req-a"],
+        )
+
+        scheduler.draft_worker.drain_pending_request_ids.assert_called_once_with(
+            ["req-a", "req-b"]
+        )
+
+    def test_remote_draft_drain_helper_ignores_local_draft_workers(self):
+        scheduler = self._new_scheduler()
+        scheduler.draft_worker = object()
+
+        Scheduler._drain_remote_draft_request_ids(
+            scheduler,
+            ["req-a"],
         )
 
     def test_remote_draft_release_helper_ignores_local_draft_workers(self):
