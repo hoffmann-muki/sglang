@@ -3682,7 +3682,6 @@ class ServerArgs:
         if self.draft_disaggregation_role == "none":
             draft_forward_fields = (
                 self.remote_draft_server_addr,
-                self.remote_draft_tokenizer_path,
                 self.remote_draft_tp_size,
                 self.draft_forward_service_host,
                 self.draft_forward_service_port,
@@ -3692,6 +3691,8 @@ class ServerArgs:
                 self.draft_forward_grpc_keyfile,
                 self.draft_forward_grpc_ca_certs,
             )
+            if self.speculative_algorithm != "TLI":
+                draft_forward_fields += (self.remote_draft_tokenizer_path,)
             if (
                 any(value is not None for value in draft_forward_fields)
                 or self.draft_forward_grpc_use_tls
