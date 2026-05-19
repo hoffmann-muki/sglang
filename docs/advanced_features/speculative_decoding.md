@@ -42,7 +42,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
 | STANDALONE | Smaller draft LLM (token-level, same vocabulary) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
-| TLI | Smaller draft LLM with heterogeneous vocabulary | Yes | `--speculative-algorithm TLI` + `--remote-draft-tokenizer-path ...` | Lossless; requires overlap; does **not** support `--enable-dp-attention` |
+| TLI | Smaller draft LLM with heterogeneous vocabulary | Yes | Colocated: `--speculative-algorithm TLI` + `--speculative-draft-model-path ...`; Disaggregated: `--speculative-algorithm TLI` + `--remote-draft-tokenizer-path ...` | Lossless; requires overlap; does **not** support `--enable-dp-attention` |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
 
@@ -339,14 +339,27 @@ print(response.choices[0].message.content)
 TLI extends standalone speculative decoding to draft models whose tokenizer differs from the target model. It computes the token intersection at startup, maps token IDs between vocabularies, and masks draft logits so speculative sampling only considers intersection tokens.
 
 TLI can run in two configurations:
-- Colocated TLI, where the target and draft live in the same serving process.
-- Draft-forward disaggregation, where the target and draft run on separate nodes and communicate over the DraftForward transport.
+- Colocated TLI, where the target and draft live in the same serving process. Use `--speculative-draft-model-path` for the draft weights.
+- Draft-forward disaggregation, where the target and draft run on separate nodes and communicate over the DraftForward transport. Use `--remote-draft-tokenizer-path` on the target and `--draft-forward-target-tokenizer-path` on the draft node.
+
+For a colocated baseline with distinct draft and target weights, pass both the target model path and the draft model path. The draft tokenizer path is derived internally from the draft model path:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --speculative-algorithm TLI \
+    --speculative-draft-model-path Qwen/Qwen2.5-0.5B-Instruct \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5
+```
 
 ### Draft-forward target/draft disaggregation
 
 ### Constraints
 
 - Requires `--remote-draft-tokenizer-path` on the target node and `--draft-forward-target-tokenizer-path` on the draft node.
+- Colocated TLI does not use `--remote-draft-tokenizer-path`; the draft tokenizer path is derived from `--speculative-draft-model-path`.
 - For disaggregated deployment, the target node may set `--remote-draft-tp-size 1` to use a single-rank draft service while keeping a multi-rank target.
 - The draft node uses the gRPC serving path and starts the DraftForward sidecar independently of the removed smg-grpc-servicer callback hook.
 - Does not support `--enable-dp-attention`.
@@ -500,7 +513,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `TLI`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
-| `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights |
+| `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights for colocated TLI and other draft-model speculative modes |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |
 | `--speculative-num-steps` | `int` | `None` (auto-chosen when omitted) | Autoregressive drafting depth |

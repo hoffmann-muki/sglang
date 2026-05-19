@@ -3594,16 +3594,29 @@ class ServerArgs:
                     "TLI speculative decoding does not support dp attention."
                 )
 
-            if self.remote_draft_tokenizer_path is None:
-                raise ValueError(
-                    "TLI speculative decoding requires --remote-draft-tokenizer-path "
-                    "so the target side can translate into the draft vocabulary."
+            colocated_tli = self.draft_disaggregation_role == "none"
+            if colocated_tli:
+                if self.speculative_draft_model_path is None:
+                    raise ValueError(
+                        "TLI colocated setup requires --speculative-draft-model-path "
+                        "to load the local draft model."
+                    )
+                if self.remote_draft_tokenizer_path is not None:
+                    raise ValueError(
+                        "TLI colocated setup does not use --remote-draft-tokenizer-path. "
+                        "Use --speculative-draft-model-path for the draft model."
+                    )
+                self.remote_draft_tokenizer_path = self.speculative_draft_model_path
+                logger.warning(
+                    "TLI colocated mode derives the draft tokenizer path from "
+                    "--speculative-draft-model-path."
                 )
-            if self.speculative_draft_model_path is not None:
-                raise ValueError(
-                    "--speculative-draft-model-path is not used by TLI speculative "
-                    "decoding. Use --remote-draft-tokenizer-path instead."
-                )
+            else:
+                if self.remote_draft_tokenizer_path is None:
+                    raise ValueError(
+                        "TLI disaggregated setup requires --remote-draft-tokenizer-path "
+                        "so the target side can translate into the draft vocabulary."
+                    )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48

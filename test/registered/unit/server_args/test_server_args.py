@@ -53,6 +53,42 @@ class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
         "sglang.srt.server_args._resolve_or_download",
         side_effect=lambda path, **kwargs: path,
     )
+    def test_colocated_tli_defaults_draft_tokenizer_path_to_draft_model(
+        self, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="TLI",
+            speculative_draft_model_path="draft-model",
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+        )
+        self.assertEqual(server_args.remote_draft_tokenizer_path, "draft-model")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_colocated_tli_rejects_explicit_remote_tokenizer_path(
+        self, _mock_resolve
+    ):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="TLI",
+                speculative_draft_model_path="draft-model",
+                remote_draft_tokenizer_path="draft-tokenizer",
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+            )
+        self.assertIn("does not use --remote-draft-tokenizer-path", str(context.exception))
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
     def test_target_defaults_draft_tp_size_to_target_tp_size(self, _mock_resolve):
         server_args = ServerArgs(
             model_path="dummy",

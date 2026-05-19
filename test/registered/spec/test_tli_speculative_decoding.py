@@ -79,7 +79,7 @@ class _DraftForwardSpecBase(CustomTestCase):
 
     @classmethod
     def get_server_args(cls):
-        return COMMON_SERVER_ARGS + ["--remote-draft-tokenizer-path", cls.draft_model]
+        return COMMON_SERVER_ARGS + ["--speculative-draft-model-path", cls.draft_model]
 
     @classmethod
     def setUpClass(cls):

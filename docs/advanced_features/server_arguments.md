@@ -306,7 +306,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--draft-disaggregation-role` | Role for draft-forward disaggregation. `target` runs the verification side and `draft` runs the draft model on the gRPC serving path while also starting the DraftForward sidecar. | `none` | `none`, `target`, `draft` |
 | `--remote-draft-server-addr` | Target-side address of the draft gRPC service, formatted as `host:port`. | `None` | Type: str |
-| `--remote-draft-tokenizer-path` | Tokenizer path for the draft model. Required on the target node so target tokens can be translated into draft tokens. | `None` | Type: str |
+| `--remote-draft-tokenizer-path` | Tokenizer path for the draft model. Required only for draft-forward disaggregated TLI so target tokens can be translated into draft tokens. Colocated TLI derives this from `--speculative-draft-model-path`. | `None` | Type: str |
 | `--remote-draft-tp-size` | Tensor-parallel size of the remote draft node. Use `1` for the asymmetric disaggregated setup; if omitted, the target defaults to its own `--tp` for the existing symmetric draft-forward path. | `None` | Type: int |
 | `--draft-forward-service-host` | Draft-side bind host for the DraftForward gRPC service. | `None` | Type: str |
 | `--draft-forward-service-port` | Draft-side bind port for the DraftForward gRPC service. | `None` | Type: int |
