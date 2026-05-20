@@ -104,6 +104,9 @@ class _FakeDraftResponse:
     round_ids: list[int] = field(default_factory=list)
     token_positions: list[int] = field(default_factory=list)
     prefix_versions: list[int] = field(default_factory=list)
+    server_total_time: float = 0.0
+    server_queue_scheduling_time: float = 0.0
+    server_model_forward_time: float = 0.0
 
 
 _FAKE_PROTO = SimpleNamespace(
@@ -234,6 +237,9 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
             round_ids=[5, 6],
             token_positions=[8, 9],
             prefix_versions=[13, 14],
+            server_total_time=0.25,
+            server_queue_scheduling_time=0.05,
+            server_model_forward_time=0.17,
         )
 
         proto_response = draft_response_to_proto(
@@ -255,6 +261,9 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
         self.assertEqual(decoded.round_ids, [5, 6])
         self.assertEqual(decoded.token_positions, [8, 9])
         self.assertEqual(decoded.prefix_versions, [13, 14])
+        self.assertEqual(decoded.server_total_time, 0.25)
+        self.assertEqual(decoded.server_queue_scheduling_time, 0.05)
+        self.assertEqual(decoded.server_model_forward_time, 0.17)
 
     def test_service_adapter_round_trip(self):
         async def handler(request):
@@ -293,6 +302,21 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
             translate_to_target_vocab=True,
         )
         self.assertEqual(response.draft_token_ids.tolist(), [0, 1, 0])
+
+    def test_service_adapter_defaults_low_latency_batching(self):
+        adapter = DraftForwardServiceAdapter(
+            lambda _request: DraftForwardResponse(
+                request_id="req-default",
+                parent_list=torch.tensor([[0]]),
+                top_scores_index=torch.tensor([[0]]),
+                draft_token_ids=torch.tensor([0]),
+            ),
+            proto_module=_FAKE_PROTO,
+        )
+
+        self.assertEqual(adapter.stream_batch_window_s, 0.0)
+        self.assertEqual(adapter.stream_batch_max_requests, 1)
+        self.assertEqual(adapter.stream_batch_max_proposed_tokens, 2)
 
     def test_service_adapter_failure_raises(self):
         async def handler(_request):

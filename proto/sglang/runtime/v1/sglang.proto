@@ -112,6 +112,9 @@ message DraftForwardResponse {
   repeated int64 round_ids = 9;
   repeated int64 token_positions = 10;
   repeated int64 prefix_versions = 11;
+  double server_total_time = 12;
+  double server_queue_scheduling_time = 13;
+  double server_model_forward_time = 14;
 }
 
 // ---- Text-based generate (text in, text out) ----

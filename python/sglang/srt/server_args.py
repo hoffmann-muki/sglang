@@ -355,7 +355,7 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
-    prefill_max_requests: Optional[int] = None
+    prefill_max_requests: Optional[int] = 1
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
@@ -528,11 +528,11 @@ class ServerArgs:
     draft_forward_service_host: Optional[str] = None
     draft_forward_service_port: Optional[int] = None
     draft_forward_rpc_timeout: Optional[float] = None
-    draft_forward_stream_batch_window_ms: float = 0.5
-    draft_forward_stream_batch_max_requests: int = 2
-    draft_forward_stream_batch_max_proposed_tokens: int = 4
-    target_scheduler_batch_window_ms: float = 2.0
-    target_scheduler_batch_max_requests: int = 8
+    draft_forward_stream_batch_window_ms: float = 0.0
+    draft_forward_stream_batch_max_requests: int = 1
+    draft_forward_stream_batch_max_proposed_tokens: int = 2
+    target_scheduler_batch_window_ms: float = 0.0
+    target_scheduler_batch_max_requests: int = 1
     draft_forward_target_tokenizer_path: Optional[str] = None
     draft_forward_grpc_use_tls: bool = False
     draft_forward_grpc_certfile: Optional[str] = None
@@ -4713,7 +4713,7 @@ class ServerArgs:
             "--prefill-max-requests",
             type=int,
             default=ServerArgs.prefill_max_requests,
-            help="The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+            help="The maximum number of requests in a prefill batch. Defaults to 1.",
         )
         parser.add_argument(
             "--target-scheduler-batch-window-ms",

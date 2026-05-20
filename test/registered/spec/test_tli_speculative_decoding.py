@@ -162,6 +162,18 @@ class _DraftForwardSpecBase(CustomTestCase):
         )
         self.assertGreaterEqual(meta_info["spec_accept_rate"], 0.0)
         self.assertLessEqual(meta_info["spec_accept_rate"], 1.0)
+        self.assertIn("latency_breakdown", meta_info)
+        self.assertEqual(
+            set(meta_info["latency_breakdown"]),
+            {
+                "grpc_communication_time",
+                "draft_proposal_time",
+                "target_verification_time",
+                "draft_queue_scheduling_time",
+                "target_queue_scheduling_time",
+                "other_time",
+            },
+        )
         return payload
 
     def test_streaming_transport_matrix(self):

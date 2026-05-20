@@ -44,6 +44,7 @@ class DraftForwardRequest:
     token_positions: Optional[List[int]] = None
     prefix_versions: Optional[List[int]] = None
     cache_prefix_on_release: bool = False
+    server_received_time: float = 0.0
 
     def to_draft_vocab(self, translator: TLITokenTranslator) -> DraftForwardRequest:
         """Translate token-id payloads into draft vocabulary.
@@ -78,6 +79,9 @@ class DraftForwardResponse:
     round_ids: Optional[List[int]] = None
     token_positions: Optional[List[int]] = None
     prefix_versions: Optional[List[int]] = None
+    server_total_time: float = 0.0
+    server_queue_scheduling_time: float = 0.0
+    server_model_forward_time: float = 0.0
 
     def to_target_vocab(self, translator: TLITokenTranslator) -> DraftForwardResponse:
         """Translate token-id payloads back into target vocabulary.
@@ -298,6 +302,9 @@ def split_merged_draft_forward_response(
                 round_ids=round_ids[i],
                 token_positions=token_positions[i],
                 prefix_versions=prefix_versions[i],
+                server_total_time=response.server_total_time,
+                server_queue_scheduling_time=response.server_queue_scheduling_time,
+                server_model_forward_time=response.server_model_forward_time,
             )
         )
     return outputs

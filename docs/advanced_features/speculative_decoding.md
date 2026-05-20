@@ -354,6 +354,17 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 5
 ```
 
+The low-latency default profile for TLI keeps batching effectively off unless you override it:
+
+- `--draft-forward-stream-batch-window-ms 0`
+- `--draft-forward-stream-batch-max-requests 1`
+- `--draft-forward-stream-batch-max-proposed-tokens 2`
+- `--target-scheduler-batch-window-ms 0`
+- `--target-scheduler-batch-max-requests 1`
+- `--prefill-max-requests 1`
+
+This minimizes queueing and batching delay on both the draft and target sides, which is good for single-request latency and baseline comparisons. The tradeoff is lower batching efficiency and usually lower throughput under concurrency.
+
 ### Draft-forward target/draft disaggregation
 
 ### Constraints

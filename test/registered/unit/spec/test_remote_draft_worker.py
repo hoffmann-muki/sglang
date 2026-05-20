@@ -95,6 +95,30 @@ class TestRemoteDraftWorker(CustomTestCase):
         worker.client.draft_forward.assert_not_called()
         mock_broadcast.assert_called_once()
 
+    def test_observe_draft_forward_timing_attributes_rpc_residual(self):
+        response = DraftForwardResponse(
+            request_id="decode:req-a",
+            parent_list=torch.empty((0,), dtype=torch.int64),
+            top_scores_index=torch.empty((0,), dtype=torch.int64),
+            draft_token_ids=torch.empty((0,), dtype=torch.int64),
+            server_total_time=0.6,
+            server_queue_scheduling_time=0.1,
+            server_model_forward_time=0.4,
+        )
+        time_stats = SimpleNamespace(observe_draft_rpc_timing=Mock())
+
+        RemoteDraftWorker._observe_draft_forward_timing(
+            [time_stats],
+            response,
+            roundtrip_time=0.75,
+        )
+
+        time_stats.observe_draft_rpc_timing.assert_called_once_with(
+            grpc_communication_time=0.15,
+            draft_queue_scheduling_time=0.1,
+            draft_proposal_time=0.4,
+        )
+
     def test_attach_ordering_metadata_advances_rounds_per_request(self):
         worker = self._make_worker(rank=0, tp_size=1, draft_tp_size=1)
         request = SimpleNamespace()

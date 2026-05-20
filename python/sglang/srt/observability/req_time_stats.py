@@ -311,8 +311,14 @@ class ReqTimeStatsBase:
         }
 
     def __setstate__(self, state: object):
+        duration_fields = {
+            "grpc_communication_time",
+            "draft_queue_scheduling_time",
+            "draft_proposal_time",
+            "target_verification_time",
+        }
         for key in state.keys():
-            if key.endswith("time"):
+            if key.endswith("time") and key not in duration_fields:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],
@@ -449,6 +455,14 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         decode_latency = self.get_decode_latency()
         if decode_latency > 0.0 and completion_tokens > 0:
             meta_info["decode_throughput"] = completion_tokens / decode_latency
+        if scheduler_time_stats and hasattr(
+            scheduler_time_stats, "get_latency_breakdown"
+        ):
+            latency_breakdown = scheduler_time_stats.get_latency_breakdown(
+                self.get_e2e_latency()
+            )
+            if latency_breakdown is not None:
+                meta_info["latency_breakdown"] = latency_breakdown
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
@@ -578,6 +592,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
     spec_draft_extend_start_time: float = 0.0
+    grpc_communication_time: float = 0.0
+    draft_queue_scheduling_time: float = 0.0
+    draft_proposal_time: float = 0.0
+    target_verification_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -587,15 +605,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
-            return {}
-
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_run_batch_start_time": self.prefill_run_batch_start_time,
             "prefill_run_batch_end_time": self.prefill_run_batch_end_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "completion_time": self.completion_time,
+            "grpc_communication_time": self.grpc_communication_time,
+            "draft_queue_scheduling_time": self.draft_queue_scheduling_time,
+            "draft_proposal_time": self.draft_proposal_time,
+            "target_verification_time": self.target_verification_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
@@ -625,10 +645,26 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_spec_verify_end_time(self, ts=None, accepted_tokens: int = 0):
         if ts is None:
             ts = time.perf_counter()
+        if self.spec_verify_start_time > 0.0:
+            self.target_verification_time += max(
+                0.0, ts - self.spec_verify_start_time
+            )
         stage = RequestStage.SPEC_VERIFY
         self.trace_slice(
             stage, self.spec_verify_start_time, ts, {"accepted_tokens": accepted_tokens}
         )
+        self.spec_verify_start_time = 0.0
+
+    def observe_draft_rpc_timing(
+        self,
+        *,
+        grpc_communication_time: float = 0.0,
+        draft_queue_scheduling_time: float = 0.0,
+        draft_proposal_time: float = 0.0,
+    ):
+        self.grpc_communication_time += max(0.0, grpc_communication_time)
+        self.draft_queue_scheduling_time += max(0.0, draft_queue_scheduling_time)
+        self.draft_proposal_time += max(0.0, draft_proposal_time)
 
     def set_spec_draft_extend_start_time(self, ts=None):
         if ts is None:
@@ -964,6 +1000,29 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
+
+    def get_target_queue_scheduling_time(self) -> float:
+        if self.forward_entry_time > 0.0 and self.wait_queue_entry_time > 0.0:
+            return max(0.0, self.forward_entry_time - self.wait_queue_entry_time)
+        return 0.0
+
+    def get_latency_breakdown(self, e2e_latency: Optional[float] = None):
+        values = {
+            "grpc_communication_time": self.grpc_communication_time,
+            "draft_proposal_time": self.draft_proposal_time,
+            "target_verification_time": self.target_verification_time,
+            "draft_queue_scheduling_time": self.draft_queue_scheduling_time,
+            "target_queue_scheduling_time": self.get_target_queue_scheduling_time(),
+        }
+        if not any(value > 0.0 for value in values.values()):
+            return None
+        values = {key: max(0.0, float(value)) for key, value in values.items()}
+        if e2e_latency is not None and e2e_latency > 0.0:
+            attributed = sum(values.values())
+            values["other_time"] = max(0.0, float(e2e_latency) - attributed)
+        else:
+            values["other_time"] = 0.0
+        return values
 
     def get_prefill_waiting_latency(self) -> Optional[float]:
         if self.prefill_run_batch_start_time > 0.0:

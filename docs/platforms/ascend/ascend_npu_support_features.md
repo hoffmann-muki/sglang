@@ -58,7 +58,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |-----------------------------------------------------|----------|--------------------------------|:----------------:|
 | `--mem-fraction-static`                             | `None`   | Type: float                    |      A2, A3      |
 | `--max-running-requests`                            | `None`   | Type: int                      |      A2, A3      |
-| `--prefill-max-requests`                            | `None`   | Type: int                      |      A2, A3      |
+| `--prefill-max-requests`                            | `1`      | Type: int                      |      A2, A3      |
 | `--max-queued-requests`                             | `None`   | Type: int                      |      A2, A3      |
 | `--max-total-tokens`                                | `None`   | Type: int                      |      A2, A3      |
 | `--chunked-prefill-size`                            | `None`   | Type: int                      |      A2, A3      |

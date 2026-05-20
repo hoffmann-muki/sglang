@@ -171,6 +171,9 @@ class TestDraftForwardProtocol(CustomTestCase):
             round_ids=merged.round_ids,
             token_positions=merged.token_positions,
             prefix_versions=merged.prefix_versions,
+            server_total_time=0.20,
+            server_queue_scheduling_time=0.03,
+            server_model_forward_time=0.15,
         )
         split = split_merged_draft_forward_response(
             merged_response,
@@ -185,6 +188,9 @@ class TestDraftForwardProtocol(CustomTestCase):
         self.assertEqual(split[1].draft_token_ids.tolist(), [[21, 22]])
         self.assertEqual(split[0].round_ids, [1])
         self.assertEqual(split[1].prefix_versions, [4])
+        self.assertEqual(split[0].server_total_time, 0.20)
+        self.assertEqual(split[1].server_queue_scheduling_time, 0.03)
+        self.assertEqual(split[0].server_model_forward_time, 0.15)
 
     def test_merge_rejects_mismatched_modes(self):
         req_a = DraftForwardRequest(

@@ -9,6 +9,7 @@ local draft model.
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -20,7 +21,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
@@ -71,6 +71,8 @@ class _PendingExtendAfterDecode:
     prefix_versions: list[int]
     future: Future[DraftForwardResponse] | None
     timeout: float | None
+    submitted_time: float | None = None
+    request_time_stats: list[object] | None = None
 
 
 class RemoteDraftWorker(EAGLEWorker):
@@ -386,6 +388,50 @@ class RemoteDraftWorker(EAGLEWorker):
         self._validate_ordering_response(request, broadcasted.response)
         return broadcasted.response
 
+    def _run_draft_forward_with_timing(
+        self,
+        request: DraftForwardRequest,
+        *,
+        request_time_stats: list[object],
+        timeout: float | None,
+        translate_request_to_draft_vocab: bool,
+        translate_response_to_target_vocab: bool,
+    ) -> DraftForwardResponse:
+        start_time = time.perf_counter()
+        response = self._run_rank0_broadcasted_draft_forward(
+            request,
+            timeout=timeout,
+            translate_request_to_draft_vocab=translate_request_to_draft_vocab,
+            translate_response_to_target_vocab=translate_response_to_target_vocab,
+        )
+        self._observe_draft_forward_timing(
+            request_time_stats,
+            response,
+            roundtrip_time=time.perf_counter() - start_time,
+        )
+        return response
+
+    @staticmethod
+    def _observe_draft_forward_timing(
+        request_time_stats: list[object] | None,
+        response: DraftForwardResponse,
+        *,
+        roundtrip_time: float,
+    ) -> None:
+        if not request_time_stats:
+            return
+        server_total_time = max(0.0, response.server_total_time)
+        grpc_communication_time = max(0.0, roundtrip_time - server_total_time)
+        for time_stats in request_time_stats:
+            observe = getattr(time_stats, "observe_draft_rpc_timing", None)
+            if observe is None:
+                continue
+            observe(
+                grpc_communication_time=grpc_communication_time,
+                draft_queue_scheduling_time=response.server_queue_scheduling_time,
+                draft_proposal_time=response.server_model_forward_time,
+            )
+
     def _submit_draft_forward_async(
         self,
         request: DraftForwardRequest,
@@ -460,9 +506,18 @@ class RemoteDraftWorker(EAGLEWorker):
         request: DraftForwardRequest,
         *,
         request_ids: list[str],
+        req_by_id: dict[str, object],
         spec_info: EagleDraftInput,
         prefix_versions: list[int],
     ) -> None:
+        submitted_time = (
+            time.perf_counter()
+            if (
+                not self.uses_rank0_broadcast
+                or self.target_worker.world_group.is_first_rank
+            )
+            else None
+        )
         pending = _PendingExtendAfterDecode(
             request=request,
             request_ids=request_ids,
@@ -475,6 +530,12 @@ class RemoteDraftWorker(EAGLEWorker):
                 translate_response_to_target_vocab=True,
             ),
             timeout=self.server_args.draft_forward_rpc_timeout,
+            submitted_time=submitted_time,
+            request_time_stats=[
+                req_by_id[request_id].time_stats
+                for request_id in request_ids
+                if request_id in req_by_id
+            ],
         )
         self._pending_extend_after_decode.append(pending)
 
@@ -520,6 +581,12 @@ class RemoteDraftWorker(EAGLEWorker):
         pending: _PendingExtendAfterDecode,
     ) -> None:
         response = self._resolve_draft_forward_async(pending)
+        if pending.submitted_time is not None:
+            self._observe_draft_forward_timing(
+                pending.request_time_stats,
+                response,
+                roundtrip_time=time.perf_counter() - pending.submitted_time,
+            )
         self._commit_prefix_versions(pending.request_ids, pending.prefix_versions)
         self._apply_next_draft_state(
             pending.spec_info,
@@ -642,17 +709,16 @@ class RemoteDraftWorker(EAGLEWorker):
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         spec_info = self.draft(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
-        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_verify_start_time")
 
         logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
             self.verify(batch, spec_info)
         )
         del model_worker_batch
 
-        if get_global_tracing_enabled():
-            for idx, req in enumerate(batch.reqs):
-                accepted = verify_output.accept_length_per_req_cpu[idx]
-                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+        for idx, req in enumerate(batch.reqs):
+            accepted = verify_output.accept_length_per_req_cpu[idx]
+            req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
         finished_request_ids = [req.rid for req in batch.reqs if req.finished()]
 
@@ -720,8 +786,13 @@ class RemoteDraftWorker(EAGLEWorker):
             ),
             advance_round=True,
         )
-        response = self._run_rank0_broadcasted_draft_forward(
+        response = self._run_draft_forward_with_timing(
             request,
+            request_time_stats=[
+                req_by_id[request_id].time_stats
+                for request_id in request_ids
+                if request_id in req_by_id
+            ],
             timeout=self.server_args.draft_forward_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
@@ -774,8 +845,13 @@ class RemoteDraftWorker(EAGLEWorker):
             ),
             advance_round=True,
         )
-        response = self._run_rank0_broadcasted_draft_forward(
+        response = self._run_draft_forward_with_timing(
             request,
+            request_time_stats=[
+                req_by_id[request_id].time_stats
+                for request_id in request_ids
+                if request_id in req_by_id
+            ],
             timeout=self.server_args.draft_forward_rpc_timeout,
             translate_request_to_draft_vocab=True,
             translate_response_to_target_vocab=True,
@@ -859,6 +935,7 @@ class RemoteDraftWorker(EAGLEWorker):
         self._queue_extend_after_decode(
             request,
             request_ids=request_ids,
+            req_by_id=req_by_id,
             spec_info=spec_info,
             prefix_versions=next_prefix_versions,
         )

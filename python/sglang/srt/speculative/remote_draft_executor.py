@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -161,6 +162,8 @@ class RemoteDraftSchedulerExecutor:
             )
 
     def handle(self, request: DraftForwardRequest) -> DraftForwardResponse:
+        server_received_time = request.server_received_time or time.perf_counter()
+        handler_start_time = time.perf_counter()
         request_ids = request.request_ids or [request.request_id]
         self._validate_request(request)
         if request.mode == "release":
@@ -169,7 +172,11 @@ class RemoteDraftSchedulerExecutor:
                 request.tp_rank,
                 cache_prefix=request.cache_prefix_on_release,
             )
-            return self._empty_response(request)
+            return self._with_timing(
+                self._empty_response(request),
+                server_received_time=server_received_time,
+                handler_start_time=handler_start_time,
+            )
 
         self._ensure_spec_config(request)
 
@@ -182,7 +189,11 @@ class RemoteDraftSchedulerExecutor:
         else:
             raise ValueError(f"Unsupported DraftForward mode: {request.mode!r}")
 
-        return self._with_request_ordering(response, request)
+        return self._with_timing(
+            self._with_request_ordering(response, request),
+            server_received_time=server_received_time,
+            handler_start_time=handler_start_time,
+        )
 
     def release(
         self, request_ids: list[str], tp_rank: int, *, cache_prefix: bool = False
@@ -347,12 +358,16 @@ class RemoteDraftSchedulerExecutor:
                     self.device, non_blocking=True
                 )
 
+            proposal_start_time = time.perf_counter()
             logits_output = self.model_runner.forward(forward_batch).logits_output
+            proposal_time = time.perf_counter() - proposal_start_time
             maybe_detect_nan(logits_output.next_token_logits, "draft_forward_extend")
             self._capture_for_decode(logits_output, forward_batch.spec_info)
             self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
-            return self._state_response(request, forward_batch.spec_info)
+            response = self._state_response(request, forward_batch.spec_info)
+            response.server_model_forward_time = proposal_time
+            return response
         except Exception:
             logger.exception(
                 "extend failed request_id=%r tp_rank=%s",
@@ -376,13 +391,16 @@ class RemoteDraftSchedulerExecutor:
         if not forward_batch.forward_mode.is_idle() and self._speculative_num_steps > 1:
             self._draft_attn_backend.init_forward_metadata(forward_batch)
 
+        proposal_start_time = time.perf_counter()
         parent_list, top_scores_index, draft_tokens = self._draft_forward(forward_batch)
+        proposal_time = time.perf_counter() - proposal_start_time
         return DraftForwardResponse(
             request_id=request.request_id,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_token_ids=draft_tokens,
             mode=request.mode,
+            server_model_forward_time=proposal_time,
         )
 
     def _handle_extend_after_decode(
@@ -408,9 +426,11 @@ class RemoteDraftSchedulerExecutor:
             forward_batch.attn_backend = attn_backend
 
         try:
+            proposal_start_time = time.perf_counter()
             logits_output = self.model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
+            proposal_time = time.perf_counter() - proposal_start_time
         except Exception:
             logger.exception(
                 "extend_after_decode forward failed request_id=%r " "tp_rank=%s",
@@ -431,7 +451,9 @@ class RemoteDraftSchedulerExecutor:
         )
         self._store_next_draft_state(request_ids, batch, forward_batch.spec_info)
 
-        return self._state_response(request, forward_batch.spec_info)
+        response = self._state_response(request, forward_batch.spec_info)
+        response.server_model_forward_time = proposal_time
+        return response
 
     def _build_initial_extend_batch(
         self, request: DraftForwardRequest, request_ids: list[str]
@@ -1124,4 +1146,23 @@ class RemoteDraftSchedulerExecutor:
         response.round_ids = request.round_ids
         response.token_positions = request.token_positions
         response.prefix_versions = request.prefix_versions
+        return response
+
+    @staticmethod
+    def _with_timing(
+        response: DraftForwardResponse,
+        *,
+        server_received_time: float,
+        handler_start_time: float,
+    ) -> DraftForwardResponse:
+        server_finish_time = time.perf_counter()
+        response.server_total_time = max(
+            0.0, server_finish_time - server_received_time
+        )
+        response.server_queue_scheduling_time = max(
+            0.0, handler_start_time - server_received_time
+        )
+        response.server_model_forward_time = max(
+            0.0, response.server_model_forward_time
+        )
         return response

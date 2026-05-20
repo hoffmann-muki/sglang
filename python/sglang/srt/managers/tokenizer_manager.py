@@ -1822,6 +1822,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                    scheduler_time_stats = (
+                        recv_obj.time_stats[i]
+                        if recv_obj.time_stats is not None
+                        else None
+                    )
+                    if scheduler_time_stats is not None and hasattr(
+                        scheduler_time_stats, "get_latency_breakdown"
+                    ):
+                        latency_breakdown = scheduler_time_stats.get_latency_breakdown(
+                            meta_info["e2e_latency"]
+                        )
+                        if latency_breakdown is not None:
+                            meta_info["latency_breakdown"] = latency_breakdown
                 if self.enable_metrics:
                     scheduler_time_stats = (
                         recv_obj.time_stats[i]

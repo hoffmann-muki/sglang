@@ -264,18 +264,18 @@ async def start_draft_forward_service(
         stream_batch_window_s=getattr(
             server_args,
             "draft_forward_stream_batch_window_ms",
-            0.5,
+            0.0,
         )
         / 1000.0,
         stream_batch_max_requests=getattr(
             server_args,
             "draft_forward_stream_batch_max_requests",
-            2,
+            1,
         ),
         stream_batch_max_proposed_tokens=getattr(
             server_args,
             "draft_forward_stream_batch_max_proposed_tokens",
-            4,
+            2,
         ),
     )
     scheme = "mTLS/TLS" if credentials is not None else "insecure"

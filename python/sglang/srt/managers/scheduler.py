@@ -388,12 +388,12 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.target_scheduler_batch_window_s = (
-            getattr(server_args, "target_scheduler_batch_window_ms", 2.0) / 1000.0
+            getattr(server_args, "target_scheduler_batch_window_ms", 0.0) / 1000.0
         )
         self.target_scheduler_batch_max_requests = getattr(
             server_args,
             "target_scheduler_batch_max_requests",
-            8,
+            1,
         )
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None

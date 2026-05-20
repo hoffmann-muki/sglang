@@ -8,6 +8,7 @@ import ctypes
 import inspect
 import logging
 import threading
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from importlib import import_module
@@ -433,6 +434,9 @@ def draft_response_to_proto(
     message = proto_module.DraftForwardResponse(
         request_id=response.request_id,
         mode=response.mode,
+        server_total_time=response.server_total_time,
+        server_queue_scheduling_time=response.server_queue_scheduling_time,
+        server_model_forward_time=response.server_model_forward_time,
     )
     if response.round_ids is not None:
         message.round_ids.extend(list(response.round_ids))
@@ -524,6 +528,13 @@ def draft_response_from_proto(
             if len(getattr(proto_response, "prefix_versions", [])) > 0
             else None
         ),
+        server_total_time=float(getattr(proto_response, "server_total_time", 0.0)),
+        server_queue_scheduling_time=float(
+            getattr(proto_response, "server_queue_scheduling_time", 0.0)
+        ),
+        server_model_forward_time=float(
+            getattr(proto_response, "server_model_forward_time", 0.0)
+        ),
     )
     if translator is not None and translate_to_target_vocab:
         return response.to_target_vocab(translator)
@@ -546,9 +557,9 @@ class DraftForwardServiceAdapter:
         proto_module=None,
         translate_requests_to_draft_vocab: bool = False,
         translate_responses_to_target_vocab: bool = False,
-        stream_batch_window_s: float = 0.0005,
-        stream_batch_max_requests: int = 2,
-        stream_batch_max_proposed_tokens: int = 4,
+        stream_batch_window_s: float = 0.0,
+        stream_batch_max_requests: int = 1,
+        stream_batch_max_proposed_tokens: int = 2,
     ):
         if stream_batch_window_s < 0:
             raise ValueError("stream_batch_window_s must be non-negative.")
@@ -581,6 +592,7 @@ class DraftForwardServiceAdapter:
 
     def _request_from_proto(self, request) -> DraftForwardRequest:
         draft_request = draft_request_from_proto(request)
+        draft_request.server_received_time = time.perf_counter()
         if self.translator is not None and self.translate_requests_to_draft_vocab:
             draft_request = draft_request.to_draft_vocab(self.translator)
         return draft_request
@@ -1175,9 +1187,9 @@ async def serve_draft_forward_service(
     translator: TLITokenTranslator | None = None,
     translate_requests_to_draft_vocab: bool = False,
     translate_responses_to_target_vocab: bool = False,
-    stream_batch_window_s: float = 0.0005,
-    stream_batch_max_requests: int = 2,
-    stream_batch_max_proposed_tokens: int = 4,
+    stream_batch_window_s: float = 0.0,
+    stream_batch_max_requests: int = 1,
+    stream_batch_max_proposed_tokens: int = 2,
     server_credentials=None,
     options=None,
 ):

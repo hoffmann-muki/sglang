@@ -138,14 +138,15 @@ class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
 
     def test_asymmetric_batching_policy_defaults(self):
         server_args = ServerArgs(model_path="dummy")
-        self.assertEqual(server_args.draft_forward_stream_batch_window_ms, 0.5)
-        self.assertEqual(server_args.draft_forward_stream_batch_max_requests, 2)
+        self.assertEqual(server_args.prefill_max_requests, 1)
+        self.assertEqual(server_args.draft_forward_stream_batch_window_ms, 0.0)
+        self.assertEqual(server_args.draft_forward_stream_batch_max_requests, 1)
         self.assertEqual(
             server_args.draft_forward_stream_batch_max_proposed_tokens,
-            4,
+            2,
         )
-        self.assertEqual(server_args.target_scheduler_batch_window_ms, 2.0)
-        self.assertEqual(server_args.target_scheduler_batch_max_requests, 8)
+        self.assertEqual(server_args.target_scheduler_batch_window_ms, 0.0)
+        self.assertEqual(server_args.target_scheduler_batch_max_requests, 1)
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
