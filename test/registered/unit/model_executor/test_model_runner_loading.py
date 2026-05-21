@@ -1,3 +1,5 @@
+"""Regression tests for model-loading synchronization behavior."""
+
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +16,7 @@ class _FakeTPGroup:
         self.cpu_group = cpu_group
 
 
-class TestModelLoadingSync(unittest.TestCase):
+class TestModelLoadingSynchronization(unittest.TestCase):
     @patch("sglang.srt.model_executor.model_runner.get_tp_group")
     @patch("sglang.srt.model_executor.model_runner.dist.barrier")
     @patch("sglang.srt.model_executor.model_runner.dist.monitored_barrier")

@@ -418,14 +418,18 @@ class RemoteDraftWorker(EAGLEWorker):
         *,
         roundtrip_time: float,
     ) -> None:
+        """Map remote draft timings into the unified request latency schema."""
         if not request_time_stats:
             return
-        server_total_time = max(0.0, response.server_total_time)
-        grpc_communication_time = max(0.0, roundtrip_time - server_total_time)
+        server_elapsed_time = max(0.0, response.server_total_time)
+        grpc_communication_time = max(0.0, roundtrip_time - server_elapsed_time)
         for time_stats in request_time_stats:
             observe = getattr(time_stats, "observe_draft_rpc_timing", None)
             if observe is None:
                 continue
+            # Keep the same field semantics as colocated asymmetric TLI:
+            # transport overhead, queue wait, and draft compute are reported in
+            # the same request-level schema.
             observe(
                 grpc_communication_time=grpc_communication_time,
                 draft_queue_scheduling_time=response.server_queue_scheduling_time,

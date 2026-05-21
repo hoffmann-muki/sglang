@@ -66,7 +66,14 @@ class DraftForwardRequest:
 
 @dataclass(slots=True)
 class DraftForwardResponse:
-    """Response sent from the draft server back to the target server."""
+    """Response sent from the draft server back to the target server.
+
+    Timing fields intentionally mirror the request-level speculative latency
+    schema so colocated and disaggregated TLI can be compared directly:
+    - `server_total_time`: total draft-server handling time excluding network
+    - `server_queue_scheduling_time`: time spent waiting before draft compute
+    - `server_model_forward_time`: time spent inside draft model execution
+    """
 
     request_id: str
     parent_list: torch.Tensor

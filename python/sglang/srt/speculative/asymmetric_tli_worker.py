@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class _BroadcastedDraftPayload:
-    """Draft proposal payload shared from rank 0 to the target TP group."""
+class _BroadcastedDraftResult:
+    """Draft proposal result shared from rank 0 to the target TP group."""
 
     ok: bool
     payload: Optional[dict] = None
@@ -232,10 +232,10 @@ class AsymmetricTLIWorker(TLIWorker):
             device=self.device,
         )
 
-    def _broadcast_verify_payload(
+    def _broadcast_draft_result(
         self,
-        payload: list[_BroadcastedDraftPayload],
-    ) -> _BroadcastedDraftPayload:
+        payload: list[_BroadcastedDraftResult],
+    ) -> _BroadcastedDraftResult:
         world_group = self.target_worker.world_group
         return broadcast_pyobj(
             payload,
@@ -292,12 +292,12 @@ class AsymmetricTLIWorker(TLIWorker):
         return spec_info, draft_proposal_time
 
     def _broadcast_draft(self, batch) -> tuple[EagleVerifyInput, float]:
-        payload: list[_BroadcastedDraftPayload]
+        payload: list[_BroadcastedDraftResult]
         if self._is_draft_rank:
             try:
                 spec_info, draft_proposal_time = self._draft_on_root(batch)
                 payload = [
-                    _BroadcastedDraftPayload(
+                    _BroadcastedDraftResult(
                         ok=True,
                         payload=self._serialize_verify_input(spec_info),
                         draft_proposal_time=draft_proposal_time,
@@ -306,7 +306,7 @@ class AsymmetricTLIWorker(TLIWorker):
             except Exception:
                 logger.exception("Asymmetric colocated TLI draft failed on root rank.")
                 payload = [
-                    _BroadcastedDraftPayload(
+                    _BroadcastedDraftResult(
                         ok=False,
                         error=traceback.format_exc(),
                     )
@@ -314,7 +314,7 @@ class AsymmetricTLIWorker(TLIWorker):
         else:
             payload = []
 
-        broadcasted = self._broadcast_verify_payload(payload)
+        broadcasted = self._broadcast_draft_result(payload)
         if not broadcasted.ok:
             raise RuntimeError(
                 "Asymmetric colocated TLI draft failed on root rank:\n"
@@ -344,13 +344,19 @@ class AsymmetricTLIWorker(TLIWorker):
             return time.perf_counter() - start_time
 
     @staticmethod
-    def _observe_draft_timing(
+    def _record_draft_timing(
         reqs,
         *,
         draft_proposal_time: float,
         grpc_communication_time: float = 0.0,
         draft_queue_scheduling_time: float = 0.0,
     ) -> None:
+        """Record colocated draft timings using the shared speculative schema.
+
+        In asymmetric colocated TLI, the draft runs in-process on the root
+        target rank, so transport cost is zero and draft-side queueing is only
+        present if the local draft path explicitly introduces it.
+        """
         for req in reqs:
             req.time_stats.observe_draft_rpc_timing(
                 grpc_communication_time=grpc_communication_time,
@@ -373,7 +379,7 @@ class AsymmetricTLIWorker(TLIWorker):
                 seq_lens_cpu,
                 logits_output.mm_input_embeds,
             )
-            self._observe_draft_timing(
+            self._record_draft_timing(
                 batch.reqs,
                 draft_proposal_time=draft_proposal_time,
             )
@@ -387,7 +393,7 @@ class AsymmetricTLIWorker(TLIWorker):
         set_time_batch(batch.reqs, "set_spec_draft_start_time")
         spec_info, draft_proposal_time = self._broadcast_draft(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time")
-        self._observe_draft_timing(
+        self._record_draft_timing(
             batch.reqs,
             draft_proposal_time=draft_proposal_time,
         )
@@ -405,7 +411,7 @@ class AsymmetricTLIWorker(TLIWorker):
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
         if batch.spec_info.verified_id.shape[0] > 0:
             draft_extend_time = self._forward_draft_extend_after_decode_on_root(batch)
-            self._observe_draft_timing(
+            self._record_draft_timing(
                 batch.reqs,
                 draft_proposal_time=draft_extend_time,
             )

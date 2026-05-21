@@ -274,7 +274,11 @@ logger = logging.getLogger(__name__)
 
 
 def synchronize_model_loading(elastic_ep_backend: str, tp_rank: int) -> None:
-    """Synchronize model loading without over-synchronizing single-rank drafts."""
+    """Synchronize model loading without over-synchronizing single-rank drafts.
+
+    The asymmetric colocated draft path loads a separate TP=1 draft model on
+    rank 0, so that path should not force a multi-rank barrier.
+    """
     tp_group = get_tp_group()
     if tp_group.world_size == 1:
         return

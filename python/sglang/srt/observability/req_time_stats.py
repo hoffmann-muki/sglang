@@ -44,6 +44,16 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 
 logger = logging.getLogger(__name__)
 
+# Stable schema for request-level speculative latency accounting.
+SPEC_LATENCY_BREAKDOWN_FIELDS = (
+    "grpc_communication_time",
+    "draft_proposal_time",
+    "target_verification_time",
+    "draft_queue_scheduling_time",
+    "target_queue_scheduling_time",
+    "other_time",
+)
+
 # Reduce system time calls by computing time.time() based on calibrated perf_counter() values.
 global_diff_realtime_monotonic = time.time() - time.perf_counter()
 
@@ -665,6 +675,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         draft_queue_scheduling_time: float = 0.0,
         draft_proposal_time: float = 0.0,
     ):
+        """Accumulate draft-side speculative timing into the unified schema.
+
+        The same three draft-side fields are used by colocated asymmetric TLI
+        and by disaggregated draft-forward TLI:
+        - `grpc_communication_time`: transport overhead between draft and target
+        - `draft_queue_scheduling_time`: time waiting before draft compute starts
+        - `draft_proposal_time`: time spent actually producing draft proposals
+        """
         self.grpc_communication_time += max(0.0, grpc_communication_time)
         self.draft_queue_scheduling_time += max(0.0, draft_queue_scheduling_time)
         self.draft_proposal_time += max(0.0, draft_proposal_time)
@@ -1005,17 +1023,35 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         return self.forward_entry_time - self.wait_queue_entry_time
 
     def get_target_queue_scheduling_time(self) -> float:
+        """Return the target-side wait between queue entry and forward entry."""
         if self.forward_entry_time > 0.0 and self.wait_queue_entry_time > 0.0:
             return max(0.0, self.forward_entry_time - self.wait_queue_entry_time)
         return 0.0
 
     def get_latency_breakdown(self, e2e_latency: Optional[float] = None):
+        """Return the request-level speculative latency breakdown.
+
+        The breakdown schema is shared by colocated and disaggregated TLI so
+        their per-request logs can be compared directly:
+        - `grpc_communication_time`: network transport between draft and target
+        - `draft_proposal_time`: draft model compute time
+        - `target_verification_time`: target model verification compute time
+        - `draft_queue_scheduling_time`: wait before draft compute begins
+        - `target_queue_scheduling_time`: wait before target forward begins
+        - `other_time`: residual e2e latency not captured by the named stages
+        """
         values = {
-            "grpc_communication_time": self.grpc_communication_time,
-            "draft_proposal_time": self.draft_proposal_time,
-            "target_verification_time": self.target_verification_time,
-            "draft_queue_scheduling_time": self.draft_queue_scheduling_time,
-            "target_queue_scheduling_time": self.get_target_queue_scheduling_time(),
+            field_name: value
+            for field_name, value in zip(
+                SPEC_LATENCY_BREAKDOWN_FIELDS[:-1],
+                (
+                    self.grpc_communication_time,
+                    self.draft_proposal_time,
+                    self.target_verification_time,
+                    self.draft_queue_scheduling_time,
+                    self.get_target_queue_scheduling_time(),
+                ),
+            )
         }
         if not any(value > 0.0 for value in values.values()):
             return None

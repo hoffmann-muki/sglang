@@ -1,6 +1,9 @@
 import unittest
 
-from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+from sglang.srt.observability.req_time_stats import (
+    SPEC_LATENCY_BREAKDOWN_FIELDS,
+    SchedulerReqTimeStats,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,16 +25,10 @@ class TestReqTimeStatsLatencyBreakdown(CustomTestCase):
         breakdown = stats.get_latency_breakdown(e2e_latency=1.0)
 
         self.assertEqual(
-            set(breakdown),
-            {
-                "grpc_communication_time",
-                "draft_proposal_time",
-                "target_verification_time",
-                "draft_queue_scheduling_time",
-                "target_queue_scheduling_time",
-                "other_time",
-            },
+            tuple(breakdown),
+            SPEC_LATENCY_BREAKDOWN_FIELDS,
         )
+        self.assertEqual(set(breakdown), set(SPEC_LATENCY_BREAKDOWN_FIELDS))
         self.assertAlmostEqual(breakdown["grpc_communication_time"], 0.1)
         self.assertAlmostEqual(breakdown["draft_queue_scheduling_time"], 0.05)
         self.assertAlmostEqual(breakdown["draft_proposal_time"], 0.3)

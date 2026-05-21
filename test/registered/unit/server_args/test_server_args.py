@@ -49,7 +49,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
-class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
+class TestTliServerArgs(unittest.TestCase):
     @patch(
         "sglang.srt.server_args._resolve_or_download",
         side_effect=lambda path, **kwargs: path,
