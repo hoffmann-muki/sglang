@@ -125,6 +125,16 @@ class SpeculativeAlgorithm(Enum):
 
                 return RemoteDraftWorker
 
+            if (
+                server_args.speculative_draft_tp_size == 1
+                and server_args.tp_size > 1
+            ):
+                from sglang.srt.speculative.asymmetric_tli_worker import (
+                    AsymmetricTLIWorker,
+                )
+
+                return AsymmetricTLIWorker
+
             from sglang.srt.speculative.tli_worker import TLIWorker
 
             return TLIWorker

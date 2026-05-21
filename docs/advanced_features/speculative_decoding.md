@@ -339,7 +339,7 @@ print(response.choices[0].message.content)
 TLI extends standalone speculative decoding to draft models whose tokenizer differs from the target model. It computes the token intersection at startup, maps token IDs between vocabularies, and masks draft logits so speculative sampling only considers intersection tokens.
 
 TLI can run in two configurations:
-- Colocated TLI, where the target and draft live in the same serving process. Use `--speculative-draft-model-path` for the draft weights.
+- Colocated TLI, where the target and draft live in the same serving process. Use `--speculative-draft-model-path` for the draft weights. By default, the colocated draft uses the same TP size as the target; set `--speculative-draft-tp-size 1` for a vLLM-style asymmetric baseline where only the target TP root rank runs the draft.
 - Draft-forward disaggregation, where the target and draft run on separate nodes and communicate over the DraftForward transport. Use `--remote-draft-tokenizer-path` on the target and `--draft-forward-target-tokenizer-path` on the draft node.
 
 For a colocated baseline with distinct draft and target weights, pass both the target model path and the draft model path. The draft tokenizer path is derived internally from the draft model path:
@@ -349,6 +349,20 @@ python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-algorithm TLI \
     --speculative-draft-model-path Qwen/Qwen2.5-0.5B-Instruct \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5
+```
+
+To match vLLM-style asymmetric TP for a colocated baseline, keep the target TP size high and run the local draft at TP=1:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --tp 4 \
+    --speculative-algorithm TLI \
+    --speculative-draft-model-path Qwen/Qwen2.5-0.5B-Instruct \
+    --speculative-draft-tp-size 1 \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 5
@@ -371,6 +385,7 @@ This minimizes queueing and batching delay on both the draft and target sides, w
 
 - Requires `--remote-draft-tokenizer-path` on the target node and `--draft-forward-target-tokenizer-path` on the draft node.
 - Colocated TLI does not use `--remote-draft-tokenizer-path`; the draft tokenizer path is derived from `--speculative-draft-model-path`.
+- Colocated asymmetric TLI uses `--speculative-draft-tp-size 1`; disaggregated asymmetric TLI uses `--remote-draft-tp-size 1`.
 - For disaggregated deployment, the target node may set `--remote-draft-tp-size 1` to use a single-rank draft service while keeping a multi-rank target.
 - The draft node uses the gRPC serving path and starts the DraftForward sidecar independently of the removed smg-grpc-servicer callback hook.
 - Does not support `--enable-dp-attention`.
@@ -525,6 +540,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 |---|---|---|---|
 | `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `TLI`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
 | `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights for colocated TLI and other draft-model speculative modes |
+| `--speculative-draft-tp-size` | `int` | `None` | Colocated TLI draft TP size. Supports `1` or the target `--tp` size. |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |
 | `--speculative-num-steps` | `int` | `None` (auto-chosen when omitted) | Autoregressive drafting depth |

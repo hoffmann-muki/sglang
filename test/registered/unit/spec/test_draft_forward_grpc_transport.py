@@ -372,6 +372,7 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
             adapter = DraftForwardServiceAdapter(
                 handler,
                 proto_module=_FAKE_PROTO,
+                stream_batch_window_s=0.001,
             )
             return [
                 draft_response_from_proto(response)

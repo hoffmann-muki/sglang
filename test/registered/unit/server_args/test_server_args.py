@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -65,6 +66,64 @@ class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
             speculative_num_draft_tokens=5,
         )
         self.assertEqual(server_args.remote_draft_tokenizer_path, "draft-model")
+        self.assertEqual(server_args.speculative_draft_tp_size, server_args.tp_size)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_colocated_tli_accepts_asymmetric_draft_tp_size_one(
+        self, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="TLI",
+            speculative_draft_model_path="draft-model",
+            speculative_draft_tp_size=1,
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+        self.assertEqual(server_args.speculative_draft_tp_size, 1)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_colocated_tli_selects_asymmetric_worker_for_draft_tp_one(
+        self, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="TLI",
+            speculative_draft_model_path="draft-model",
+            speculative_draft_tp_size=1,
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+        worker_cls = SpeculativeAlgorithm.TLI.create_worker(server_args)
+        self.assertEqual(worker_cls.__name__, "AsymmetricTLIWorker")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_colocated_tli_rejects_unsupported_draft_tp_size(self, _mock_resolve):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="TLI",
+                speculative_draft_model_path="draft-model",
+                speculative_draft_tp_size=2,
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+                tp_size=4,
+            )
+        self.assertIn("speculative-draft-tp-size", str(context.exception))
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
@@ -100,6 +159,24 @@ class TestDraftForwardDisaggregationServerArgs(unittest.TestCase):
             tp_size=4,
         )
         self.assertEqual(server_args.remote_draft_tp_size, 4)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_target_rejects_colocated_draft_tp_size(self, _mock_resolve):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                grpc_mode=True,
+                draft_disaggregation_role="target",
+                speculative_algorithm="TLI",
+                remote_draft_server_addr="127.0.0.1:31000",
+                remote_draft_tokenizer_path="draft-tokenizer",
+                speculative_draft_tp_size=1,
+                tp_size=4,
+            )
+        self.assertIn("remote-draft-tp-size", str(context.exception))
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",

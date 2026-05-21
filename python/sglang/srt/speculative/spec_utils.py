@@ -15,6 +15,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
+    patch_world_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -36,6 +37,64 @@ elif _is_hip:
     from sgl_kernel import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
+
+
+class SingleRankDraftGroup:
+    """Minimal GroupCoordinator-like object for root-only local draft workers."""
+
+    def __init__(self, source_group: GroupCoordinator, *, rank: Optional[int] = None):
+        self.rank = source_group.rank if rank is None else rank
+        self.ranks = [self.rank]
+        self.world_size = 1
+        self.local_rank = getattr(source_group, "local_rank", 0)
+        self.rank_in_group = 0
+        self.first_rank = self.rank
+        self.last_rank = self.rank
+        self.is_first_rank = True
+        self.is_last_rank = True
+        self.cpu_group = None
+        self.device_group = None
+        self.device = getattr(source_group, "device", torch.device("cpu"))
+        self.device_module = getattr(source_group, "device_module", torch)
+        self.active_ranks = torch.ones(1, dtype=torch.int32, device=self.device)
+        self.active_ranks_cpu = torch.ones(1, dtype=torch.int32)
+        self.use_pynccl = False
+        self.use_pymscclpp = False
+        self.use_custom_allreduce = False
+        self.use_torch_symm_mem_all_reduce = False
+        self.use_message_queue_broadcaster = False
+        self.pynccl_comm = None
+        self.pymscclpp_comm = None
+        self.ca_comm = None
+        self.qr_comm = None
+        self.torch_symm_mem_comm = None
+        self.mq_broadcaster = None
+
+    def barrier(self):
+        return None
+
+    def all_reduce(self, input_: torch.Tensor, *args, **kwargs):
+        return input_
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1):
+        return input_
+
+    def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1):
+        return input_
+
+    def all_gather_into_tensor(self, output: torch.Tensor, input_: torch.Tensor):
+        output.copy_(input_)
+        return None
+
+    def reduce_scatter_tensor(self, output: torch.Tensor, input_: torch.Tensor):
+        output.copy_(input_)
+        return None
+
+
+@contextmanager
+def single_rank_draft_context(tp_group: SingleRankDraftGroup):
+    with patch_world_group(tp_group), patch_tensor_parallel_group(tp_group):
+        yield
 
 
 logger = logging.getLogger(__name__)

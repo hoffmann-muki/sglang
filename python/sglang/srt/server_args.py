@@ -504,6 +504,7 @@ class ServerArgs:
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
+    speculative_draft_tp_size: Optional[int] = None
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
@@ -3611,7 +3612,20 @@ class ServerArgs:
                     "TLI colocated mode derives the draft tokenizer path from "
                     "--speculative-draft-model-path."
                 )
+                if self.speculative_draft_tp_size is None:
+                    self.speculative_draft_tp_size = self.tp_size
+                elif self.speculative_draft_tp_size not in (1, self.tp_size):
+                    raise ValueError(
+                        "--speculative-draft-tp-size currently supports either 1 "
+                        "for vLLM-style asymmetric colocated TLI or the target "
+                        "--tp size for the existing symmetric colocated path."
+                    )
             else:
+                if self.speculative_draft_tp_size is not None:
+                    raise ValueError(
+                        "--speculative-draft-tp-size is only valid for colocated TLI. "
+                        "Use --remote-draft-tp-size for draft-forward disaggregation."
+                    )
                 if self.remote_draft_tokenizer_path is None:
                     raise ValueError(
                         "TLI disaggregated setup requires --remote-draft-tokenizer-path "
@@ -3664,6 +3678,11 @@ class ServerArgs:
                     "for TLI speculative decoding."
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+        elif self.speculative_draft_tp_size is not None:
+            raise ValueError(
+                "--speculative-draft-tp-size is currently only supported for "
+                "TLI speculative decoding."
+            )
 
         if self.speculative_adaptive:
             from sglang.srt.speculative.adaptive_spec_params import (
@@ -5592,6 +5611,17 @@ class ServerArgs:
             "--speculative-draft-model",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-draft-tp-size",
+            type=int,
+            default=ServerArgs.speculative_draft_tp_size,
+            help=(
+                "Colocated TLI only. Tensor-parallel size for the local draft "
+                "model. Use 1 for vLLM-style asymmetric colocated TLI, or omit/"
+                "set to the target --tp size for the existing symmetric path. "
+                "For disaggregated TLI, use --remote-draft-tp-size instead."
+            ),
         )
         parser.add_argument(
             "--speculative-draft-model-revision",

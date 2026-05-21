@@ -1386,6 +1386,24 @@ def get_world_group() -> GroupCoordinator:
     return _WORLD
 
 
+@contextmanager
+def patch_world_group(world_group: GroupCoordinator):
+    """Temporarily patch the global world group.
+
+    This is used by colocated asymmetric speculative draft workers that run on a
+    strict subset of target TP ranks. The draft model should see a single-rank
+    world while it initializes and runs, but the target verifier must keep using
+    the real multi-rank world outside this context.
+    """
+    old_world_group = get_world_group()
+    global _WORLD
+    _WORLD = world_group
+    try:
+        yield
+    finally:
+        _WORLD = old_world_group
+
+
 def init_world_group(
     ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
 ) -> GroupCoordinator:
@@ -2123,19 +2141,30 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
-    global _TP_STATE_PATCHED
+    global _TP_STATE_PATCHED, _TP, _ATTN_TP, _MOE_TP, _MOE_EP
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
     _TP_STATE_PATCHED = True
     old_tp_group = get_tp_group()
-    global _TP
+    old_attn_tp_group = _ATTN_TP
+    old_moe_tp_group = _MOE_TP
+    old_moe_ep_group = _MOE_EP
     _TP = tp_group
+    if _ATTN_TP is old_tp_group:
+        _ATTN_TP = tp_group
+    if _MOE_TP is old_tp_group:
+        _MOE_TP = tp_group
+    if _MOE_EP is old_tp_group:
+        _MOE_EP = tp_group
     try:
         yield
     finally:
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+        _ATTN_TP = old_attn_tp_group
+        _MOE_TP = old_moe_tp_group
+        _MOE_EP = old_moe_ep_group
 
 
 def get_world_size():

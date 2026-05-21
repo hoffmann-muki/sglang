@@ -592,9 +592,12 @@ class DraftForwardServiceAdapter:
 
     def _request_from_proto(self, request) -> DraftForwardRequest:
         draft_request = draft_request_from_proto(request)
-        draft_request.server_received_time = time.perf_counter()
         if self.translator is not None and self.translate_requests_to_draft_vocab:
             draft_request = draft_request.to_draft_vocab(self.translator)
+        # Queue/scheduling time starts once the request is decoded and ready for
+        # the draft executor. Proto decode and vocab translation belong to RPC
+        # overhead, not service queueing.
+        draft_request.server_received_time = time.perf_counter()
         return draft_request
 
     def _response_to_proto(self, response: DraftForwardResponse):
@@ -721,6 +724,13 @@ class DraftForwardServiceAdapter:
                 requests = pending_requests
                 pending_requests = []
                 if not requests:
+                    return
+                if (
+                    self.stream_batch_window_s <= 0.0
+                    and self.stream_batch_max_requests == 1
+                    and len(requests) == 1
+                ):
+                    await run_many(requests)
                     return
                 task = asyncio.create_task(run_many(requests))
                 tasks.add(task)
