@@ -224,6 +224,11 @@ class TestTliServerArgs(unittest.TestCase):
         )
         self.assertEqual(server_args.target_scheduler_batch_window_ms, 0.0)
         self.assertEqual(server_args.target_scheduler_batch_max_requests, 1)
+        self.assertEqual(server_args.draft_forward_grpc_num_streams, 4)
+        self.assertEqual(
+            server_args.draft_forward_grpc_max_message_bytes,
+            256 * 1024 * 1024,
+        )
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
@@ -266,6 +271,14 @@ class TestTliServerArgs(unittest.TestCase):
             (
                 {"draft_forward_stream_batch_max_proposed_tokens": 0},
                 "draft-forward-stream-batch-max-proposed-tokens",
+            ),
+            (
+                {"draft_forward_grpc_num_streams": 0},
+                "draft-forward-grpc-num-streams",
+            ),
+            (
+                {"draft_forward_grpc_max_message_bytes": 0},
+                "draft-forward-grpc-max-message-bytes",
             ),
         ]
         for kwargs, expected_message in invalid_cases:

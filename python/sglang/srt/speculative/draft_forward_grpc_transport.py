@@ -9,6 +9,8 @@ import inspect
 import logging
 import threading
 import time
+import warnings
+import zlib
 from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from importlib import import_module
@@ -31,6 +33,10 @@ DraftForwardHandler = Callable[
     [DraftForwardRequest], DraftForwardResponse | Awaitable[DraftForwardResponse]
 ]
 
+DEFAULT_DRAFT_FORWARD_GRPC_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+DEFAULT_DRAFT_FORWARD_GRPC_INITIAL_WINDOW_SIZE = 16 * 1024 * 1024
+DEFAULT_DRAFT_FORWARD_GRPC_INITIAL_CONNECTION_WINDOW_SIZE = 64 * 1024 * 1024
+
 _DTYPE_TO_STR = {
     torch.float16: "float16",
     torch.float32: "float32",
@@ -44,6 +50,36 @@ _DTYPE_TO_STR = {
     torch.bool: "bool",
 }
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
+
+
+def build_draft_forward_grpc_options(
+    *,
+    max_message_bytes: int = DEFAULT_DRAFT_FORWARD_GRPC_MAX_MESSAGE_BYTES,
+    extra_options=None,
+) -> list[tuple[str, int]]:
+    """Build low-latency gRPC options for DraftForward transport.
+
+    The message sizes are intentionally large enough for hidden-state payloads,
+    and the HTTP/2 windows avoid per-request stalls on Slingshot/IB-class links.
+    """
+    options = [
+        ("grpc.max_send_message_length", max_message_bytes),
+        ("grpc.max_receive_message_length", max_message_bytes),
+        (
+            "grpc.http2.initial_window_size",
+            DEFAULT_DRAFT_FORWARD_GRPC_INITIAL_WINDOW_SIZE,
+        ),
+        (
+            "grpc.http2.initial_connection_window_size",
+            DEFAULT_DRAFT_FORWARD_GRPC_INITIAL_CONNECTION_WINDOW_SIZE,
+        ),
+        ("grpc.keepalive_time_ms", 20_000),
+        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.keepalive_permit_without_calls", 1),
+    ]
+    if extra_options:
+        options.extend(extra_options)
+    return options
 
 
 def _import_proto_modules():
@@ -136,9 +172,11 @@ def _tensor_from_bytes(
     if numel == 0:
         return torch.empty(shape, dtype=tensor_dtype, device=device)
 
-    # `torch.frombuffer` warns on immutable bytes objects; copy into a writable
-    # bytearray first since we immediately clone anyway.
-    tensor = torch.frombuffer(bytearray(data), dtype=tensor_dtype).reshape(shape)
+    # Decode with one CPU copy instead of bytearray(data) + clone(). The source
+    # protobuf bytes are immutable, but the cloned tensor below is writable.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The given buffer is not writable")
+        tensor = torch.frombuffer(data, dtype=tensor_dtype).reshape(shape)
     tensor = tensor.clone()
     if device != "cpu" and device != torch.device("cpu"):
         tensor = tensor.to(device)
@@ -1013,13 +1051,18 @@ class StreamingDraftForwardClient:
         translator: TLITokenTranslator | None = None,
         channel_credentials=None,
         options=None,
+        num_streams: int = 1,
     ):
+        if num_streams <= 0:
+            raise ValueError("num_streams must be positive.")
         self.translator = translator
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._lock = threading.Lock()
         self._pending: dict[str, tuple[Future, bool]] = {}
         self._stream_error: Exception | None = None
+        self._num_streams = num_streams
+        self._ready_streams = 0
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -1027,25 +1070,32 @@ class StreamingDraftForwardClient:
             daemon=True,
         )
         self._thread.start()
-        self._async_client_future = asyncio.run_coroutine_threadsafe(
-            self._create_async_client(
-                target,
-                translator=translator,
-                channel_credentials=channel_credentials,
-                options=options,
-            ),
-            self._loop,
-        )
-        self._async_client_future.result()
-        self._request_queue_future = asyncio.run_coroutine_threadsafe(
-            self._create_request_queue(),
-            self._loop,
-        )
-        self._request_queue = self._request_queue_future.result()
-        self._stream_task = asyncio.run_coroutine_threadsafe(
-            self._run_stream(),
-            self._loop,
-        )
+        self._async_clients = []
+        self._request_queues = []
+        self._stream_tasks = []
+        for _ in range(num_streams):
+            async_client = asyncio.run_coroutine_threadsafe(
+                self._create_async_client(
+                    target,
+                    translator=translator,
+                    channel_credentials=channel_credentials,
+                    options=options,
+                ),
+                self._loop,
+            ).result()
+            self._async_clients.append(async_client)
+            request_queue = asyncio.run_coroutine_threadsafe(
+                self._create_request_queue(),
+                self._loop,
+            ).result()
+            self._request_queues.append(request_queue)
+        for stream_index in range(num_streams):
+            self._stream_tasks.append(
+                asyncio.run_coroutine_threadsafe(
+                    self._run_stream(stream_index),
+                    self._loop,
+                )
+            )
         self._ready.wait()
 
     def _run_loop(self):
@@ -1059,8 +1109,8 @@ class StreamingDraftForwardClient:
         translator: TLITokenTranslator | None,
         channel_credentials,
         options,
-    ) -> None:
-        self._async_client = DraftForwardClient(
+    ) -> DraftForwardClient:
+        return DraftForwardClient(
             target,
             translator=translator,
             channel_credentials=channel_credentials,
@@ -1070,9 +1120,10 @@ class StreamingDraftForwardClient:
     async def _create_request_queue(self) -> asyncio.Queue:
         return asyncio.Queue()
 
-    async def _request_iterator(self) -> AsyncIterator:
+    async def _request_iterator(self, stream_index: int) -> AsyncIterator:
+        request_queue = self._request_queues[stream_index]
         while True:
-            item = await self._request_queue.get()
+            item = await request_queue.get()
             if item is None:
                 break
             request, translate_request_to_draft_vocab = item
@@ -1085,11 +1136,13 @@ class StreamingDraftForwardClient:
                 translate_to_draft_vocab=False,
             )
 
-    async def _run_stream(self):
-        self._ready.set()
+    async def _run_stream(self, stream_index: int):
+        self._ready_streams += 1
+        if self._ready_streams == self._num_streams:
+            self._ready.set()
         try:
-            proto_responses = self._async_client._stub.DraftForwardStream(
-                self._request_iterator()
+            proto_responses = self._async_clients[stream_index]._stub.DraftForwardStream(
+                self._request_iterator(stream_index)
             )
             async for proto_response in proto_responses:
                 response = draft_response_from_proto(proto_response)
@@ -1122,6 +1175,9 @@ class StreamingDraftForwardClient:
         for future in pending:
             future.set_exception(exc)
 
+    def _stream_index_for_request_id(self, request_id: str) -> int:
+        return zlib.crc32(request_id.encode("utf-8")) % self._num_streams
+
     def draft_forward(
         self,
         request: DraftForwardRequest,
@@ -1151,8 +1207,11 @@ class StreamingDraftForwardClient:
                 translate_response_to_target_vocab,
             )
 
+        stream_index = self._stream_index_for_request_id(request.request_id)
         enqueue = asyncio.run_coroutine_threadsafe(
-            self._request_queue.put((request, translate_request_to_draft_vocab)),
+            self._request_queues[stream_index].put(
+                (request, translate_request_to_draft_vocab)
+            ),
             self._loop,
         )
         try:
@@ -1173,16 +1232,19 @@ class StreamingDraftForwardClient:
         if self._closed.is_set():
             return
         self._closed.set()
-        asyncio.run_coroutine_threadsafe(self._request_queue.put(None), self._loop)
+        for request_queue in self._request_queues:
+            asyncio.run_coroutine_threadsafe(request_queue.put(None), self._loop)
+        for stream_task in self._stream_tasks:
+            try:
+                stream_task.result(timeout=5)
+            except Exception:
+                stream_task.cancel()
         try:
-            self._stream_task.result(timeout=5)
-        except Exception:
-            self._stream_task.cancel()
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._async_client.close(),
-                self._loop,
-            ).result(timeout=5)
+            for async_client in self._async_clients:
+                asyncio.run_coroutine_threadsafe(
+                    async_client.close(),
+                    self._loop,
+                ).result(timeout=5)
         finally:
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=5)

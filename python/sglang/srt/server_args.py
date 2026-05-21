@@ -539,6 +539,8 @@ class ServerArgs:
     draft_forward_grpc_certfile: Optional[str] = None
     draft_forward_grpc_keyfile: Optional[str] = None
     draft_forward_grpc_ca_certs: Optional[str] = None
+    draft_forward_grpc_num_streams: int = 4
+    draft_forward_grpc_max_message_bytes: int = 256 * 1024 * 1024
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -3872,6 +3874,12 @@ class ServerArgs:
             raise ValueError(
                 "--draft-forward-stream-batch-max-proposed-tokens must be positive."
             )
+        if self.draft_forward_grpc_num_streams <= 0:
+            raise ValueError("--draft-forward-grpc-num-streams must be positive.")
+        if self.draft_forward_grpc_max_message_bytes <= 0:
+            raise ValueError(
+                "--draft-forward-grpc-max-message-bytes must be positive."
+            )
 
     def _handle_load_format(self):
         if (
@@ -5854,6 +5862,27 @@ class ServerArgs:
             dest="draft_forward_grpc_ca_certs",
             default=ServerArgs.draft_forward_grpc_ca_certs,
             help="CA certificate bundle for DraftForward gRPC TLS/mTLS.",
+        )
+        parser.add_argument(
+            "--draft-forward-grpc-num-streams",
+            type=int,
+            dest="draft_forward_grpc_num_streams",
+            default=ServerArgs.draft_forward_grpc_num_streams,
+            help=(
+                "Target role only. Number of long-lived DraftForward streams to "
+                "open to the draft service. More than one stream reduces "
+                "head-of-line blocking under concurrent requests."
+            ),
+        )
+        parser.add_argument(
+            "--draft-forward-grpc-max-message-bytes",
+            type=int,
+            dest="draft_forward_grpc_max_message_bytes",
+            default=ServerArgs.draft_forward_grpc_max_message_bytes,
+            help=(
+                "Maximum DraftForward gRPC message size in bytes. This also "
+                "sets the client and server receive limits."
+            ),
         )
 
         # Speculative decoding (ngram)

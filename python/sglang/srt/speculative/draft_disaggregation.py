@@ -10,6 +10,7 @@ from typing import Awaitable, Callable
 
 from sglang.srt.managers.io_struct import DraftForwardReqInput
 from sglang.srt.speculative.draft_forward_grpc_transport import (
+    build_draft_forward_grpc_options,
     serve_draft_forward_service,
 )
 from sglang.srt.speculative.draft_forward_protocol import (
@@ -261,6 +262,9 @@ async def start_draft_forward_service(
         port=port,
         request_handler=handler,
         server_credentials=credentials,
+        options=build_draft_forward_grpc_options(
+            max_message_bytes=server_args.draft_forward_grpc_max_message_bytes,
+        ),
         stream_batch_window_s=getattr(
             server_args,
             "draft_forward_stream_batch_window_ms",

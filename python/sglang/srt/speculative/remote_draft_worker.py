@@ -32,6 +32,7 @@ from sglang.srt.speculative.draft_disaggregation import (
 )
 from sglang.srt.speculative.draft_forward_grpc_transport import (
     StreamingDraftForwardClient,
+    build_draft_forward_grpc_options,
 )
 from sglang.srt.speculative.draft_forward_protocol import (
     DraftForwardRequest,
@@ -159,6 +160,10 @@ class RemoteDraftWorker(EAGLEWorker):
             remote_draft_server_addr,
             translator=self.vocab_mapping,
             channel_credentials=build_draft_forward_channel_credentials(server_args),
+            options=build_draft_forward_grpc_options(
+                max_message_bytes=server_args.draft_forward_grpc_max_message_bytes,
+            ),
+            num_streams=server_args.draft_forward_grpc_num_streams,
         )
         logger.info(
             "RemoteDraftWorker initialized; DraftForward target=%s draft_tp_size=%d "

@@ -317,6 +317,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--draft-forward-grpc-certfile` | TLS certificate chain for the draft-side gRPC server. | `None` | Type: str |
 | `--draft-forward-grpc-keyfile` | Private key for the draft-side gRPC server. | `None` | Type: str |
 | `--draft-forward-grpc-ca-certs` | CA bundle used to verify the peer in TLS/mTLS mode. | `None` | Type: str |
+| `--draft-forward-grpc-num-streams` | Target-side number of long-lived DraftForward streams to open to the draft service. Additional streams reduce head-of-line blocking for concurrent requests. | `4` | Type: int |
+| `--draft-forward-grpc-max-message-bytes` | Maximum DraftForward gRPC message size in bytes. This configures both client and server send/receive limits. | `268435456` | Type: int |
 
 ## Multi-layer Eagle speculative decoding
 | Argument | Description | Defaults | Options |

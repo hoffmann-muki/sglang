@@ -65,6 +65,7 @@ class TestDraftDisaggregation(CustomTestCase):
             draft_forward_grpc_keyfile=None,
             draft_forward_grpc_certfile=None,
             draft_forward_grpc_ca_certs=None,
+            draft_forward_grpc_max_message_bytes=256 * 1024 * 1024,
         )
         args.update(kwargs)
         return SimpleNamespace(**args)

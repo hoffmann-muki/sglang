@@ -7,6 +7,8 @@ import torch
 
 from sglang.srt.speculative.draft_forward_grpc_transport import (
     DraftForwardServiceAdapter,
+    StreamingDraftForwardClient,
+    build_draft_forward_grpc_options,
     draft_request_from_proto,
     draft_request_to_proto,
     draft_response_from_proto,
@@ -317,6 +319,30 @@ class TestDraftForwardGrpcTransport(CustomTestCase):
         self.assertEqual(adapter.stream_batch_window_s, 0.0)
         self.assertEqual(adapter.stream_batch_max_requests, 1)
         self.assertEqual(adapter.stream_batch_max_proposed_tokens, 2)
+
+    def test_draft_forward_grpc_options_set_low_latency_transport_limits(self):
+        options = dict(build_draft_forward_grpc_options(max_message_bytes=1234))
+
+        self.assertEqual(options["grpc.max_send_message_length"], 1234)
+        self.assertEqual(options["grpc.max_receive_message_length"], 1234)
+        self.assertGreater(options["grpc.http2.initial_window_size"], 1024 * 1024)
+        self.assertGreater(
+            options["grpc.http2.initial_connection_window_size"],
+            options["grpc.http2.initial_window_size"],
+        )
+        self.assertEqual(options["grpc.keepalive_permit_without_calls"], 1)
+
+    def test_streaming_client_routes_requests_across_configured_streams(self):
+        client = StreamingDraftForwardClient.__new__(StreamingDraftForwardClient)
+        client._num_streams = 4
+
+        indices = {
+            client._stream_index_for_request_id(f"decode:req-{idx}")
+            for idx in range(16)
+        }
+
+        self.assertGreater(len(indices), 1)
+        self.assertTrue(all(0 <= index < client._num_streams for index in indices))
 
     def test_service_adapter_failure_raises(self):
         async def handler(_request):

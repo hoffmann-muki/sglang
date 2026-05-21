@@ -376,6 +376,7 @@ The low-latency default profile for TLI keeps batching effectively off unless yo
 - `--target-scheduler-batch-window-ms 0`
 - `--target-scheduler-batch-max-requests 1`
 - `--prefill-max-requests 1`
+- `--draft-forward-grpc-num-streams 4`
 
 This minimizes queueing and batching delay on both the draft and target sides, which is good for single-request latency and baseline comparisons. The tradeoff is lower batching efficiency and usually lower throughput under concurrency.
 
