@@ -633,9 +633,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_spec_draft_end_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
+        if self.spec_draft_start_time > 0.0:
+            self.draft_proposal_time += max(0.0, ts - self.spec_draft_start_time)
 
         stage = RequestStage.SPEC_DRAFT
         self.trace_slice(stage, self.spec_draft_start_time, ts)
+        self.spec_draft_start_time = 0.0
 
     def set_spec_verify_start_time(self, ts=None):
         if ts is None:

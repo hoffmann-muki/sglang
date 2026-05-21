@@ -49,6 +49,16 @@ class TestReqTimeStatsLatencyBreakdown(CustomTestCase):
 
         self.assertAlmostEqual(stats.target_verification_time, 0.7)
 
+    def test_spec_draft_timing_accumulates_without_tracing(self):
+        stats = SchedulerReqTimeStats()
+
+        stats.set_spec_draft_start_time(200.0)
+        stats.set_spec_draft_end_time(200.25)
+        stats.set_spec_draft_start_time(201.0)
+        stats.set_spec_draft_end_time(201.15)
+
+        self.assertAlmostEqual(stats.draft_proposal_time, 0.4)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
