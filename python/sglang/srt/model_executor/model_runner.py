@@ -273,6 +273,30 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+def synchronize_model_loading(elastic_ep_backend: str, tp_rank: int) -> None:
+    """Synchronize model loading without over-synchronizing single-rank drafts."""
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return
+
+    if elastic_ep_backend == "mooncake":
+        # Mooncake does not support `monitored_barrier`.
+        dist.barrier(group=tp_group.cpu_group)
+        return
+
+    # Handle the case where some ranks do not finish loading.
+    try:
+        dist.monitored_barrier(
+            group=tp_group.cpu_group,
+            timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+            wait_all_ranks=True,
+        )
+    except RuntimeError:
+        raise ValueError(
+            f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+        ) from None
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -1424,23 +1448,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
-            # Mooncake does not support `monitored_barrier`
-            dist.barrier(group=get_tp_group().cpu_group)
-        else:
-            # Handle the case where some ranks do not finish loading.
-            try:
-                dist.monitored_barrier(
-                    group=get_tp_group().cpu_group,
-                    timeout=datetime.timedelta(
-                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
-                    ),
-                    wait_all_ranks=True,
-                )
-            except RuntimeError:
-                raise ValueError(
-                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-                ) from None
+        synchronize_model_loading(self.server_args.elastic_ep_backend, self.tp_rank)
 
     def update_expert_location(
         self,
