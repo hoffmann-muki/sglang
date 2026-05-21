@@ -40,7 +40,7 @@ else:
 
 
 class SingleRankDraftGroup:
-    """Minimal GroupCoordinator-like object for root-only local draft workers."""
+    """Lightweight GroupCoordinator-compatible shim for a single-rank draft group."""
 
     def __init__(self, source_group: GroupCoordinator, *, rank: Optional[int] = None):
         self.rank = source_group.rank if rank is None else rank

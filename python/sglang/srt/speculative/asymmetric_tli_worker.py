@@ -7,6 +7,7 @@ import copy
 import logging
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class _BroadcastedVerifyInput:
+class _BroadcastedDraftPayload:
+    """Draft proposal payload shared from rank 0 to the target TP group."""
+
     ok: bool
     payload: Optional[dict] = None
     draft_proposal_time: float = 0.0
@@ -59,8 +62,8 @@ class AsymmetricTLIWorker(TLIWorker):
     """Run colocated TLI with a TP=1 draft on the target TP root rank.
 
     This follows vLLM's asymmetric TP shape: only the first target TP rank
-    participates in draft generation, while the remaining target ranks act as
-    dummy draft ranks and receive the root rank's verification payload.
+    participates in draft generation, while the remaining target ranks remain
+    passive draft participants and receive the root rank's verification payload.
     """
 
     def __init__(
@@ -89,11 +92,12 @@ class AsymmetricTLIWorker(TLIWorker):
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
         self._is_draft_rank = tp_rank == 0
-        self._draft_tp_group = SingleRankDraftGroup(target_worker.world_group)
+        self._target_model_runner = target_worker.model_runner
+        self._local_draft_tp_group = SingleRankDraftGroup(target_worker.world_group)
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        self.model_config = target_worker.model_runner.model_config
+        self.model_config = self._target_model_runner.model_config
         self.hot_token_id = None
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
@@ -107,13 +111,39 @@ class AsymmetricTLIWorker(TLIWorker):
                 attn_cp_rank=attn_cp_rank,
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
-                target_worker=target_worker,
             )
         else:
             logger.info(
-                "Asymmetric colocated TLI: target TP rank %s is a dummy draft rank.",
+                "Asymmetric colocated TLI: target TP rank %s is a passive draft participant.",
                 tp_rank,
             )
+
+    @property
+    def target_model_runner(self):
+        return self._target_model_runner
+
+    @property
+    def draft_model_runner(self):
+        if not self._is_draft_rank:
+            raise RuntimeError(
+                "Non-root target TP ranks do not own a local draft model runner."
+            )
+        return self._draft_model_runner
+
+    @property
+    def model_runner(self):
+        if self._is_draft_rank:
+            return self.draft_model_runner
+        return self.target_model_runner
+
+    @contextmanager
+    def _root_draft_context(self):
+        with (
+            single_rank_draft_context(self._local_draft_tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
 
     def _init_root_draft_model(
         self,
@@ -125,14 +155,13 @@ class AsymmetricTLIWorker(TLIWorker):
         attn_cp_rank: int,
         moe_dp_rank: int,
         nccl_port: int,
-        target_worker: TpModelWorker,
     ) -> None:
         draft_args = copy.copy(server_args)
         draft_args.tp_size = 1
         draft_args.ep_size = 1
         draft_args.enable_dp_attention = False
         draft_args.disable_cuda_graph = True
-        draft_args.context_length = target_worker.model_runner.model_config.context_len
+        draft_args.context_length = self.target_model_runner.model_config.context_len
 
         draft_model_config = ModelConfig.from_server_args(
             draft_args,
@@ -140,12 +169,8 @@ class AsymmetricTLIWorker(TLIWorker):
             model_revision=draft_args.speculative_draft_model_revision,
             is_draft_model=True,
         )
-        with (
-            single_rank_draft_context(self._draft_tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
-            self._model_runner = ModelRunner(
+        with self._root_draft_context():
+            self._draft_model_runner = ModelRunner(
                 model_config=draft_model_config,
                 mem_fraction_static=draft_args.mem_fraction_static,
                 gpu_id=gpu_id,
@@ -163,9 +188,9 @@ class AsymmetricTLIWorker(TLIWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
+                memory_pool_config=self.target_model_runner.memory_pool_config,
             )
-            self.model_config = self.draft_model_runner.model_config
+            self.model_config = self._draft_model_runner.model_config
 
             target_tokenizer = get_tokenizer(
                 server_args.tokenizer_path,
@@ -183,7 +208,6 @@ class AsymmetricTLIWorker(TLIWorker):
             self.vocab_mapping = self._create_vocab_mapping(
                 target_tokenizer=target_tokenizer,
                 draft_tokenizer=draft_tokenizer,
-                target_worker=target_worker,
             )
             self._try_prune_draft_lm_head(draft_args)
             self.init_attention_backend()
@@ -193,25 +217,25 @@ class AsymmetricTLIWorker(TLIWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
         logger.info(
-            "Asymmetric colocated TLI initialized: target_tp=%s draft_tp=1 draft_rank=0.",
+            "Asymmetric colocated TLI initialized: target_tp=%s, draft_tp=1, root_draft_rank=0.",
             server_args.tp_size,
         )
 
-    def _create_vocab_mapping(self, *, target_tokenizer, draft_tokenizer, target_worker):
+    def _create_vocab_mapping(self, *, target_tokenizer, draft_tokenizer):
         from sglang.srt.speculative.tli_token_translator import TLITokenTranslator
 
         return TLITokenTranslator(
             target_tokenizer=target_tokenizer,
             draft_tokenizer=draft_tokenizer,
-            target_vocab_size=target_worker.model_runner.model_config.vocab_size,
+            target_vocab_size=self.target_model_runner.model_config.vocab_size,
             draft_vocab_size=self.draft_model_runner.model_config.vocab_size,
             device=self.device,
         )
 
     def _broadcast_verify_payload(
         self,
-        payload: list[_BroadcastedVerifyInput],
-    ) -> _BroadcastedVerifyInput:
+        payload: list[_BroadcastedDraftPayload],
+    ) -> _BroadcastedDraftPayload:
         world_group = self.target_worker.world_group
         return broadcast_pyobj(
             payload,
@@ -261,23 +285,19 @@ class AsymmetricTLIWorker(TLIWorker):
     def _draft_on_root(self, batch) -> tuple[EagleVerifyInput, float]:
         if not self._is_draft_rank:
             raise RuntimeError("Only the root draft rank can generate TLI proposals.")
-        with (
-            single_rank_draft_context(self._draft_tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+        with self._root_draft_context():
             start_time = time.perf_counter()
             spec_info = self.draft(batch)
             draft_proposal_time = time.perf_counter() - start_time
         return spec_info, draft_proposal_time
 
     def _broadcast_draft(self, batch) -> tuple[EagleVerifyInput, float]:
-        payload: list[_BroadcastedVerifyInput]
+        payload: list[_BroadcastedDraftPayload]
         if self._is_draft_rank:
             try:
                 spec_info, draft_proposal_time = self._draft_on_root(batch)
                 payload = [
-                    _BroadcastedVerifyInput(
+                    _BroadcastedDraftPayload(
                         ok=True,
                         payload=self._serialize_verify_input(spec_info),
                         draft_proposal_time=draft_proposal_time,
@@ -286,7 +306,7 @@ class AsymmetricTLIWorker(TLIWorker):
             except Exception:
                 logger.exception("Asymmetric colocated TLI draft failed on root rank.")
                 payload = [
-                    _BroadcastedVerifyInput(
+                    _BroadcastedDraftPayload(
                         ok=False,
                         error=traceback.format_exc(),
                     )
@@ -310,11 +330,7 @@ class AsymmetricTLIWorker(TLIWorker):
     def _forward_draft_extend_on_root(self, batch, *args, **kwargs) -> float:
         if not self._is_draft_rank:
             return 0.0
-        with (
-            single_rank_draft_context(self._draft_tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+        with self._root_draft_context():
             start_time = time.perf_counter()
             self.forward_draft_extend(batch, *args, **kwargs)
             return time.perf_counter() - start_time
@@ -322,14 +338,25 @@ class AsymmetricTLIWorker(TLIWorker):
     def _forward_draft_extend_after_decode_on_root(self, batch) -> float:
         if not self._is_draft_rank:
             return 0.0
-        with (
-            single_rank_draft_context(self._draft_tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
+        with self._root_draft_context():
             start_time = time.perf_counter()
             self.forward_draft_extend_after_decode(batch)
             return time.perf_counter() - start_time
+
+    @staticmethod
+    def _observe_draft_timing(
+        reqs,
+        *,
+        draft_proposal_time: float,
+        grpc_communication_time: float = 0.0,
+        draft_queue_scheduling_time: float = 0.0,
+    ) -> None:
+        for req in reqs:
+            req.time_stats.observe_draft_rpc_timing(
+                grpc_communication_time=grpc_communication_time,
+                draft_queue_scheduling_time=draft_queue_scheduling_time,
+                draft_proposal_time=draft_proposal_time,
+            )
 
     def forward_batch_generation(self, batch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -346,12 +373,10 @@ class AsymmetricTLIWorker(TLIWorker):
                 seq_lens_cpu,
                 logits_output.mm_input_embeds,
             )
-            for req in batch.reqs:
-                req.time_stats.observe_draft_rpc_timing(
-                    grpc_communication_time=0.0,
-                    draft_queue_scheduling_time=0.0,
-                    draft_proposal_time=draft_proposal_time,
-                )
+            self._observe_draft_timing(
+                batch.reqs,
+                draft_proposal_time=draft_proposal_time,
+            )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -362,12 +387,10 @@ class AsymmetricTLIWorker(TLIWorker):
         set_time_batch(batch.reqs, "set_spec_draft_start_time")
         spec_info, draft_proposal_time = self._broadcast_draft(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time")
-        for req in batch.reqs:
-            req.time_stats.observe_draft_rpc_timing(
-                grpc_communication_time=0.0,
-                draft_queue_scheduling_time=0.0,
-                draft_proposal_time=draft_proposal_time,
-            )
+        self._observe_draft_timing(
+            batch.reqs,
+            draft_proposal_time=draft_proposal_time,
+        )
 
         set_time_batch(batch.reqs, "set_spec_verify_start_time")
         logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
@@ -382,12 +405,10 @@ class AsymmetricTLIWorker(TLIWorker):
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
         if batch.spec_info.verified_id.shape[0] > 0:
             draft_extend_time = self._forward_draft_extend_after_decode_on_root(batch)
-            for req in batch.reqs:
-                req.time_stats.observe_draft_rpc_timing(
-                    grpc_communication_time=0.0,
-                    draft_queue_scheduling_time=0.0,
-                    draft_proposal_time=draft_extend_time,
-                )
+            self._observe_draft_timing(
+                batch.reqs,
+                draft_proposal_time=draft_extend_time,
+            )
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(

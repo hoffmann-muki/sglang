@@ -1076,6 +1076,15 @@ class Scheduler(
         )
 
         if (
+            self.spec_algorithm.is_tli()
+            and self.server_args.draft_disaggregation_role == "none"
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        ):
+            # Colocated asymmetric TLI keeps draft execution local to the
+            # worker, so the draft-forward disaggregation wiring is not needed.
+            return
+
+        if (
             self.draft_worker is None
             or self.spec_algorithm.is_ngram()
             or (
