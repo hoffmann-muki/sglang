@@ -288,6 +288,144 @@ class TestTliServerArgs(unittest.TestCase):
                 self.assertIn(expected_message, str(context.exception))
 
 
+class TestCoDraftServerArgs(unittest.TestCase):
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_defaults_to_asymmetric_ar_and_dllm_tp_one(
+        self, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="target-model",
+            speculative_algorithm="CO_DRAFT",
+            speculative_draft_model_path="ar-draft-model",
+            codraft_dllm_draft_model_path="dllm-draft-model",
+            codraft_dllm_algorithm="LowConfidence",
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+
+        self.assertEqual(server_args.speculative_draft_tp_size, 1)
+        self.assertEqual(server_args.codraft_dllm_draft_tp_size, 1)
+        self.assertEqual(server_args.remote_draft_tokenizer_path, "ar-draft-model")
+        self.assertEqual(server_args.codraft_dllm_tokenizer_path, "dllm-draft-model")
+
+        worker_cls = SpeculativeAlgorithm.CO_DRAFT.create_worker(server_args)
+        self.assertEqual(worker_cls.__name__, "CoDraftWorker")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_accepts_symmetric_dllm_draft_tp(
+        self, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="target-model",
+            speculative_algorithm="CO_DRAFT",
+            speculative_draft_model_path="ar-draft-model",
+            codraft_dllm_draft_model_path="dllm-draft-model",
+            codraft_dllm_algorithm="LowConfidence",
+            codraft_dllm_draft_tp_size=4,
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+
+        self.assertEqual(server_args.codraft_dllm_draft_tp_size, 4)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_accepts_symmetric_ar_draft_tp(self, _mock_resolve):
+        server_args = ServerArgs(
+            model_path="target-model",
+            speculative_algorithm="CO_DRAFT",
+            speculative_draft_model_path="ar-draft-model",
+            speculative_draft_tp_size=4,
+            codraft_dllm_draft_model_path="dllm-draft-model",
+            codraft_dllm_algorithm="LowConfidence",
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+
+        self.assertEqual(server_args.speculative_draft_tp_size, 4)
+        worker_cls = SpeculativeAlgorithm.CO_DRAFT.create_worker(server_args)
+        self.assertEqual(worker_cls.__name__, "SymmetricCoDraftWorker")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_rejects_intermediate_dllm_tp_size(
+        self, _mock_resolve
+    ):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="target-model",
+                speculative_algorithm="CO_DRAFT",
+                speculative_draft_model_path="ar-draft-model",
+                codraft_dllm_draft_model_path="dllm-draft-model",
+                codraft_dllm_algorithm="LowConfidence",
+                codraft_dllm_draft_tp_size=2,
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+                tp_size=4,
+            )
+
+        self.assertIn("codraft-dllm-draft-tp-size", str(context.exception))
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_rejects_global_dllm_algorithm(self, _mock_resolve):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="target-model",
+                speculative_algorithm="CO_DRAFT",
+                speculative_draft_model_path="ar-draft-model",
+                codraft_dllm_draft_model_path="dllm-draft-model",
+                codraft_dllm_algorithm="LowConfidence",
+                dllm_algorithm="LowConfidence",
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+                tp_size=4,
+            )
+
+        self.assertIn("codraft-dllm-algorithm", str(context.exception))
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_rejects_unimplemented_strategy(self, _mock_resolve):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="target-model",
+                speculative_algorithm="CO_DRAFT",
+                speculative_draft_model_path="ar-draft-model",
+                codraft_strategy="dllm_only",
+                codraft_dllm_draft_model_path="dllm-draft-model",
+                codraft_dllm_algorithm="LowConfidence",
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+                tp_size=4,
+            )
+
+        self.assertIn("strategy adapters are not implemented", str(context.exception))
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

@@ -20,6 +20,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     TLI = auto()
+    CO_DRAFT = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -52,7 +53,10 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.STANDALONE
 
     def is_tli(self) -> bool:
-        return self == SpeculativeAlgorithm.TLI
+        return self in (SpeculativeAlgorithm.TLI, SpeculativeAlgorithm.CO_DRAFT)
+
+    def is_co_draft(self) -> bool:
+        return self == SpeculativeAlgorithm.CO_DRAFT
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
@@ -116,9 +120,19 @@ class SpeculativeAlgorithm(Enum):
         elif self.is_tli():
             if enable_overlap:
                 raise ValueError(
-                    "TLI speculative decoding does not support overlap scheduling yet. "
+                    f"{self.name} speculative decoding does not support overlap scheduling yet. "
                     "Disable overlap with --disable-overlap-schedule."
                 )
+
+            if self.is_co_draft():
+                from sglang.srt.speculative.co_draft.worker import (
+                    CoDraftWorker,
+                    SymmetricCoDraftWorker,
+                )
+
+                if server_args.speculative_draft_tp_size == server_args.tp_size:
+                    return SymmetricCoDraftWorker
+                return CoDraftWorker
 
             if server_args.draft_disaggregation_role == "target":
                 from sglang.srt.speculative.remote_draft_worker import RemoteDraftWorker

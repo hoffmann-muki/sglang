@@ -43,6 +43,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
 | STANDALONE | Smaller draft LLM (token-level, same vocabulary) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
 | TLI | Smaller draft LLM with heterogeneous vocabulary | Yes | Colocated: `--speculative-algorithm TLI` + `--speculative-draft-model-path ...`; Disaggregated: `--speculative-algorithm TLI` + `--remote-draft-tokenizer-path ...` | Lossless; requires overlap; does **not** support `--enable-dp-attention` |
+| CO_DRAFT | Colocated AR draft plus colocated dLLM draft | Yes | `--speculative-algorithm CO_DRAFT` + `--speculative-draft-model-path ...` + `--codraft-dllm-draft-model-path ...` | Experimental infrastructure. The initial executable strategy is `ar_only`; dLLM strategy adapters are intentionally separate. |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
 
@@ -380,6 +381,31 @@ The low-latency default profile for TLI keeps batching effectively off unless yo
 
 This minimizes queueing and batching delay on both the draft and target sides, which is good for single-request latency and baseline comparisons. The tradeoff is lower batching efficiency and usually lower throughput under concurrency.
 
+### Colocated AR+dLLM Co-Draft Infrastructure
+
+CO_DRAFT is an experimental colocated mode for testing one autoregressive draft executor and one diffusion-LLM draft executor against a single target model. It uses the existing colocated TLI verification path for the AR draft and reserves typed dLLM executor and AR/dLLM bridge contracts with independent TP plans.
+
+The first executable strategy is `ar_only`. Other `--codraft-strategy` values are reserved as stable configuration names for follow-on strategy adapters and fail fast until those adapters are implemented.
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --tp 4 \
+    --speculative-algorithm CO_DRAFT \
+    --speculative-draft-model-path Qwen/Qwen2.5-0.5B-Instruct \
+    --speculative-draft-tp-size 1 \
+    --codraft-dllm-draft-model-path JetLM/SDAR-8B-Chat \
+    --codraft-dllm-draft-tp-size 1 \
+    --codraft-dllm-algorithm LowConfidence \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5
+```
+
+CO_DRAFT keeps the target worker in autoregressive verification mode. Do not set the global `--dllm-algorithm` flags with CO_DRAFT; use `--codraft-dllm-algorithm` and `--codraft-dllm-algorithm-config` for the dLLM draft descriptor. Both local drafts currently support only two TP shapes: asymmetric TP=1 or symmetric TP=target `--tp`.
+
+The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
+
 ### Draft-forward target/draft disaggregation
 
 ### Constraints
@@ -539,9 +565,9 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `TLI`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
+| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `TLI`, `CO_DRAFT`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
 | `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights for colocated TLI and other draft-model speculative modes |
-| `--speculative-draft-tp-size` | `int` | `None` | Colocated TLI draft TP size. Supports `1` or the target `--tp` size. |
+| `--speculative-draft-tp-size` | `int` | `None` | Colocated TLI/CO_DRAFT AR draft TP size. Supports `1` or the target `--tp` size. |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |
 | `--speculative-num-steps` | `int` | `None` (auto-chosen when omitted) | Autoregressive drafting depth |

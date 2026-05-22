@@ -522,6 +522,12 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    codraft_strategy: str = "ar_only"
+    codraft_dllm_draft_model_path: Optional[str] = None
+    codraft_dllm_tokenizer_path: Optional[str] = None
+    codraft_dllm_draft_tp_size: Optional[int] = None
+    codraft_dllm_algorithm: Optional[str] = None
+    codraft_dllm_algorithm_config: Optional[str] = None
     draft_disaggregation_role: Literal["none", "target", "draft"] = "none"
     remote_draft_server_addr: Optional[str] = None
     remote_draft_tokenizer_path: Optional[str] = None
@@ -1485,7 +1491,7 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm in ("STANDALONE", "TLI"):
+                if self.speculative_algorithm in ("STANDALONE", "TLI", "CO_DRAFT"):
                     # standalone / TLI draft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
@@ -3591,38 +3597,51 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-        if self.speculative_algorithm == "TLI":
+        if self.speculative_algorithm in ("TLI", "CO_DRAFT"):
             if self.enable_dp_attention:
                 raise ValueError(
-                    "TLI speculative decoding does not support dp attention."
+                    f"{self.speculative_algorithm} speculative decoding does not "
+                    "support dp attention."
                 )
 
-            colocated_tli = self.draft_disaggregation_role == "none"
-            if colocated_tli:
+            colocated_draft = self.draft_disaggregation_role == "none"
+            if colocated_draft:
                 if self.speculative_draft_model_path is None:
                     raise ValueError(
-                        "TLI colocated setup requires --speculative-draft-model-path "
+                        f"{self.speculative_algorithm} colocated setup requires "
+                        "--speculative-draft-model-path "
                         "to load the local draft model."
                     )
                 if self.remote_draft_tokenizer_path is not None:
                     raise ValueError(
-                        "TLI colocated setup does not use --remote-draft-tokenizer-path. "
+                        f"{self.speculative_algorithm} colocated setup does not use "
+                        "--remote-draft-tokenizer-path. "
                         "Use --speculative-draft-model-path for the draft model."
                     )
                 self.remote_draft_tokenizer_path = self.speculative_draft_model_path
                 logger.warning(
-                    "TLI colocated mode derives the draft tokenizer path from "
-                    "--speculative-draft-model-path."
+                    "%s colocated mode derives the draft tokenizer path from "
+                    "--speculative-draft-model-path.",
+                    self.speculative_algorithm,
                 )
                 if self.speculative_draft_tp_size is None:
-                    self.speculative_draft_tp_size = self.tp_size
+                    self.speculative_draft_tp_size = (
+                        1 if self.speculative_algorithm == "CO_DRAFT" else self.tp_size
+                    )
                 elif self.speculative_draft_tp_size not in (1, self.tp_size):
                     raise ValueError(
                         "--speculative-draft-tp-size currently supports either 1 "
-                        "for vLLM-style asymmetric colocated TLI or the target "
-                        "--tp size for the existing symmetric colocated path."
+                        "for vLLM-style asymmetric colocated drafting or the target "
+                        "--tp size for symmetric colocated drafting."
                     )
+                if self.speculative_algorithm == "CO_DRAFT":
+                    self._handle_codraft_args()
             else:
+                if self.speculative_algorithm == "CO_DRAFT":
+                    raise ValueError(
+                        "CO_DRAFT currently supports colocated drafting only; "
+                        "use --draft-disaggregation-role none."
+                    )
                 if self.speculative_draft_tp_size is not None:
                     raise ValueError(
                         "--speculative-draft-tp-size is only valid for colocated TLI. "
@@ -3637,21 +3656,24 @@ class ServerArgs:
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
-                    "Max running requests is reset to 48 for TLI speculative decoding. "
-                    "You can override this by explicitly setting --max-running-requests."
+                    "Max running requests is reset to 48 for %s speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests.",
+                    self.speculative_algorithm,
                 )
 
             self.disable_overlap_schedule = True
             logger.warning(
-                "Overlap scheduler is disabled when using TLI speculative decoding "
-                "(spec v2 is not supported yet)."
+                "Overlap scheduler is disabled when using %s speculative decoding "
+                "(spec v2 is not supported yet).",
+                self.speculative_algorithm,
             )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using "
-                    "TLI speculative decoding."
+                    "%s speculative decoding.",
+                    self.speculative_algorithm,
                 )
 
             if self.speculative_num_steps is None:
@@ -3670,20 +3692,22 @@ class ServerArgs:
                 and self.speculative_eagle_topk != 1
             ):
                 raise ValueError(
-                    "TLI speculative decoding only supports speculative_eagle_topk == 1."
+                    f"{self.speculative_algorithm} speculative decoding only supports "
+                    "speculative_eagle_topk == 1."
                 )
             self.speculative_eagle_topk = 1
 
             if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
                 logger.warning(
                     "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
-                    "for TLI speculative decoding."
+                    "for %s speculative decoding.",
+                    self.speculative_algorithm,
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
         elif self.speculative_draft_tp_size is not None:
             raise ValueError(
                 "--speculative-draft-tp-size is currently only supported for "
-                "TLI speculative decoding."
+                "TLI and CO_DRAFT speculative decoding."
             )
 
         if self.speculative_adaptive:
@@ -3879,6 +3903,55 @@ class ServerArgs:
         if self.draft_forward_grpc_max_message_bytes <= 0:
             raise ValueError(
                 "--draft-forward-grpc-max-message-bytes must be positive."
+            )
+
+    def _handle_codraft_args(self):
+        valid_strategies = {
+            "ar_only",
+            "dllm_only",
+            "winner_take_all",
+            "agreement_gate",
+            "mixed_tree",
+            "ar_qualifier",
+        }
+        if self.codraft_strategy not in valid_strategies:
+            raise ValueError(
+                f"--codraft-strategy must be one of {sorted(valid_strategies)}."
+            )
+        if self.codraft_strategy != "ar_only":
+            raise ValueError(
+                "CO_DRAFT strategy adapters are not implemented yet. "
+                "Use --codraft-strategy ar_only for the initial executable path."
+            )
+        if self.draft_disaggregation_role != "none":
+            raise ValueError(
+                "CO_DRAFT currently requires --draft-disaggregation-role none."
+            )
+        if self.dllm_algorithm is not None or self.dllm_algorithm_config is not None:
+            raise ValueError(
+                "CO_DRAFT uses --codraft-dllm-algorithm and "
+                "--codraft-dllm-algorithm-config for the dLLM draft. Do not set "
+                "the global --dllm-algorithm flags, which apply to the target worker."
+            )
+        if self.speculative_draft_tp_size not in (1, self.tp_size):
+            raise ValueError(
+                "CO_DRAFT currently supports --speculative-draft-tp-size 1 or "
+                "the target --tp size for the AR draft executor."
+            )
+        if self.codraft_dllm_draft_model_path is None:
+            raise ValueError(
+                "CO_DRAFT requires --codraft-dllm-draft-model-path for the dLLM draft."
+            )
+        if self.codraft_dllm_tokenizer_path is None:
+            self.codraft_dllm_tokenizer_path = self.codraft_dllm_draft_model_path
+        if self.codraft_dllm_algorithm is None:
+            raise ValueError("CO_DRAFT requires --codraft-dllm-algorithm.")
+        if self.codraft_dllm_draft_tp_size is None:
+            self.codraft_dllm_draft_tp_size = 1
+        if self.codraft_dllm_draft_tp_size not in (1, self.tp_size):
+            raise ValueError(
+                "CO_DRAFT currently supports --codraft-dllm-draft-tp-size 1 or "
+                "the target --tp size for the dLLM draft executor."
             )
 
     def _handle_load_format(self):
@@ -5610,6 +5683,7 @@ class ServerArgs:
                 "NEXTN",
                 "STANDALONE",
                 "TLI",
+                "CO_DRAFT",
                 "NGRAM",
             ],
             help="Speculative algorithm.",
@@ -5732,6 +5806,60 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--codraft-strategy",
+            type=str,
+            choices=[
+                "ar_only",
+                "dllm_only",
+                "winner_take_all",
+                "agreement_gate",
+                "mixed_tree",
+                "ar_qualifier",
+            ],
+            default=ServerArgs.codraft_strategy,
+            help=(
+                "CO_DRAFT only. Strategy for combining colocated AR and dLLM "
+                "draft executors. The initial executable path is ar_only; "
+                "other choices are reserved and fail fast until implemented."
+            ),
+        )
+        parser.add_argument(
+            "--codraft-dllm-draft-model-path",
+            type=str,
+            default=ServerArgs.codraft_dllm_draft_model_path,
+            help="CO_DRAFT only. Model path for the colocated dLLM draft executor.",
+        )
+        parser.add_argument(
+            "--codraft-dllm-tokenizer-path",
+            type=str,
+            default=ServerArgs.codraft_dllm_tokenizer_path,
+            help=(
+                "CO_DRAFT only. Tokenizer path for the dLLM draft model. "
+                "Defaults to --codraft-dllm-draft-model-path."
+            ),
+        )
+        parser.add_argument(
+            "--codraft-dllm-draft-tp-size",
+            type=int,
+            default=ServerArgs.codraft_dllm_draft_tp_size,
+            help=(
+                "CO_DRAFT only. Tensor-parallel size for the colocated dLLM "
+                "draft executor. Supports 1 or the target --tp size."
+            ),
+        )
+        parser.add_argument(
+            "--codraft-dllm-algorithm",
+            type=str,
+            default=ServerArgs.codraft_dllm_algorithm,
+            help="CO_DRAFT only. dLLM draft algorithm, such as LowConfidence.",
+        )
+        parser.add_argument(
+            "--codraft-dllm-algorithm-config",
+            type=str,
+            default=ServerArgs.codraft_dllm_algorithm_config,
+            help="CO_DRAFT only. YAML config path for the dLLM draft algorithm.",
         )
         parser.add_argument(
             "--draft-disaggregation-role",
@@ -7846,7 +7974,7 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm in ("STANDALONE", "TLI"):
+    if self.speculative_algorithm in ("STANDALONE", "TLI", "CO_DRAFT"):
         # The default value for standalone / TLI speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:

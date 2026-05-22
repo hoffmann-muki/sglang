@@ -276,9 +276,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--speculative-algorithm` | Speculative algorithm. | `None` | `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `TLI`, `NGRAM` |
+| `--speculative-algorithm` | Speculative algorithm. | `None` | `EAGLE`, `EAGLE3`, `NEXTN`, `STANDALONE`, `TLI`, `CO_DRAFT`, `NGRAM` |
 | `--speculative-draft-model-path`<br>`--speculative-draft-model` | The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. | `None` | Type: str |
-| `--speculative-draft-tp-size` | Colocated TLI only. Tensor-parallel size for the local draft model. Use `1` for vLLM-style asymmetric colocated TLI, or omit/set to the target `--tp` size for the existing symmetric colocated path. For disaggregated TLI, use `--remote-draft-tp-size`. | `None` | Type: int |
+| `--speculative-draft-tp-size` | Colocated TLI/CO_DRAFT only. Tensor-parallel size for the local AR draft model. Use `1` for vLLM-style asymmetric colocated drafting, or omit/set to the target `--tp` size for symmetric colocated drafting. For disaggregated TLI, use `--remote-draft-tp-size`. | `None` | Type: int |
 | `--speculative-draft-model-revision` | The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
 | `--speculative-draft-load-format` | The format of the draft model weights to load. If not specified, will use the same format as --load-format. Use 'dummy' to initialize draft model weights with random values for profiling. | `None` | Same as --load-format options |
 | `--speculative-num-steps` | The number of steps sampled from draft model in Speculative Decoding. | `None` | Type: int |
@@ -292,6 +292,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-moe-runner-backend` | MOE backend for EAGLE speculative decoding, see --moe-runner-backend for options. Same as moe runner backend if unset. | `None` | Same as --moe-runner-backend options |
 | `--speculative-moe-a2a-backend` | MOE A2A backend for EAGLE speculative decoding, see --moe-a2a-backend for options. Same as moe a2a backend if unset. | `None` | Same as --moe-a2a-backend options |
 | `--speculative-draft-model-quantization` | The quantization method for speculative model. | `None` | Same as --quantization options |
+| `--codraft-strategy` | CO_DRAFT only. Strategy name for combining the colocated AR and dLLM draft executors. The initial executable path is `ar_only`; other strategy names are reserved and fail fast until their adapters are implemented. | `ar_only` | `ar_only`, `dllm_only`, `winner_take_all`, `agreement_gate`, `mixed_tree`, `ar_qualifier` |
+| `--codraft-dllm-draft-model-path` | CO_DRAFT only. Model path for the colocated dLLM draft executor. | `None` | Type: str |
+| `--codraft-dllm-tokenizer-path` | CO_DRAFT only. Tokenizer path for the dLLM draft model. Defaults to `--codraft-dllm-draft-model-path`. | `None` | Type: str |
+| `--codraft-dllm-draft-tp-size` | CO_DRAFT only. Tensor-parallel size for the colocated dLLM draft executor. Supports `1` for asymmetric drafting or target `--tp` for symmetric drafting. | `None` | Type: int |
+| `--codraft-dllm-algorithm` | CO_DRAFT only. dLLM draft algorithm, such as `LowConfidence`. | `None` | Type: str |
+| `--codraft-dllm-algorithm-config` | CO_DRAFT only. YAML config path for the dLLM draft algorithm. | `None` | Type: str |
 
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |
