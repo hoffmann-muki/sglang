@@ -24,6 +24,63 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _compute_default_rope_parameters(
+    config: Any = None,
+    device: Optional[torch.device] = None,
+    seq_len: Optional[int] = None,
+) -> tuple[torch.Tensor, float]:
+    """Compute standard RoPE parameters for the Fast_dLLM_v2 compatibility shim."""
+
+    del seq_len
+    if config is None:
+        raise ValueError("Fast_dLLM_v2 default RoPE shim requires a config.")
+
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    rope_theta = rope_parameters.get(
+        "rope_theta", getattr(config, "rope_theta", 10000.0)
+    )
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(config, "hidden_size", None)
+        num_attention_heads = getattr(config, "num_attention_heads", None)
+        if hidden_size is None or num_attention_heads in (None, 0):
+            raise ValueError(
+                "Fast_dLLM_v2 default RoPE shim requires hidden_size and "
+                "num_attention_heads when head_dim is not available."
+            )
+        head_dim = hidden_size // num_attention_heads
+
+    partial_rotary_factor = rope_parameters.get(
+        "partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0)
+    )
+    rotary_dim = int(head_dim * partial_rotary_factor)
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float, device=device)
+            / rotary_dim
+        )
+    )
+    return inv_freq, 1.0
+
+
+def _ensure_transformers_default_rope_support() -> None:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    if "default" in ROPE_INIT_FUNCTIONS:
+        return
+
+    # Fast_dLLM_v2 checkpoints use standard Qwen2.5-style RoPE when no
+    # scaling override is present. Some Transformers releases expose that path
+    # as a registered "default" rope_type and others compute it inline, so we
+    # register a local compatibility alias when needed.
+    ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+    logger.warning(
+        "Registered a local Transformers RoPE compatibility shim for the "
+        "'default' rope_type."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FastDllmV2RunnerConfig:
     """Runtime configuration for an independent Fast_dLLM_v2 draft runner."""
@@ -153,6 +210,8 @@ class TransformersFastDllmV2Runtime:
     def _ensure_loaded(self, config: FastDllmV2RunnerConfig) -> None:
         if self.model is not None:
             return
+
+        _ensure_transformers_default_rope_support()
 
         has_accelerate = self._has_accelerate()
         device_map = config.device_map if has_accelerate else None

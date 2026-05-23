@@ -16,6 +16,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2ProposalRunner,
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
+    _ensure_transformers_default_rope_support,
 )
 from sglang.srt.speculative.linear_verify import (
     LinearDraftBlock,
@@ -452,6 +453,32 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             transformer_runtime._load_model.call_args.kwargs["device_map"],
             None,
         )
+
+    def test_default_rope_shim_registers_missing_default_key(self):
+        import torch
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        from unittest.mock import MagicMock
+
+        sentinel = ROPE_INIT_FUNCTIONS.pop("default", None)
+        try:
+            _ensure_transformers_default_rope_support()
+
+            self.assertIn("default", ROPE_INIT_FUNCTIONS)
+            inv_freq, attention_factor = ROPE_INIT_FUNCTIONS["default"](
+                MagicMock(
+                    hidden_size=8,
+                    num_attention_heads=2,
+                    rope_theta=10000.0,
+                ),
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(attention_factor, 1.0)
+            self.assertEqual(inv_freq.numel(), 2)
+        finally:
+            if sentinel is not None:
+                ROPE_INIT_FUNCTIONS["default"] = sentinel
+            else:
+                ROPE_INIT_FUNCTIONS.pop("default", None)
 
 
 class TestLinearVerifyHelpers(unittest.TestCase):
