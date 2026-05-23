@@ -127,6 +127,7 @@ class FastDllmV2RunnerConfig:
     model_path: str
     tokenizer_path: str
     proposed_token_num: int
+    block_size: int = 32
     small_block_size: int = 8
     threshold: float = 0.9
     torch_dtype: str = "auto"
@@ -144,6 +145,7 @@ class FastDllmV2RunnerConfig:
             model_path=executor.model_path,
             tokenizer_path=executor.tokenizer_path,
             proposed_token_num=executor.verification_plan.proposed_token_num,
+            block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
@@ -225,6 +227,7 @@ class TransformersFastDllmV2Runtime:
             metadata={
                 "runner": "fast_dllm_v2",
                 "runtime": "transformers",
+                "block_size": config.block_size,
                 "small_block_size": config.small_block_size,
                 "threshold": config.threshold,
             },
@@ -313,10 +316,16 @@ class TransformersFastDllmV2Runtime:
         assert self.tokenizer is not None
         device = self.model.device
         prompt = torch.tensor([input_ids], dtype=torch.long, device=device)
+        internal_max_new_tokens = _fast_dllm_v2_internal_generation_budget(
+            prompt.shape[1],
+            config.proposed_token_num,
+            config.block_size,
+        )
         output = self.model.generate(
             prompt,
             tokenizer=self.tokenizer,
-            max_new_tokens=config.proposed_token_num,
+            max_new_tokens=internal_max_new_tokens,
+            block_size=config.block_size,
             small_block_size=config.small_block_size,
             threshold=config.threshold,
             **config.generation_kwargs,
@@ -406,3 +415,24 @@ def _load_algorithm_config(config_path: Optional[str]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("Fast_dLLM_v2 algorithm config must be a mapping.")
     return raw
+
+
+def _fast_dllm_v2_internal_generation_budget(
+    prompt_len: int,
+    proposed_token_num: int,
+    block_size: int,
+) -> int:
+    """Return the block-aligned budget Fast_dLLM_v2 needs for a short proposal."""
+
+    if block_size <= 0:
+        raise ValueError("Fast_dLLM_v2 block_size must be positive.")
+    if proposed_token_num <= 0:
+        raise ValueError("Fast_dLLM_v2 proposed_token_num must be positive.")
+
+    remainder = prompt_len % block_size
+    first_block_tokens = block_size + 1 if remainder == 0 else block_size - remainder + 1
+    blocks = 1
+    if proposed_token_num > first_block_tokens:
+        remaining = proposed_token_num - first_block_tokens
+        blocks += (remaining + block_size - 1) // block_size
+    return blocks * block_size

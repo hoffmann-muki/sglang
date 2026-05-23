@@ -17,6 +17,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2ProposalRunner,
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
+    _fast_dllm_v2_internal_generation_budget,
     _ensure_transformers_default_rope_support,
     _ensure_transformers_tied_weights_support,
 )
@@ -310,6 +311,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             config_file.write(
                 "\n".join(
                     [
+                        "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.75",
                         "device_map: cuda:0",
@@ -340,10 +342,37 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.model_path, "fast-dllm")
         self.assertEqual(config.tokenizer_path, "fast-dllm-tokenizer")
         self.assertEqual(config.proposed_token_num, 3)
+        self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.75)
         self.assertEqual(config.device_map, "cuda:0")
         self.assertEqual(config.generation_kwargs, {"do_sample": False})
+
+    def test_internal_generation_budget_is_block_aligned(self):
+        self.assertEqual(
+            _fast_dllm_v2_internal_generation_budget(
+                prompt_len=29,
+                proposed_token_num=2,
+                block_size=32,
+            ),
+            32,
+        )
+        self.assertEqual(
+            _fast_dllm_v2_internal_generation_budget(
+                prompt_len=27,
+                proposed_token_num=8,
+                block_size=32,
+            ),
+            64,
+        )
+        self.assertEqual(
+            _fast_dllm_v2_internal_generation_budget(
+                prompt_len=32,
+                proposed_token_num=8,
+                block_size=32,
+            ),
+            32,
+        )
 
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch
