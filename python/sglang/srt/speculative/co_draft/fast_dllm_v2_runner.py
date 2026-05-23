@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -121,6 +120,58 @@ def _ensure_transformers_tied_weights_support() -> None:
     )
 
 
+def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    if lhs.device.type == "meta" or rhs.device.type == "meta":
+        return False
+    return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+
+
+def _ensure_fast_dllm_v2_tied_embeddings(model: Any) -> bool:
+    """Faithfully enforce Fast_dLLM_v2's tied embedding/LM-head contract."""
+
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "Fast_dLLM_Qwen":
+        return False
+    if not getattr(config, "tie_word_embeddings", False):
+        return False
+
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    if input_embeddings is None or output_embeddings is None:
+        raise ValueError("Fast_dLLM_v2 requires input and output embeddings.")
+
+    input_weight = getattr(input_embeddings, "weight", None)
+    output_weight = getattr(output_embeddings, "weight", None)
+    if input_weight is None or output_weight is None:
+        raise ValueError("Fast_dLLM_v2 embeddings must expose weight tensors.")
+
+    if _tensors_share_storage(input_weight, output_weight):
+        return False
+
+    tie_weights = getattr(model, "tie_weights", None)
+    if callable(tie_weights):
+        try:
+            tie_weights()
+        except TypeError:
+            tie_weights(recompute_mapping=True)
+
+    output_embeddings = model.get_output_embeddings()
+    output_weight = getattr(output_embeddings, "weight", None)
+    if output_weight is not None and _tensors_share_storage(input_weight, output_weight):
+        logger.warning("Fast_dLLM_v2 input embeddings and LM head were tied.")
+        return True
+
+    # Last-resort compatibility path for newer Transformers releases whose
+    # metadata handling changed enough that the remote model's old list-style
+    # tied-weight declaration was not applied during loading.
+    output_embeddings.weight = input_weight
+    logger.warning(
+        "Fast_dLLM_v2 LM head was explicitly tied to input embeddings after "
+        "load."
+    )
+    return True
+
+
 def _ensure_transformers_legacy_dynamic_cache_support() -> None:
     """Use the list-backed DynamicCache API expected by Fast_dLLM_v2."""
 
@@ -175,8 +226,16 @@ def _ensure_transformers_legacy_dynamic_cache_support() -> None:
             if layer_idx == 0:
                 self._seen_tokens += key_states.shape[-2]
             if len(self.key_cache) <= layer_idx:
+                for _ in range(len(self.key_cache), layer_idx):
+                    self.key_cache.append(torch.tensor([], device=key_states.device))
+                    self.value_cache.append(
+                        torch.tensor([], device=value_states.device)
+                    )
                 self.key_cache.append(key_states)
                 self.value_cache.append(value_states)
+            elif not self.key_cache[layer_idx].numel():
+                self.key_cache[layer_idx] = key_states
+                self.value_cache[layer_idx] = value_states
             else:
                 self.key_cache[layer_idx] = torch.cat(
                     [self.key_cache[layer_idx], key_states], dim=-2
@@ -195,6 +254,24 @@ def _ensure_transformers_legacy_dynamic_cache_support() -> None:
 
         def get_max_length(self) -> Optional[int]:
             return None
+
+        def get_max_cache_shape(self) -> Optional[int]:
+            return None
+
+        def crop(self, max_length: int) -> None:
+            if max_length < 0:
+                max_length = self.get_seq_length() - abs(max_length)
+            if self.get_seq_length() <= max_length:
+                return
+            self._seen_tokens = max_length
+            for layer_idx in range(len(self.key_cache)):
+                if self.key_cache[layer_idx].numel():
+                    self.key_cache[layer_idx] = self.key_cache[layer_idx][
+                        ..., :max_length, :
+                    ]
+                    self.value_cache[layer_idx] = self.value_cache[layer_idx][
+                        ..., :max_length, :
+                    ]
 
         def reorder_cache(self, beam_idx: torch.LongTensor):
             for layer_idx in range(len(self.key_cache)):
@@ -221,9 +298,6 @@ def _ensure_transformers_legacy_dynamic_cache_support() -> None:
             return cache
 
     cache_utils.DynamicCache = FastDllmV2LegacyDynamicCache
-    for module in list(sys.modules.values()):
-        if getattr(module, "DynamicCache", None) is current_cache:
-            setattr(module, "DynamicCache", FastDllmV2LegacyDynamicCache)
     logger.warning(
         "Registered a local Transformers legacy DynamicCache compatibility "
         "shim for Fast_dLLM_v2."
@@ -345,6 +419,7 @@ class TransformersFastDllmV2Runtime:
                 "small_block_size": config.small_block_size,
                 "threshold": config.threshold,
                 "generation_max_new_tokens": config.generation_max_new_tokens,
+                **getattr(self, "model_metadata", {}),
             },
         )
 
@@ -382,7 +457,11 @@ class TransformersFastDllmV2Runtime:
 
         self.model = self._load_model(config, device_map=device_map)
         self.model.eval()
+        tied_embeddings_after_load = _ensure_fast_dllm_v2_tied_embeddings(self.model)
         self.model = self._move_model_to_primary_device(self.model)
+        self.model_metadata = {
+            "tied_embeddings_after_load": tied_embeddings_after_load,
+        }
         self.tokenizer = self._load_tokenizer(config)
 
     def _has_accelerate(self) -> bool:
