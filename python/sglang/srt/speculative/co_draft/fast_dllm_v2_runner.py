@@ -133,6 +133,86 @@ def _disable_transformers_hub_kernels_for_fast_dllm_v2() -> bool:
     return False
 
 
+def _repeat_kv_for_fast_dllm_v2(
+    hidden_states: torch.Tensor, n_rep: int
+) -> torch.Tensor:
+    """Transformers 4.53.1 repeat_kv helper used by sdpa_attention_forward."""
+
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _fast_dllm_v2_sdpa_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Transformers 4.53.1 SDPA wrapper for Fast_dLLM_v2 remote model code."""
+
+    del kwargs
+    if hasattr(module, "num_key_value_groups"):
+        key = _repeat_kv_for_fast_dllm_v2(key, module.num_key_value_groups)
+        value = _repeat_kv_for_fast_dllm_v2(value, module.num_key_value_groups)
+    if attention_mask is not None and attention_mask.ndim == 4:
+        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    if is_causal is None:
+        is_causal = (
+            query.shape[2] > 1
+            and attention_mask is None
+            and getattr(module, "is_causal", True)
+        )
+    if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
+        is_causal = is_causal.item()
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        scale=scaling,
+        is_causal=is_causal,
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+
+def _ensure_transformers_v453_sdpa_support() -> None:
+    """Install the SDPA call contract Fast_dLLM_v2 was validated against."""
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    current = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    if getattr(current, "_sglang_fast_dllm_v2_v453_compat", False):
+        return
+
+    _fast_dllm_v2_sdpa_attention_forward._sglang_fast_dllm_v2_v453_compat = True
+    try:
+        ALL_ATTENTION_FUNCTIONS["sdpa"] = _fast_dllm_v2_sdpa_attention_forward
+    except TypeError:
+        ALL_ATTENTION_FUNCTIONS.register(
+            "sdpa", _fast_dllm_v2_sdpa_attention_forward
+        )
+    logger.warning(
+        "Registered a Transformers 4.53.1-compatible SDPA shim for "
+        "Fast_dLLM_v2."
+    )
+
+
 def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     if lhs.device.type == "meta" or rhs.device.type == "meta":
         return False
@@ -465,6 +545,7 @@ class TransformersFastDllmV2Runtime:
         _ensure_transformers_default_rope_support()
         _ensure_transformers_tied_weights_support()
         _ensure_transformers_legacy_dynamic_cache_support()
+        _ensure_transformers_v453_sdpa_support()
         hub_kernels_disabled = False
         if config.disable_hub_kernels:
             hub_kernels_disabled = _disable_transformers_hub_kernels_for_fast_dllm_v2()
@@ -490,6 +571,7 @@ class TransformersFastDllmV2Runtime:
             "reference_transformers_version": FAST_DLLM_V2_REFERENCE_TRANSFORMERS_VERSION,
             "hub_kernels_disabled": config.disable_hub_kernels,
             "hub_kernels_env_changed": hub_kernels_disabled,
+            "sdpa_compat": "transformers_4.53.1",
         }
         self.tokenizer = self._load_tokenizer(config)
 

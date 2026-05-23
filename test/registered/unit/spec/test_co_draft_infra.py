@@ -23,6 +23,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     _ensure_transformers_default_rope_support,
     _ensure_transformers_legacy_dynamic_cache_support,
     _ensure_transformers_tied_weights_support,
+    _ensure_transformers_v453_sdpa_support,
 )
 from sglang.srt.speculative.linear_verify import (
     LinearDraftBlock,
@@ -595,6 +596,40 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                 os.environ.pop("USE_HUB_KERNELS", None)
             else:
                 os.environ["USE_HUB_KERNELS"] = original_value
+
+    def test_fast_dllm_registers_transformers_v453_sdpa_contract(self):
+        import torch
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        original_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+        try:
+            _ensure_transformers_v453_sdpa_support()
+
+            sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+            module = SimpleNamespace(num_key_value_groups=2, is_causal=True)
+            query = torch.randn(1, 4, 3, 8)
+            key = torch.randn(1, 2, 3, 8)
+            value = torch.randn(1, 2, 3, 8)
+            mask = torch.ones(3, 3, dtype=torch.bool).tril()
+
+            out, weights = sdpa(
+                module,
+                query,
+                key,
+                value,
+                mask,
+                is_causal=False,
+                scaling=8**-0.5,
+                sliding_window=None,
+            )
+
+            self.assertIsNone(weights)
+            self.assertEqual(out.shape, (1, 3, 4, 8))
+        finally:
+            try:
+                ALL_ATTENTION_FUNCTIONS["sdpa"] = original_sdpa
+            except TypeError:
+                ALL_ATTENTION_FUNCTIONS.register("sdpa", original_sdpa)
 
     def test_dynamic_cache_shim_registers_list_backed_legacy_cache(self):
         import torch
