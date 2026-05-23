@@ -296,6 +296,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--codraft-dllm-draft-model-path` | CO_DRAFT only. Model path for the colocated dLLM draft executor. | `None` | Type: str |
 | `--codraft-dllm-tokenizer-path` | CO_DRAFT only. Tokenizer path for the dLLM draft model. Defaults to `--codraft-dllm-draft-model-path`. | `None` | Type: str |
 | `--codraft-dllm-draft-tp-size` | CO_DRAFT only. Tensor-parallel size for the colocated dLLM draft executor. Supports `1` for asymmetric drafting or target `--tp` for symmetric drafting. | `None` | Type: int |
+| `--codraft-dllm-backend` | CO_DRAFT only. dLLM draft backend family. `sglang_dllm` targets SGLang-native dLLM models, `fast_dllm_v2` uses the independent Fast_dLLM_v2 proposal runner plus linear target verification, and `dflash` reserves SGLang's DFlash draft-model path. | `sglang_dllm` | `sglang_dllm`, `fast_dllm_v2`, `dflash` |
 | `--codraft-dllm-algorithm` | CO_DRAFT only. dLLM draft algorithm, such as `LowConfidence`. | `None` | Type: str |
 | `--codraft-dllm-algorithm-config` | CO_DRAFT only. YAML config path for the dLLM draft algorithm. | `None` | Type: str |
 

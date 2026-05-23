@@ -526,6 +526,7 @@ class ServerArgs:
     codraft_dllm_draft_model_path: Optional[str] = None
     codraft_dllm_tokenizer_path: Optional[str] = None
     codraft_dllm_draft_tp_size: Optional[int] = None
+    codraft_dllm_backend: str = "sglang_dllm"
     codraft_dllm_algorithm: Optional[str] = None
     codraft_dllm_algorithm_config: Optional[str] = None
     draft_disaggregation_role: Literal["none", "target", "draft"] = "none"
@@ -3918,6 +3919,11 @@ class ServerArgs:
             raise ValueError(
                 f"--codraft-strategy must be one of {sorted(valid_strategies)}."
             )
+        valid_dllm_backends = {"sglang_dllm", "fast_dllm_v2", "dflash"}
+        if self.codraft_dllm_backend not in valid_dllm_backends:
+            raise ValueError(
+                f"--codraft-dllm-backend must be one of {sorted(valid_dllm_backends)}."
+            )
         if self.codraft_strategy != "ar_only":
             raise ValueError(
                 "CO_DRAFT strategy adapters are not implemented yet. "
@@ -3946,6 +3952,15 @@ class ServerArgs:
             self.codraft_dllm_tokenizer_path = self.codraft_dllm_draft_model_path
         if self.codraft_dllm_algorithm is None:
             raise ValueError("CO_DRAFT requires --codraft-dllm-algorithm.")
+        if (
+            self.codraft_dllm_backend == "fast_dllm_v2"
+            and self.codraft_dllm_algorithm not in {"FastDLLMv2", "LowConfidence"}
+        ):
+            logger.warning(
+                "CO_DRAFT fast_dllm_v2 backend is experimental. Serving uses "
+                "the independent Fast_dLLM_v2 proposal runner and linear "
+                "target verification; validate quality and latency on GPU."
+            )
         if self.codraft_dllm_draft_tp_size is None:
             self.codraft_dllm_draft_tp_size = 1
         if self.codraft_dllm_draft_tp_size not in (1, self.tp_size):
@@ -5847,6 +5862,18 @@ class ServerArgs:
             help=(
                 "CO_DRAFT only. Tensor-parallel size for the colocated dLLM "
                 "draft executor. Supports 1 or the target --tp size."
+            ),
+        )
+        parser.add_argument(
+            "--codraft-dllm-backend",
+            type=str,
+            choices=["sglang_dllm", "fast_dllm_v2", "dflash"],
+            default=ServerArgs.codraft_dllm_backend,
+            help=(
+                "CO_DRAFT only. dLLM draft backend family. 'sglang_dllm' uses "
+                "SGLang's native dLLM serving abstractions, 'fast_dllm_v2' "
+                "uses the independent Fast_dLLM_v2 proposal runner, and "
+                "'dflash' reserves SGLang's DFlash draft-model path."
             ),
         )
         parser.add_argument(

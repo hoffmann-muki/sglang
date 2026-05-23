@@ -385,6 +385,10 @@ This minimizes queueing and batching delay on both the draft and target sides, w
 
 CO_DRAFT is an experimental colocated mode for testing one autoregressive draft executor and one diffusion-LLM draft executor against a single target model. It uses the existing colocated TLI verification path for the AR draft and reserves typed dLLM executor and AR/dLLM bridge contracts with independent TP plans.
 
+The dLLM side is modeled as an independent block proposer that emits token IDs for linear AR-target verification. This deliberately separates the verification primitive from DFlash's specialized draft model: `dflash` can use SGLang's DFlash draft-model family, while `fast_dllm_v2` is reserved for a Fast_dLLM_v2-style standalone block-diffusion draft that keeps its own model/cache and feeds proposed tokens into the same linear target-verification contract.
+
+Independent dLLM backends plug in through a proposal-runner contract. The runner owns model execution and draft cache state, returns proposed token blocks, and the shared adapter converts those blocks into the same DFlash-compatible linear verification shape used by the AR target.
+
 The first executable strategy is `ar_only`. Other `--codraft-strategy` values are reserved as stable configuration names for follow-on strategy adapters and fail fast until those adapters are implemented.
 
 ```bash
@@ -396,6 +400,7 @@ python3 -m sglang.launch_server \
     --speculative-draft-tp-size 1 \
     --codraft-dllm-draft-model-path JetLM/SDAR-8B-Chat \
     --codraft-dllm-draft-tp-size 1 \
+    --codraft-dllm-backend sglang_dllm \
     --codraft-dllm-algorithm LowConfidence \
     --speculative-num-steps 4 \
     --speculative-eagle-topk 1 \
@@ -403,6 +408,19 @@ python3 -m sglang.launch_server \
 ```
 
 CO_DRAFT keeps the target worker in autoregressive verification mode. Do not set the global `--dllm-algorithm` flags with CO_DRAFT; use `--codraft-dllm-algorithm` and `--codraft-dllm-algorithm-config` for the dLLM draft descriptor. Both local drafts currently support only two TP shapes: asymmetric TP=1 or symmetric TP=target `--tp`.
+
+For Fast_dLLM_v2 experiments, use `--codraft-dllm-backend fast_dllm_v2` to select the independent Fast_dLLM_v2 proposal runner. The runner lazy-loads the Hugging Face model through its `trust_remote_code=True` `generate` path, owns dLLM request state, applies accepted-token updates, and emits token blocks for linear AR-target verification. The remaining validation work is to run the real model on GPU and measure proposal quality, acceptance behavior, and latency.
+
+The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_v2 generation parameters:
+
+```yaml
+small_block_size: 8
+threshold: 0.9
+torch_dtype: auto
+device_map: auto
+trust_remote_code: true
+generation_kwargs: {}
+```
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 

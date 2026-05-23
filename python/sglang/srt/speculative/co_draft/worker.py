@@ -14,6 +14,10 @@ from sglang.srt.speculative.co_draft.executor import (
     ArTliDraftExecutor,
     CoDraftStrategy,
     DllmDraftExecutor,
+    LinearVerificationPlan,
+)
+from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
+    FastDllmV2ProposalRunner,
 )
 from sglang.srt.speculative.co_draft.tp import LocalDraftTpPlan
 from sglang.srt.speculative.tli_worker import TLIWorker
@@ -55,20 +59,29 @@ class CoDraftWorkerMixin:
                 tokenizer_path=server_args.codraft_dllm_tokenizer_path,
                 algorithm=server_args.codraft_dllm_algorithm,
                 algorithm_config=server_args.codraft_dllm_algorithm_config,
+                backend=server_args.codraft_dllm_backend,
+                verification_plan=LinearVerificationPlan(
+                    proposed_token_num=server_args.speculative_num_draft_tokens
+                ),
             ),
             bridge=UnimplementedCoDraftBridge(),
             strategy=server_args.codraft_strategy,
         )
+        if executors.dllm.backend == "fast_dllm_v2":
+            executors.dllm.attach_runner(
+                FastDllmV2ProposalRunner.from_executor(executors.dllm)
+            )
         if executors.strategy != "ar_only":
             raise NotImplementedError(
                 f"CO_DRAFT strategy {executors.strategy!r} is not implemented yet. "
                 "Use 'ar_only' until a strategy adapter is wired."
             )
         logger.info(
-            "CO_DRAFT initialized: strategy=%s, ar_tp=%s/%s, dllm_tp=%s/%s.",
+            "CO_DRAFT initialized: strategy=%s, ar_tp=%s/%s, dllm_backend=%s, dllm_tp=%s/%s.",
             executors.strategy,
             ar_tp_plan.draft_tp_size,
             ar_tp_plan.target_tp_size,
+            executors.dllm.backend,
             dllm_tp_plan.draft_tp_size,
             dllm_tp_plan.target_tp_size,
         )

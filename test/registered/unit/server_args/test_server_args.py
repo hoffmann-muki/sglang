@@ -310,6 +310,7 @@ class TestCoDraftServerArgs(unittest.TestCase):
 
         self.assertEqual(server_args.speculative_draft_tp_size, 1)
         self.assertEqual(server_args.codraft_dllm_draft_tp_size, 1)
+        self.assertEqual(server_args.codraft_dllm_backend, "sglang_dllm")
         self.assertEqual(server_args.remote_draft_tokenizer_path, "ar-draft-model")
         self.assertEqual(server_args.codraft_dllm_tokenizer_path, "dllm-draft-model")
 
@@ -337,6 +338,47 @@ class TestCoDraftServerArgs(unittest.TestCase):
         )
 
         self.assertEqual(server_args.codraft_dllm_draft_tp_size, 4)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_accepts_fast_dllm_backend_descriptor(self, _mock_resolve):
+        server_args = ServerArgs(
+            model_path="target-model",
+            speculative_algorithm="CO_DRAFT",
+            speculative_draft_model_path="ar-draft-model",
+            codraft_dllm_draft_model_path="fast-dllm-model",
+            codraft_dllm_backend="fast_dllm_v2",
+            codraft_dllm_algorithm="FastDLLMv2",
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+
+        self.assertEqual(server_args.codraft_dllm_backend, "fast_dllm_v2")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    def test_codraft_rejects_unknown_dllm_backend(self, _mock_resolve):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="target-model",
+                speculative_algorithm="CO_DRAFT",
+                speculative_draft_model_path="ar-draft-model",
+                codraft_dllm_draft_model_path="dllm-draft-model",
+                codraft_dllm_backend="unknown",
+                codraft_dllm_algorithm="LowConfidence",
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+                tp_size=4,
+            )
+
+        self.assertIn("codraft-dllm-backend", str(context.exception))
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
