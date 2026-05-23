@@ -120,6 +120,39 @@ def _ensure_transformers_tied_weights_support() -> None:
     )
 
 
+def _ensure_transformers_dynamic_cache_indexing_support() -> None:
+    """Provide legacy layer indexing for Fast_dLLM_v2 cache access."""
+
+    from transformers.cache_utils import DynamicCache
+
+    if hasattr(DynamicCache, "__getitem__"):
+        return
+
+    def _legacy_getitem(self, layer_idx: int):
+        key_cache = getattr(self, "key_cache", None)
+        value_cache = getattr(self, "value_cache", None)
+        if key_cache is not None and value_cache is not None:
+            return key_cache[layer_idx], value_cache[layer_idx]
+
+        layers = getattr(self, "layers", None)
+        if layers is not None:
+            layer = layers[layer_idx]
+            if hasattr(layer, "keys") and hasattr(layer, "values"):
+                return layer.keys, layer.values
+            if hasattr(layer, "key_cache") and hasattr(layer, "value_cache"):
+                return layer.key_cache, layer.value_cache
+
+        raise TypeError(
+            "DynamicCache does not expose legacy layer key/value tensors."
+        )
+
+    DynamicCache.__getitem__ = _legacy_getitem
+    logger.warning(
+        "Registered a local Transformers DynamicCache indexing compatibility "
+        "shim for Fast_dLLM_v2."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FastDllmV2RunnerConfig:
     """Runtime configuration for an independent Fast_dLLM_v2 draft runner."""
@@ -255,6 +288,7 @@ class TransformersFastDllmV2Runtime:
 
         _ensure_transformers_default_rope_support()
         _ensure_transformers_tied_weights_support()
+        _ensure_transformers_dynamic_cache_indexing_support()
 
         has_accelerate = self._has_accelerate()
         device_map = config.device_map if has_accelerate else None

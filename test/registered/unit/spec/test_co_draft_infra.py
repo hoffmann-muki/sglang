@@ -18,6 +18,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
     _fast_dllm_v2_internal_generation_budget,
+    _ensure_transformers_dynamic_cache_indexing_support,
     _ensure_transformers_default_rope_support,
     _ensure_transformers_tied_weights_support,
 )
@@ -539,6 +540,28 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             )
         finally:
             PreTrainedModel.get_expanded_tied_weights_keys = original_method
+
+    def test_dynamic_cache_shim_adds_legacy_layer_indexing(self):
+        from transformers.cache_utils import DynamicCache
+
+        sentinel = getattr(DynamicCache, "__getitem__", None)
+        if sentinel is not None:
+            delattr(DynamicCache, "__getitem__")
+
+        try:
+            _ensure_transformers_dynamic_cache_indexing_support()
+
+            cache = DynamicCache()
+            cache.layers = [
+                SimpleNamespace(keys="layer0-keys", values="layer0-values")
+            ]
+
+            self.assertEqual(cache[0], ("layer0-keys", "layer0-values"))
+        finally:
+            if sentinel is not None:
+                DynamicCache.__getitem__ = sentinel
+            else:
+                delattr(DynamicCache, "__getitem__")
 
 
 class TestLinearVerifyHelpers(unittest.TestCase):
