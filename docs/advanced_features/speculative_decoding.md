@@ -417,6 +417,7 @@ The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_
 block_size: 32
 small_block_size: 8
 threshold: 0.9
+generation_max_new_tokens: 128  # optional; omitting it uses the smallest block-aligned budget
 torch_dtype: auto
 device_map: auto
 trust_remote_code: true
@@ -426,7 +427,9 @@ generation_kwargs: {}
 Fast_dLLM_v2 decodes in complete diffusion blocks. The runner therefore
 requests enough internal block budget for the model's `generate` path and then
 slices the first `--speculative-num-draft-tokens` proposed tokens for target
-verification.
+verification. Set `generation_max_new_tokens` when you want to match the
+standalone Hugging Face examples that generate a longer block-diffusion
+completion before slicing proposal tokens.
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 

@@ -163,6 +163,7 @@ class FastDllmV2RunnerConfig:
     block_size: int = 32
     small_block_size: int = 8
     threshold: float = 0.9
+    generation_max_new_tokens: Optional[int] = None
     torch_dtype: str = "auto"
     device_map: str = "auto"
     trust_remote_code: bool = True
@@ -181,6 +182,9 @@ class FastDllmV2RunnerConfig:
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
+            generation_max_new_tokens=_optional_positive_int(
+                raw_config.get("generation_max_new_tokens")
+            ),
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
             device_map=str(raw_config.get("device_map", "auto")),
             trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
@@ -263,6 +267,7 @@ class TransformersFastDllmV2Runtime:
                 "block_size": config.block_size,
                 "small_block_size": config.small_block_size,
                 "threshold": config.threshold,
+                "generation_max_new_tokens": config.generation_max_new_tokens,
             },
         )
 
@@ -299,6 +304,7 @@ class TransformersFastDllmV2Runtime:
             )
 
         self.model = self._load_model(config, device_map=device_map)
+        self.model.eval()
         self.model = self._move_model_to_primary_device(self.model)
         self.tokenizer = self._load_tokenizer(config)
 
@@ -355,6 +361,11 @@ class TransformersFastDllmV2Runtime:
             config.proposed_token_num,
             config.block_size,
         )
+        if config.generation_max_new_tokens is not None:
+            internal_max_new_tokens = max(
+                internal_max_new_tokens,
+                config.generation_max_new_tokens,
+            )
         output = self.model.generate(
             prompt,
             tokenizer=self.tokenizer,
@@ -449,6 +460,15 @@ def _load_algorithm_config(config_path: Optional[str]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("Fast_dLLM_v2 algorithm config must be a mapping.")
     return raw
+
+
+def _optional_positive_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("Fast_dLLM_v2 generation_max_new_tokens must be positive.")
+    return parsed
 
 
 def _fast_dllm_v2_internal_generation_budget(

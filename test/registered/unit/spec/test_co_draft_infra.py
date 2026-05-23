@@ -315,6 +315,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.75",
+                        "generation_max_new_tokens: 128",
                         "device_map: cuda:0",
                         "generation_kwargs:",
                         "  do_sample: false",
@@ -346,6 +347,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.75)
+        self.assertEqual(config.generation_max_new_tokens, 128)
         self.assertEqual(config.device_map, "cuda:0")
         self.assertEqual(config.generation_kwargs, {"do_sample": False})
 
