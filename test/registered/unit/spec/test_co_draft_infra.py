@@ -18,8 +18,8 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
     _fast_dllm_v2_internal_generation_budget,
-    _ensure_transformers_dynamic_cache_indexing_support,
     _ensure_transformers_default_rope_support,
+    _ensure_transformers_legacy_dynamic_cache_support,
     _ensure_transformers_tied_weights_support,
 )
 from sglang.srt.speculative.linear_verify import (
@@ -543,27 +543,45 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         finally:
             PreTrainedModel.get_expanded_tied_weights_keys = original_method
 
-    def test_dynamic_cache_shim_adds_legacy_layer_indexing(self):
-        from transformers.cache_utils import DynamicCache
+    def test_dynamic_cache_shim_registers_list_backed_legacy_cache(self):
+        import sys
 
-        sentinel = getattr(DynamicCache, "__getitem__", None)
-        if sentinel is not None:
-            delattr(DynamicCache, "__getitem__")
+        import torch
+        import transformers.cache_utils as cache_utils
+
+        original_cache = cache_utils.DynamicCache
+        modules_to_restore = [
+            module
+            for module in sys.modules.values()
+            if getattr(module, "DynamicCache", None) is original_cache
+        ]
 
         try:
-            _ensure_transformers_dynamic_cache_indexing_support()
+            _ensure_transformers_legacy_dynamic_cache_support()
 
-            cache = DynamicCache()
-            cache.layers = [
-                SimpleNamespace(keys="layer0-keys", values="layer0-values")
-            ]
+            cache = cache_utils.DynamicCache()
+            key_0 = torch.ones(1, 2, 3, 4)
+            value_0 = torch.full((1, 2, 3, 4), 2.0)
+            key_1 = torch.full((1, 2, 1, 4), 3.0)
+            value_1 = torch.full((1, 2, 1, 4), 4.0)
 
-            self.assertEqual(cache[0], ("layer0-keys", "layer0-values"))
+            cache.update(key_0, value_0, 0)
+            cache.update(key_1, value_1, 0)
+
+            self.assertEqual(len(cache), 1)
+            self.assertEqual(cache.seen_tokens, 4)
+            self.assertEqual(cache.get_seq_length(0), 4)
+            self.assertTrue(
+                torch.equal(cache[0][0], torch.cat([key_0, key_1], dim=-2))
+            )
+            self.assertTrue(
+                torch.equal(cache[0][1], torch.cat([value_0, value_1], dim=-2))
+            )
         finally:
-            if sentinel is not None:
-                DynamicCache.__getitem__ = sentinel
-            else:
-                delattr(DynamicCache, "__getitem__")
+            cache_utils.DynamicCache = original_cache
+            for module in modules_to_restore:
+                if getattr(module, "DynamicCache", None) is not original_cache:
+                    setattr(module, "DynamicCache", original_cache)
 
 
 class TestLinearVerifyHelpers(unittest.TestCase):

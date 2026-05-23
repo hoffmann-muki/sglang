@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -120,35 +121,111 @@ def _ensure_transformers_tied_weights_support() -> None:
     )
 
 
-def _ensure_transformers_dynamic_cache_indexing_support() -> None:
-    """Provide legacy layer indexing for Fast_dLLM_v2 cache access."""
+def _ensure_transformers_legacy_dynamic_cache_support() -> None:
+    """Use the list-backed DynamicCache API expected by Fast_dLLM_v2."""
 
-    from transformers.cache_utils import DynamicCache
+    import transformers.cache_utils as cache_utils
 
-    if hasattr(DynamicCache, "__getitem__"):
+    current_cache = cache_utils.DynamicCache
+    try:
+        cache = current_cache()
+    except TypeError:
+        cache = None
+    if (
+        cache is not None
+        and hasattr(cache, "key_cache")
+        and hasattr(cache, "value_cache")
+        and hasattr(current_cache, "__getitem__")
+    ):
         return
 
-    def _legacy_getitem(self, layer_idx: int):
-        key_cache = getattr(self, "key_cache", None)
-        value_cache = getattr(self, "value_cache", None)
-        if key_cache is not None and value_cache is not None:
-            return key_cache[layer_idx], value_cache[layer_idx]
+    class FastDllmV2LegacyDynamicCache:
+        def __init__(self) -> None:
+            self.key_cache: list[torch.Tensor] = []
+            self.value_cache: list[torch.Tensor] = []
+            self._seen_tokens = 0
 
-        layers = getattr(self, "layers", None)
-        if layers is not None:
-            layer = layers[layer_idx]
-            if hasattr(layer, "keys") and hasattr(layer, "values"):
-                return layer.keys, layer.values
-            if hasattr(layer, "key_cache") and hasattr(layer, "value_cache"):
-                return layer.key_cache, layer.value_cache
+        @property
+        def seen_tokens(self):
+            return self._seen_tokens
 
-        raise TypeError(
-            "DynamicCache does not expose legacy layer key/value tensors."
-        )
+        def __getitem__(self, layer_idx: int):
+            if layer_idx < len(self):
+                return self.key_cache[layer_idx], self.value_cache[layer_idx]
+            raise KeyError(
+                f"Cache only has {len(self)} layers, attempted to access "
+                f"layer with index {layer_idx}"
+            )
 
-    DynamicCache.__getitem__ = _legacy_getitem
+        def __iter__(self):
+            for layer_idx in range(len(self)):
+                yield self[layer_idx]
+
+        def __len__(self):
+            return len(self.key_cache)
+
+        def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            layer_idx: int,
+            cache_kwargs: Optional[dict[str, Any]] = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del cache_kwargs
+            if layer_idx == 0:
+                self._seen_tokens += key_states.shape[-2]
+            if len(self.key_cache) <= layer_idx:
+                self.key_cache.append(key_states)
+                self.value_cache.append(value_states)
+            else:
+                self.key_cache[layer_idx] = torch.cat(
+                    [self.key_cache[layer_idx], key_states], dim=-2
+                )
+                self.value_cache[layer_idx] = torch.cat(
+                    [self.value_cache[layer_idx], value_states], dim=-2
+                )
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+        def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+            if layer_idx is None:
+                layer_idx = 0
+            if len(self.key_cache) <= layer_idx:
+                return 0
+            return self.key_cache[layer_idx].shape[-2]
+
+        def get_max_length(self) -> Optional[int]:
+            return None
+
+        def reorder_cache(self, beam_idx: torch.LongTensor):
+            for layer_idx in range(len(self.key_cache)):
+                key_device = self.key_cache[layer_idx].device
+                value_device = self.value_cache[layer_idx].device
+                self.key_cache[layer_idx] = self.key_cache[layer_idx].index_select(
+                    0, beam_idx.to(key_device)
+                )
+                self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(
+                    0, beam_idx.to(value_device)
+                )
+
+        def to_legacy_cache(self):
+            return tuple(self[layer_idx] for layer_idx in range(len(self)))
+
+        @classmethod
+        def from_legacy_cache(cls, past_key_values=None):
+            cache = cls()
+            if past_key_values is not None:
+                for layer_idx, (key_states, value_states) in enumerate(
+                    past_key_values
+                ):
+                    cache.update(key_states, value_states, layer_idx)
+            return cache
+
+    cache_utils.DynamicCache = FastDllmV2LegacyDynamicCache
+    for module in list(sys.modules.values()):
+        if getattr(module, "DynamicCache", None) is current_cache:
+            setattr(module, "DynamicCache", FastDllmV2LegacyDynamicCache)
     logger.warning(
-        "Registered a local Transformers DynamicCache indexing compatibility "
+        "Registered a local Transformers legacy DynamicCache compatibility "
         "shim for Fast_dLLM_v2."
     )
 
@@ -293,7 +370,7 @@ class TransformersFastDllmV2Runtime:
 
         _ensure_transformers_default_rope_support()
         _ensure_transformers_tied_weights_support()
-        _ensure_transformers_dynamic_cache_indexing_support()
+        _ensure_transformers_legacy_dynamic_cache_support()
 
         has_accelerate = self._has_accelerate()
         device_map = config.device_map if has_accelerate else None
