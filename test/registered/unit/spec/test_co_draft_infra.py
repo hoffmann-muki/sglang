@@ -15,6 +15,7 @@ from sglang.srt.speculative.co_draft.executor import (
 from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2ProposalRunner,
     FastDllmV2RunnerConfig,
+    TransformersFastDllmV2Runtime,
 )
 from sglang.srt.speculative.linear_verify import (
     LinearDraftBlock,
@@ -412,6 +413,45 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
 
         self.assertNotIn("r0", runner.states)
         self.assertEqual(runtime.released, ["r0"])
+
+    def test_runner_falls_back_without_accelerate(self):
+        import torch
+        from unittest.mock import MagicMock
+
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=2,
+        )
+        transformer_runtime = TransformersFastDllmV2Runtime()
+        transformer_runtime._has_accelerate = MagicMock(return_value=False)
+        fake_model = MagicMock()
+        fake_model.device = torch.device("cpu")
+        fake_model.generate = MagicMock(
+            return_value=torch.tensor([[10, 11, 12, 101, 102]])
+        )
+        transformer_runtime._load_model = MagicMock(return_value=fake_model)
+        transformer_runtime._load_tokenizer = MagicMock(return_value=MagicMock())
+
+        request = IndependentDllmDraftRequest(
+            request_ids=["r0"],
+            input_ids=[[10, 11, 12]],
+            current_token_ids=torch.tensor([12]),
+            prefix_lens=torch.tensor([3]),
+            proposed_token_num=2,
+        )
+
+        transformer_runtime.propose(
+            config,
+            request,
+            {"r0": MagicMock(input_ids=[10, 11, 12])},
+        )
+
+        transformer_runtime._load_model.assert_called_once()
+        self.assertEqual(
+            transformer_runtime._load_model.call_args.kwargs["device_map"],
+            None,
+        )
 
 
 class TestLinearVerifyHelpers(unittest.TestCase):

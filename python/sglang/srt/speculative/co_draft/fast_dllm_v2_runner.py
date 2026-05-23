@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -18,6 +20,8 @@ from sglang.srt.speculative.co_draft.dllm_linear_adapter import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.co_draft.executor import DllmDraftExecutor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,18 +154,56 @@ class TransformersFastDllmV2Runtime:
         if self.model is not None:
             return
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        has_accelerate = self._has_accelerate()
+        device_map = config.device_map if has_accelerate else None
+        if not has_accelerate and config.device_map not in (None, "none"):
+            logger.warning(
+                "Fast_dLLM_v2 is falling back to a single-device load because "
+                "accelerate is unavailable in this environment."
+            )
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            config.model_path,
-            torch_dtype=config.torch_dtype,
-            device_map=config.device_map,
-            trust_remote_code=config.trust_remote_code,
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.model = self._load_model(config, device_map=device_map)
+        self.model = self._move_model_to_primary_device(self.model)
+        self.tokenizer = self._load_tokenizer(config)
+
+    def _has_accelerate(self) -> bool:
+        return importlib.util.find_spec("accelerate") is not None
+
+    def _load_model(
+        self,
+        config: FastDllmV2RunnerConfig,
+        *,
+        device_map: Optional[str],
+    ) -> Any:
+        from transformers import AutoModelForCausalLM
+
+        kwargs: dict[str, Any] = {
+            "torch_dtype": config.torch_dtype,
+            "trust_remote_code": config.trust_remote_code,
+        }
+        if device_map is not None:
+            kwargs["device_map"] = device_map
+        return AutoModelForCausalLM.from_pretrained(config.model_path, **kwargs)
+
+    def _load_tokenizer(self, config: FastDllmV2RunnerConfig) -> Any:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
             config.tokenizer_path,
             trust_remote_code=config.trust_remote_code,
         )
+
+    def _move_model_to_primary_device(self, model):
+        current_device = getattr(model, "device", torch.device("cpu"))
+        if torch.cuda.is_available() and current_device.type != "cuda":
+            try:
+                return model.to(torch.device("cuda"))
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning(
+                    "Fast_dLLM_v2 could not move the model to CUDA after CPU load: %s",
+                    exc,
+                )
+        return model
 
     def _generate_one(
         self,
