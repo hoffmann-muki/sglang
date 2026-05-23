@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.co_draft.executor import DllmDraftExecutor
 
 logger = logging.getLogger(__name__)
+
+FAST_DLLM_V2_REFERENCE_TRANSFORMERS_VERSION = "4.53.1"
 
 
 def _compute_default_rope_parameters(
@@ -118,6 +121,16 @@ def _ensure_transformers_tied_weights_support() -> None:
         "Registered a local Transformers tied-weights compatibility shim for "
         "Fast_dLLM_v2."
     )
+
+
+def _disable_transformers_hub_kernels_for_fast_dllm_v2() -> bool:
+    """Disable Transformers Hub kernels for Fast_dLLM_v2 remote-code fidelity."""
+
+    previous = os.environ.get("USE_HUB_KERNELS")
+    if previous is None or previous.strip().upper() not in {"0", "OFF", "NO"}:
+        os.environ["USE_HUB_KERNELS"] = "0"
+        return True
+    return False
 
 
 def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -318,6 +331,8 @@ class FastDllmV2RunnerConfig:
     torch_dtype: str = "auto"
     device_map: str = "auto"
     trust_remote_code: bool = True
+    attn_implementation: Optional[str] = "sdpa"
+    disable_hub_kernels: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -339,6 +354,10 @@ class FastDllmV2RunnerConfig:
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
             device_map=str(raw_config.get("device_map", "auto")),
             trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
+            attn_implementation=_optional_str(
+                raw_config.get("attn_implementation", "sdpa")
+            ),
+            disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
             generation_kwargs=generation_kwargs,
         )
 
@@ -446,6 +465,9 @@ class TransformersFastDllmV2Runtime:
         _ensure_transformers_default_rope_support()
         _ensure_transformers_tied_weights_support()
         _ensure_transformers_legacy_dynamic_cache_support()
+        hub_kernels_disabled = False
+        if config.disable_hub_kernels:
+            hub_kernels_disabled = _disable_transformers_hub_kernels_for_fast_dllm_v2()
 
         has_accelerate = self._has_accelerate()
         device_map = config.device_map if has_accelerate else None
@@ -457,10 +479,17 @@ class TransformersFastDllmV2Runtime:
 
         self.model = self._load_model(config, device_map=device_map)
         self.model.eval()
+        if config.disable_hub_kernels and hasattr(self.model, "config"):
+            self.model.config.disable_custom_kernels = True
         tied_embeddings_after_load = _ensure_fast_dllm_v2_tied_embeddings(self.model)
         self.model = self._move_model_to_primary_device(self.model)
+        transformers_version = self._transformers_version()
         self.model_metadata = {
             "tied_embeddings_after_load": tied_embeddings_after_load,
+            "transformers_version": transformers_version,
+            "reference_transformers_version": FAST_DLLM_V2_REFERENCE_TRANSFORMERS_VERSION,
+            "hub_kernels_disabled": config.disable_hub_kernels,
+            "hub_kernels_env_changed": hub_kernels_disabled,
         }
         self.tokenizer = self._load_tokenizer(config)
 
@@ -481,7 +510,14 @@ class TransformersFastDllmV2Runtime:
         }
         if device_map is not None:
             kwargs["device_map"] = device_map
+        if config.attn_implementation:
+            kwargs["attn_implementation"] = config.attn_implementation
         return AutoModelForCausalLM.from_pretrained(config.model_path, **kwargs)
+
+    def _transformers_version(self) -> str:
+        import transformers
+
+        return transformers.__version__
 
     def _load_tokenizer(self, config: FastDllmV2RunnerConfig) -> Any:
         from transformers import AutoTokenizer
@@ -624,6 +660,15 @@ def _optional_positive_int(value: Any) -> Optional[int]:
     parsed = int(value)
     if parsed <= 0:
         raise ValueError("Fast_dLLM_v2 generation_max_new_tokens must be positive.")
+    return parsed
+
+
+def _optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    parsed = str(value)
+    if parsed.lower() in ("", "none", "null"):
+        return None
     return parsed
 
 

@@ -17,6 +17,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2ProposalRunner,
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
+    _disable_transformers_hub_kernels_for_fast_dllm_v2,
     _fast_dllm_v2_internal_generation_budget,
     _ensure_fast_dllm_v2_tied_embeddings,
     _ensure_transformers_default_rope_support,
@@ -318,6 +319,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                         "threshold: 0.75",
                         "generation_max_new_tokens: 128",
                         "device_map: cuda:0",
+                        "attn_implementation: sdpa",
+                        "disable_hub_kernels: true",
                         "generation_kwargs:",
                         "  do_sample: false",
                     ]
@@ -350,6 +353,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.threshold, 0.75)
         self.assertEqual(config.generation_max_new_tokens, 128)
         self.assertEqual(config.device_map, "cuda:0")
+        self.assertEqual(config.attn_implementation, "sdpa")
+        self.assertTrue(config.disable_hub_kernels)
         self.assertEqual(config.generation_kwargs, {"do_sample": False})
 
     def test_internal_generation_budget_is_block_aligned(self):
@@ -575,6 +580,21 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             model.get_output_embeddings().weight,
             model.get_input_embeddings().weight,
         )
+
+    def test_fast_dllm_disables_hub_kernels_before_model_import(self):
+        import os
+
+        original_value = os.environ.pop("USE_HUB_KERNELS", None)
+        try:
+            changed = _disable_transformers_hub_kernels_for_fast_dllm_v2()
+
+            self.assertTrue(changed)
+            self.assertEqual(os.environ["USE_HUB_KERNELS"], "0")
+        finally:
+            if original_value is None:
+                os.environ.pop("USE_HUB_KERNELS", None)
+            else:
+                os.environ["USE_HUB_KERNELS"] = original_value
 
     def test_dynamic_cache_shim_registers_list_backed_legacy_cache(self):
         import torch
