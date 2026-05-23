@@ -81,6 +81,45 @@ def _ensure_transformers_default_rope_support() -> None:
     )
 
 
+def _ensure_transformers_tied_weights_support() -> None:
+    """Normalize tied-weight metadata for the Fast_dLLM_v2 remote model code.
+
+    The Fast_dLLM_v2 checkpoint still declares tied weights using the legacy
+    list-style contract, while newer Transformers releases expect an explicit
+    mapping. We patch the base helper so the remote model can declare its tied
+    embedding/LM-head pair in the format the loader expects.
+    """
+
+    from transformers.modeling_utils import PreTrainedModel
+
+    original = getattr(
+        PreTrainedModel.get_expanded_tied_weights_keys,
+        "_sglang_fast_dllm_v2_compat",
+        None,
+    )
+    if original is not None:
+        return
+
+    original_method = PreTrainedModel.get_expanded_tied_weights_keys
+
+    def _patched_get_expanded_tied_weights_keys(self, all_submodels=False):
+        tied_weights_keys = getattr(self, "_tied_weights_keys", None)
+        if isinstance(tied_weights_keys, list):
+            model_type = getattr(getattr(self, "config", None), "model_type", None)
+            if model_type == "Fast_dLLM_Qwen":
+                self._tied_weights_keys = {
+                    "lm_head.weight": "model.embed_tokens.weight"
+                }
+        return original_method(self, all_submodels=all_submodels)
+
+    _patched_get_expanded_tied_weights_keys._sglang_fast_dllm_v2_compat = True
+    PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded_tied_weights_keys
+    logger.warning(
+        "Registered a local Transformers tied-weights compatibility shim for "
+        "Fast_dLLM_v2."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class FastDllmV2RunnerConfig:
     """Runtime configuration for an independent Fast_dLLM_v2 draft runner."""
@@ -212,6 +251,7 @@ class TransformersFastDllmV2Runtime:
             return
 
         _ensure_transformers_default_rope_support()
+        _ensure_transformers_tied_weights_support()
 
         has_accelerate = self._has_accelerate()
         device_map = config.device_map if has_accelerate else None

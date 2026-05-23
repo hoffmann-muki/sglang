@@ -1,5 +1,6 @@
 import unittest
 from tempfile import NamedTemporaryFile
+from types import SimpleNamespace
 
 from sglang.srt.speculative.co_draft.bridge import UnimplementedCoDraftBridge
 from sglang.srt.speculative.co_draft.dllm_linear_adapter import (
@@ -17,6 +18,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
     _ensure_transformers_default_rope_support,
+    _ensure_transformers_tied_weights_support,
 )
 from sglang.srt.speculative.linear_verify import (
     LinearDraftBlock,
@@ -479,6 +481,35 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                 ROPE_INIT_FUNCTIONS["default"] = sentinel
             else:
                 ROPE_INIT_FUNCTIONS.pop("default", None)
+
+    def test_tied_weights_shim_normalizes_legacy_list_metadata(self):
+        from transformers.modeling_utils import PreTrainedModel
+
+        original_method = PreTrainedModel.get_expanded_tied_weights_keys
+
+        def fake_original(self, all_submodels=False):
+            return self._tied_weights_keys
+
+        try:
+            PreTrainedModel.get_expanded_tied_weights_keys = fake_original
+            _ensure_transformers_tied_weights_support()
+
+            dummy = SimpleNamespace(
+                _tied_weights_keys=["lm_head.weight"],
+                config=SimpleNamespace(model_type="Fast_dLLM_Qwen"),
+            )
+            result = PreTrainedModel.get_expanded_tied_weights_keys(dummy, False)
+
+            self.assertEqual(
+                dummy._tied_weights_keys,
+                {"lm_head.weight": "model.embed_tokens.weight"},
+            )
+            self.assertEqual(
+                result,
+                {"lm_head.weight": "model.embed_tokens.weight"},
+            )
+        finally:
+            PreTrainedModel.get_expanded_tied_weights_keys = original_method
 
 
 class TestLinearVerifyHelpers(unittest.TestCase):
