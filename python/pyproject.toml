@@ -19,6 +19,7 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
+  "accelerate",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -147,7 +148,6 @@ fastokens = [
 ]
 
 test = [
-  "accelerate",
   "addict",
   "bitsandbytes",
   "expecttest",
