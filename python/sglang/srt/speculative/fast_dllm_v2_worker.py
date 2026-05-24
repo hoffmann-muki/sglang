@@ -257,16 +257,16 @@ class FastDllmV2Worker:
 
         old_output_lens = [len(req.output_ids) for req in batch.reqs]
 
-        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_draft_start_time")
         self._prepare_for_speculative_decoding(batch)
-        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_draft_end_time")
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
 
-        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_verify_start_time")
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch,
             is_verify=True,
@@ -300,6 +300,7 @@ class FastDllmV2Worker:
         for req, accepted in zip(
             batch.reqs, accept_length_per_req_cpu, strict=True
         ):
+            req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
             req.update_spec_acceptance_histogram(accepted)
 
         batch.forward_mode = ForwardMode.DECODE
