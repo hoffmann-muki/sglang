@@ -25,6 +25,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     _ensure_transformers_tied_weights_support,
     _ensure_transformers_v453_sdpa_support,
     _normalize_fast_dllm_v2_rope_config,
+    _patch_fast_dllm_v2_rotary_embedding_forward,
 )
 from sglang.srt.speculative.linear_verify import (
     LinearDraftBlock,
@@ -669,6 +670,34 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(config.rope_scaling["rope_type"], "yarn")
         self.assertEqual(config.rope_parameters["rope_type"], "yarn")
+
+    def test_fast_dllm_rotary_forward_patch_produces_non_identity_rope(self):
+        import torch
+
+        class Fast_dLLM_QwenRotaryEmbedding(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    hidden_size=8,
+                    num_attention_heads=2,
+                    rope_theta=10000.0,
+                )
+
+            def forward(self, x, position_ids):
+                return torch.ones(1, 4, 2), torch.zeros(1, 4, 2)
+
+        model = torch.nn.Module()
+        model.rotary_emb = Fast_dLLM_QwenRotaryEmbedding()
+
+        patched = _patch_fast_dllm_v2_rotary_embedding_forward(model)
+        cos, sin = model.rotary_emb(
+            torch.zeros(1, 4, 8),
+            torch.arange(4).reshape(1, 4),
+        )
+
+        self.assertTrue(patched)
+        self.assertGreater(cos.std().item(), 0.0)
+        self.assertGreater(sin.std().item(), 0.0)
 
     def test_dynamic_cache_shim_registers_list_backed_legacy_cache(self):
         import torch

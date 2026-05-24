@@ -76,6 +76,8 @@ def write_trace(args: argparse.Namespace) -> None:
         trust_remote_code=args.trust_remote_code,
     )
     model.eval()
+    if args.apply_sglang_compat:
+        apply_sglang_fast_dllm_v2_model_compat(model)
 
     text = tokenizer.apply_chat_template(
         [{"role": "user", "content": args.prompt}],
@@ -161,6 +163,14 @@ def apply_sglang_fast_dllm_v2_compat(config: Any) -> None:
     _ensure_transformers_v453_sdpa_support()
     _normalize_fast_dllm_v2_rope_config(config)
     _disable_transformers_hub_kernels_for_fast_dllm_v2()
+
+
+def apply_sglang_fast_dllm_v2_model_compat(model: torch.nn.Module) -> None:
+    from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
+        _patch_fast_dllm_v2_rotary_embedding_forward,
+    )
+
+    _patch_fast_dllm_v2_rotary_embedding_forward(model)
 
 
 class FastDllmTrace:

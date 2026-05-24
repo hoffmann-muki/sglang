@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -238,6 +239,56 @@ def _normalize_fast_dllm_v2_rope_config(config: Any) -> bool:
             setattr(config, attr, None)
             changed = True
     return changed
+
+
+def _fast_dllm_v2_reference_rotary_forward(
+    rotary_emb: torch.nn.Module,
+    x: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    config = getattr(rotary_emb, "config", None)
+    if config is None:
+        raise ValueError("Fast_dLLM_v2 rotary compatibility requires a config.")
+
+    inv_freq, attention_scaling = _compute_default_rope_parameters(
+        config=config,
+        device=x.device,
+    )
+    inv_freq_expanded = inv_freq[None, :, None].float().expand(
+        position_ids.shape[0], -1, 1
+    )
+    position_ids_expanded = position_ids[:, None, :].float()
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * attention_scaling
+        sin = emb.sin() * attention_scaling
+    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def _patch_fast_dllm_v2_rotary_embedding_forward(model: Any) -> bool:
+    """Patch Fast_dLLM_v2 rotary modules to the reference Qwen RoPE behavior."""
+
+    patched = False
+    for module in model.modules():
+        if module.__class__.__name__ != "Fast_dLLM_QwenRotaryEmbedding":
+            continue
+        if getattr(module.forward, "_sglang_fast_dllm_v2_v453_compat", False):
+            patched = True
+            continue
+
+        def _forward(self, x, position_ids):
+            return _fast_dllm_v2_reference_rotary_forward(self, x, position_ids)
+
+        _forward._sglang_fast_dllm_v2_v453_compat = True
+        module.forward = types.MethodType(_forward, module)
+        patched = True
+    if patched:
+        logger.warning(
+            "Patched Fast_dLLM_v2 rotary embedding forward to reference "
+            "Transformers 4.53.1 behavior."
+        )
+    return patched
 
 
 def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -587,6 +638,9 @@ class TransformersFastDllmV2Runtime:
             )
 
         self.model = self._load_model(config, device_map=device_map)
+        rotary_forward_patched = _patch_fast_dllm_v2_rotary_embedding_forward(
+            self.model
+        )
         self.model.eval()
         if config.disable_hub_kernels and hasattr(self.model, "config"):
             self.model.config.disable_custom_kernels = True
@@ -601,6 +655,7 @@ class TransformersFastDllmV2Runtime:
             "hub_kernels_env_changed": hub_kernels_disabled,
             "sdpa_compat": "transformers_4.53.1",
             "rope_config_normalized": self._rope_config_normalized,
+            "rotary_forward_patched": rotary_forward_patched,
         }
         self.tokenizer = self._load_tokenizer(config)
 
