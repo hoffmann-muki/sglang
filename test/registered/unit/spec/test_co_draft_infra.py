@@ -430,6 +430,27 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             32,
         )
 
+    def test_runtime_initializes_partial_block_with_padded_state(self):
+        import torch
+
+        runtime = TransformersFastDllmV2Runtime()
+        input_tensor = torch.arange(26, dtype=torch.long).reshape(1, 26)
+        seq_block_idx = torch.tensor([0], dtype=torch.long)
+
+        x_init, updated_input = runtime._initialize_proposal_block(
+            input_tensor=input_tensor,
+            seq_block_idx=seq_block_idx,
+            block_idx=0,
+            block_size=32,
+            mask_id=151666,
+        )
+
+        self.assertEqual(tuple(x_init.shape), (1, 32))
+        self.assertEqual(tuple(updated_input.shape), (1, 32))
+        self.assertTrue(torch.equal(x_init, updated_input))
+        self.assertTrue(torch.equal(x_init[:, :26], input_tensor))
+        self.assertTrue(torch.equal(x_init[:, 26:], torch.full((1, 6), 151666)))
+
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch
 

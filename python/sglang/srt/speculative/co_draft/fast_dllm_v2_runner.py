@@ -745,6 +745,27 @@ class TransformersFastDllmV2Runtime:
                 )
         return model
 
+    @staticmethod
+    def _initialize_proposal_block(
+        input_tensor: torch.Tensor,
+        seq_block_idx: torch.Tensor,
+        block_idx: int,
+        block_size: int,
+        mask_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (seq_block_idx == block_idx).all():
+            mask_count = block_size - input_tensor.shape[1] % block_size
+            mask_tokens = torch.full(
+                (input_tensor.shape[0], mask_count),
+                mask_id,
+                device=input_tensor.device,
+                dtype=torch.long,
+            )
+            x_init = torch.cat([input_tensor, mask_tokens], dim=1)
+            return x_init, x_init
+
+        return input_tensor[:, : (block_idx + 1) * block_size], input_tensor
+
     @torch.no_grad()
     def _propose_one(
         self,
@@ -824,17 +845,13 @@ class TransformersFastDllmV2Runtime:
         num_small_blocks = block_size // small_block_size
 
         for block_idx in range(start_block_idx, num_blocks):
-            if (seq_block_idx == block_idx).all():
-                mask_count = block_size - input_tensor.shape[1] % block_size
-                x_init = torch.full(
-                    (input_tensor.shape[0], mask_count),
-                    mask_id,
-                    device=device,
-                    dtype=torch.long,
-                )
-                x_init = torch.cat([input_tensor, x_init], dim=1)
-            else:
-                x_init = input_tensor[:, : (block_idx + 1) * block_size]
+            x_init, input_tensor = self._initialize_proposal_block(
+                input_tensor,
+                seq_block_idx,
+                block_idx,
+                block_size,
+                mask_id,
+            )
 
             x_t = x_init.clone()
             block_past_key_values = None
