@@ -3446,6 +3446,14 @@ class ServerArgs:
                     "FAST_DLLM_V2 speculative decoding requires setting "
                     "--speculative-draft-model-path."
                 )
+            if self.speculative_draft_tp_size is None:
+                self.speculative_draft_tp_size = 1
+            elif int(self.speculative_draft_tp_size) != 1:
+                raise ValueError(
+                    "FAST_DLLM_V2 currently supports --speculative-draft-tp-size 1 "
+                    "only. The Hugging Face Fast_dLLM_v2 proposal runner is not "
+                    "tensor-parallel sharded yet."
+                )
 
             if self.speculative_num_steps is None:
                 self.speculative_num_steps = 1
@@ -3775,10 +3783,13 @@ class ServerArgs:
                     self.speculative_algorithm,
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
-        elif self.speculative_draft_tp_size is not None:
+        elif (
+            self.speculative_algorithm != "FAST_DLLM_V2"
+            and self.speculative_draft_tp_size is not None
+        ):
             raise ValueError(
                 "--speculative-draft-tp-size is currently only supported for "
-                "TLI and CO_DRAFT speculative decoding."
+                "TLI, CO_DRAFT, and FAST_DLLM_V2 speculative decoding."
             )
 
         if self.speculative_adaptive:
@@ -5785,10 +5796,10 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_draft_tp_size,
             help=(
-                "Colocated TLI only. Tensor-parallel size for the local draft "
-                "model. Use 1 for vLLM-style asymmetric colocated TLI, or omit/"
-                "set to the target --tp size for the existing symmetric path. "
-                "For disaggregated TLI, use --remote-draft-tp-size instead."
+                "Colocated TLI/CO_DRAFT/FAST_DLLM_V2 only. Tensor-parallel "
+                "size for the local draft model. TLI supports 1 or the target "
+                "--tp size; FAST_DLLM_V2 currently supports 1. For "
+                "disaggregated TLI, use --remote-draft-tp-size instead."
             ),
         )
         parser.add_argument(

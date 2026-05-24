@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import traceback
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -24,12 +26,27 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import resolve_dflash_verify_mask_policy
 from sglang.srt.speculative.linear_verify import (
+    LinearDraftBlock,
     build_linear_draft_block,
     build_linear_verify_input,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _BroadcastedFastDllmV2Proposal:
+    ok: bool
+    payload: Optional[dict] = None
+    error: Optional[str] = None
+
+
+def _cpu_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    return tensor.detach().to("cpu")
 
 
 class FastDllmV2Worker:
@@ -60,44 +77,62 @@ class FastDllmV2Worker:
         self.page_size = server_args.page_size
         self.tp_rank = tp_rank
         self.device = target_worker.device
+        self.tp_size = int(server_args.tp_size)
+        self.draft_tp_size = int(server_args.speculative_draft_tp_size)
+        self._is_draft_rank = tp_rank < self.draft_tp_size
         self.speculative_num_draft_tokens = int(
             server_args.speculative_num_draft_tokens
         )
         self.proposed_token_num = self.speculative_num_draft_tokens - 1
-        self.runner = FastDllmV2ProposalRunner(
-            FastDllmV2RunnerConfig.from_server_args(server_args)
+        self.runner = (
+            FastDllmV2ProposalRunner(
+                FastDllmV2RunnerConfig.from_server_args(server_args)
+            )
+            if self._is_draft_rank
+            else None
         )
         self._logged_first_verify = False
         if self.tp_rank == 0:
             logger.info(
                 "Initialized FAST_DLLM_V2 standalone speculator. "
-                "model=%s, verify_block=%s, proposed_tokens=%s.",
+                "model=%s, target_tp=%s, draft_tp=%s, verify_block=%s, "
+                "proposed_tokens=%s.",
                 server_args.speculative_draft_model_path,
+                self.tp_size,
+                self.draft_tp_size,
                 self.speculative_num_draft_tokens,
                 self.proposed_token_num,
+            )
+        elif not self._is_draft_rank:
+            logger.info(
+                "FAST_DLLM_V2: target TP rank %s is a passive draft participant.",
+                tp_rank,
             )
 
     def __getattr__(self, name):
         return getattr(self.target_worker, name)
 
     def clear_cache_pool(self):
-        self.runner.states.clear()
+        if self.runner is not None:
+            self.runner.states.clear()
 
     def release_request_ids(
         self, request_ids: list[str], *, cache_prefix: bool = True
     ) -> None:
         del cache_prefix
-        self.runner.release(request_ids)
+        if self.runner is not None:
+            self.runner.release(request_ids)
 
     def _request_input_ids(self, batch: ScheduleBatch) -> list[list[int]]:
         return [
             list(req.origin_input_ids) + list(req.output_ids) for req in batch.reqs
         ]
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch) -> None:
-        if batch.forward_mode.is_idle():
-            return
-
+    def _build_proposal_on_draft_rank(self, batch: ScheduleBatch) -> LinearDraftBlock:
+        if self.runner is None:
+            raise RuntimeError(
+                "FAST_DLLM_V2 proposal requested on a non-participating draft rank."
+            )
         input_ids = self._request_input_ids(batch)
         current_token_ids = torch.tensor(
             [ids[-1] for ids in input_ids],
@@ -113,11 +148,75 @@ class FastDllmV2Worker:
             proposed_token_num=self.proposed_token_num,
         )
         tokens = self.runner.propose(request)
-        block = build_linear_draft_block(
+        return build_linear_draft_block(
             current_token_ids=tokens.current_token_ids,
             proposed_token_ids=tokens.proposed_token_ids,
             prefix_lens=tokens.prefix_lens,
         )
+
+    def _serialize_linear_block(self, block: LinearDraftBlock) -> dict:
+        return {
+            "draft_token": _cpu_tensor(block.draft_token),
+            "positions": _cpu_tensor(block.positions),
+            "draft_token_num": block.draft_token_num,
+        }
+
+    def _deserialize_linear_block(self, payload: dict) -> LinearDraftBlock:
+        return LinearDraftBlock(
+            draft_token=payload["draft_token"].to(self.device, non_blocking=True),
+            positions=payload["positions"].to(self.device, non_blocking=True),
+            draft_token_num=int(payload["draft_token_num"]),
+        )
+
+    def _broadcast_proposal_result(
+        self,
+        payload: list[_BroadcastedFastDllmV2Proposal],
+    ) -> _BroadcastedFastDllmV2Proposal:
+        world_group = self.target_worker.world_group
+        return broadcast_pyobj(
+            payload,
+            world_group.rank,
+            world_group.cpu_group,
+            src=world_group.first_rank,
+        )[0]
+
+    def _propose_linear_block(self, batch: ScheduleBatch) -> LinearDraftBlock:
+        payload: list[_BroadcastedFastDllmV2Proposal]
+        if self._is_draft_rank:
+            try:
+                block = self._build_proposal_on_draft_rank(batch)
+                payload = [
+                    _BroadcastedFastDllmV2Proposal(
+                        ok=True,
+                        payload=self._serialize_linear_block(block),
+                    )
+                ]
+            except Exception:
+                logger.exception("FAST_DLLM_V2 proposal failed on draft rank.")
+                payload = [
+                    _BroadcastedFastDllmV2Proposal(
+                        ok=False,
+                        error=traceback.format_exc(),
+                    )
+                ]
+        else:
+            payload = []
+
+        broadcasted = self._broadcast_proposal_result(payload)
+        if not broadcasted.ok:
+            raise RuntimeError(
+                "FAST_DLLM_V2 proposal failed on draft rank:\n"
+                f"{broadcasted.error}"
+            )
+        if broadcasted.payload is None:
+            raise RuntimeError("FAST_DLLM_V2 proposal returned no payload.")
+        return self._deserialize_linear_block(broadcasted.payload)
+
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch) -> None:
+        if batch.forward_mode.is_idle():
+            return
+
+        block = self._propose_linear_block(batch)
         verify_input = build_linear_verify_input(
             block,
             requires_target_hidden=False,
@@ -191,12 +290,13 @@ class FastDllmV2Worker:
             req.output_ids[old_len:]
             for req, old_len in zip(batch.reqs, old_output_lens, strict=True)
         ]
-        self.runner.extend_after_accept(
-            IndependentDllmAcceptedTokens(
-                request_ids=[req.rid for req in batch.reqs],
-                accepted_token_ids=accepted_token_ids,
+        if self.runner is not None:
+            self.runner.extend_after_accept(
+                IndependentDllmAcceptedTokens(
+                    request_ids=[req.rid for req in batch.reqs],
+                    accepted_token_ids=accepted_token_ids,
+                )
             )
-        )
         for req, accepted in zip(
             batch.reqs, accept_length_per_req_cpu, strict=True
         ):

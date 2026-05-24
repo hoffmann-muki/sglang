@@ -439,8 +439,10 @@ without an AR co-draft:
 ```bash
 python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
+    --tp 4 \
     --speculative-algorithm FAST_DLLM_V2 \
     --speculative-draft-model-path Efficient-Large-Model/Fast_dLLM_v2_1.5B \
+    --speculative-draft-tp-size 1 \
     --speculative-num-draft-tokens 9 \
     --speculative-fast-dllm-v2-algorithm-config fast_dllm_v2.yaml
 ```
@@ -450,7 +452,10 @@ draft emits token ids, but it does not use DFlash's target-hidden-conditioned
 draft model or draft KV materialization. The verify block still includes the
 current token at column 0, so `--speculative-num-draft-tokens 9` means eight new
 Fast_dLLM_v2 proposal tokens per verify step. As with DFlash, this path is
-spec-v1 only and disables the overlap scheduler.
+spec-v1 only and disables the overlap scheduler. With
+`--speculative-draft-tp-size 1`, only target TP rank 0 loads and runs the
+Fast_dLLM_v2 proposal model; other target ranks receive the proposed linear
+verify block over the CPU process group and do not allocate draft-model weights.
 
 ### Draft-forward target/draft disaggregation
 
