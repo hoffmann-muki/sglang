@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 DEFAULT_PROMPT = "Write a short Python function that returns the factorial of n."
@@ -57,8 +57,12 @@ def main() -> None:
 def write_trace(args: argparse.Namespace) -> None:
     if args.disable_hub_kernels:
         os.environ["USE_HUB_KERNELS"] = "0"
+    config = AutoConfig.from_pretrained(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+    )
     if args.apply_sglang_compat:
-        apply_sglang_fast_dllm_v2_compat()
+        apply_sglang_fast_dllm_v2_compat(config)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path,
@@ -66,6 +70,7 @@ def write_trace(args: argparse.Namespace) -> None:
     )
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        config=config,
         torch_dtype=args.torch_dtype,
         device_map=args.device_map,
         trust_remote_code=args.trust_remote_code,
@@ -140,19 +145,21 @@ def write_trace(args: argparse.Namespace) -> None:
     print("generated text:", trace["generate"]["new_text"])
 
 
-def apply_sglang_fast_dllm_v2_compat() -> None:
+def apply_sglang_fast_dllm_v2_compat(config: Any) -> None:
     from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
         _disable_transformers_hub_kernels_for_fast_dllm_v2,
         _ensure_transformers_default_rope_support,
         _ensure_transformers_legacy_dynamic_cache_support,
         _ensure_transformers_tied_weights_support,
         _ensure_transformers_v453_sdpa_support,
+        _normalize_fast_dllm_v2_rope_config,
     )
 
     _ensure_transformers_default_rope_support()
     _ensure_transformers_tied_weights_support()
     _ensure_transformers_legacy_dynamic_cache_support()
     _ensure_transformers_v453_sdpa_support()
+    _normalize_fast_dllm_v2_rope_config(config)
     _disable_transformers_hub_kernels_for_fast_dllm_v2()
 
 
