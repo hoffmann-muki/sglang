@@ -496,16 +496,27 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             None,
         )
 
-    def test_default_rope_shim_registers_missing_default_key(self):
+    def test_default_rope_shim_installs_reference_initializer(self):
         import torch
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
         from unittest.mock import MagicMock
 
-        sentinel = ROPE_INIT_FUNCTIONS.pop("default", None)
+        sentinel = ROPE_INIT_FUNCTIONS.get("default")
+        ROPE_INIT_FUNCTIONS["default"] = lambda *args, **kwargs: (
+            torch.zeros(2),
+            1.0,
+        )
         try:
             _ensure_transformers_default_rope_support()
 
             self.assertIn("default", ROPE_INIT_FUNCTIONS)
+            self.assertTrue(
+                getattr(
+                    ROPE_INIT_FUNCTIONS["default"],
+                    "_sglang_fast_dllm_v2_v453_compat",
+                    False,
+                )
+            )
             inv_freq, attention_factor = ROPE_INIT_FUNCTIONS["default"](
                 MagicMock(
                     hidden_size=8,
@@ -516,6 +527,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             )
             self.assertEqual(attention_factor, 1.0)
             self.assertEqual(inv_freq.numel(), 2)
+            self.assertFalse(torch.equal(inv_freq, torch.zeros_like(inv_freq)))
         finally:
             if sentinel is not None:
                 ROPE_INIT_FUNCTIONS["default"] = sentinel

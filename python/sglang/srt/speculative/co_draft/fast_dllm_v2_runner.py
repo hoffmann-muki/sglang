@@ -70,17 +70,20 @@ def _compute_default_rope_parameters(
 def _ensure_transformers_default_rope_support() -> None:
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    if "default" in ROPE_INIT_FUNCTIONS:
+    current = ROPE_INIT_FUNCTIONS.get("default")
+    if getattr(current, "_sglang_fast_dllm_v2_v453_compat", False):
         return
 
-    # Fast_dLLM_v2 checkpoints use standard Qwen2.5-style RoPE when no
-    # scaling override is present. Some Transformers releases expose that path
-    # as a registered "default" rope_type and others compute it inline, so we
-    # register a local compatibility alias when needed.
+    # Fast_dLLM_v2 checkpoints use standard Qwen2.5-style RoPE when no scaling
+    # override is present. The model was validated against Transformers 4.53.1,
+    # while newer Transformers releases route "default" through a changed
+    # rope_parameters contract. For this remote model that can produce identity
+    # rotations (cos=1, sin=0), so install the reference initializer explicitly.
+    _compute_default_rope_parameters._sglang_fast_dllm_v2_v453_compat = True
     ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
     logger.warning(
-        "Registered a local Transformers RoPE compatibility shim for the "
-        "'default' rope_type."
+        "Registered a Transformers 4.53.1-compatible RoPE initializer for "
+        "Fast_dLLM_v2."
     )
 
 
