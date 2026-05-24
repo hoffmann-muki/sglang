@@ -512,6 +512,7 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
+    speculative_fast_dllm_v2_algorithm_config: Optional[str] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -3429,6 +3430,75 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
 
+        if self.speculative_algorithm == "FAST_DLLM_V2":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently FAST_DLLM_V2 speculative decoding does not support dp attention."
+                )
+
+            if self.pp_size != 1:
+                raise ValueError(
+                    "Currently FAST_DLLM_V2 speculative decoding only supports pp_size == 1."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "FAST_DLLM_V2 speculative decoding requires setting "
+                    "--speculative-draft-model-path."
+                )
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 1
+            elif int(self.speculative_num_steps) != 1:
+                logger.warning(
+                    "FAST_DLLM_V2 only supports speculative_num_steps == 1; "
+                    "overriding speculative_num_steps=%s to 1.",
+                    self.speculative_num_steps,
+                )
+                self.speculative_num_steps = 1
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            elif int(self.speculative_eagle_topk) != 1:
+                logger.warning(
+                    "FAST_DLLM_V2 only supports speculative_eagle_topk == 1; "
+                    "overriding speculative_eagle_topk=%s to 1.",
+                    self.speculative_eagle_topk,
+                )
+                self.speculative_eagle_topk = 1
+
+            if self.speculative_num_draft_tokens is None:
+                # Linear verification includes the current token at column 0.
+                # A verify block of 9 therefore asks Fast_dLLM_v2 for 8 new
+                # proposal tokens, matching the common smoke-test setting.
+                self.speculative_num_draft_tokens = 9
+            elif int(self.speculative_num_draft_tokens) <= 1:
+                raise ValueError(
+                    "FAST_DLLM_V2 requires --speculative-num-draft-tokens >= 2 "
+                    "because the verify block includes the current token."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for FAST_DLLM_V2 "
+                    "speculative decoding. You can override this by explicitly "
+                    "setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using FAST_DLLM_V2 speculative "
+                "decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "FAST_DLLM_V2 speculative decoding."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -5693,6 +5763,7 @@ class ServerArgs:
             type=str,
             choices=[
                 "DFLASH",
+                "FAST_DLLM_V2",
                 "EAGLE",
                 "EAGLE3",
                 "NEXTN",
@@ -5769,6 +5840,17 @@ class ServerArgs:
             "local cache (paged backends may retain up to one extra page on the left "
             "for alignment). Default is full context.",
             default=ServerArgs.speculative_dflash_draft_window_size,
+        )
+        parser.add_argument(
+            "--speculative-fast-dllm-v2-algorithm-config",
+            type=str,
+            help=(
+                "FAST_DLLM_V2 only. YAML/JSON config for the Fast_dLLM_v2 "
+                "proposal runner, including block_size, small_block_size, "
+                "threshold, generation_max_new_tokens, device_map, and "
+                "generation_kwargs."
+            ),
+            default=ServerArgs.speculative_fast_dllm_v2_algorithm_config,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

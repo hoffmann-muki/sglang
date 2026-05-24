@@ -32,6 +32,7 @@ from sglang.srt.speculative.linear_verify import (
     build_linear_draft_block,
     build_linear_verify_input,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.co_draft.tp import LocalDraftTpPlan
 
 
@@ -312,6 +313,53 @@ class TestDllmDraftExecutor(unittest.TestCase):
 
 
 class TestFastDllmV2ProposalRunner(unittest.TestCase):
+    def test_standalone_config_uses_linear_verify_width(self):
+        server_args = SimpleNamespace(
+            speculative_draft_model_path="fast-dllm",
+            speculative_fast_dllm_v2_algorithm_config=None,
+            speculative_num_draft_tokens=9,
+        )
+
+        config = FastDllmV2RunnerConfig.from_server_args(server_args)
+
+        self.assertEqual(config.model_path, "fast-dllm")
+        self.assertEqual(config.tokenizer_path, "fast-dllm")
+        self.assertEqual(config.proposed_token_num, 8)
+
+    def test_standalone_config_loads_generation_options(self):
+        with NamedTemporaryFile("w", suffix=".yaml") as config_file:
+            config_file.write(
+                "\n".join(
+                    [
+                        "tokenizer_path: fast-dllm-tokenizer",
+                        "block_size: 16",
+                        "small_block_size: 4",
+                        "threshold: 0.8",
+                        "generation_max_new_tokens: 128",
+                        "device_map: cuda:0",
+                        "generation_kwargs:",
+                        "  do_sample: false",
+                    ]
+                )
+            )
+            config_file.flush()
+            server_args = SimpleNamespace(
+                speculative_draft_model_path="fast-dllm",
+                speculative_fast_dllm_v2_algorithm_config=config_file.name,
+                speculative_num_draft_tokens=5,
+            )
+
+            config = FastDllmV2RunnerConfig.from_server_args(server_args)
+
+        self.assertEqual(config.tokenizer_path, "fast-dllm-tokenizer")
+        self.assertEqual(config.proposed_token_num, 4)
+        self.assertEqual(config.block_size, 16)
+        self.assertEqual(config.small_block_size, 4)
+        self.assertEqual(config.threshold, 0.8)
+        self.assertEqual(config.generation_max_new_tokens, 128)
+        self.assertEqual(config.device_map, "cuda:0")
+        self.assertEqual(config.generation_kwargs, {"do_sample": False})
+
     def test_config_loads_generation_options_from_yaml(self):
         with NamedTemporaryFile("w", suffix=".yaml") as config_file:
             config_file.write(
@@ -737,6 +785,10 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
 
 
 class TestLinearVerifyHelpers(unittest.TestCase):
+    def test_fast_dllm_algorithm_reuses_linear_verify_contract(self):
+        self.assertTrue(SpeculativeAlgorithm.FAST_DLLM_V2.uses_linear_verify())
+        self.assertFalse(SpeculativeAlgorithm.FAST_DLLM_V2.is_dflash())
+
     def test_builds_linear_block_from_independent_dllm_tokens(self):
         import torch
 
@@ -766,9 +818,26 @@ class TestLinearVerifyHelpers(unittest.TestCase):
         verify_input = build_linear_verify_input(block)
 
         self.assertEqual(verify_input.draft_token_num, 2)
+        self.assertTrue(verify_input.requires_target_hidden)
         self.assertEqual(verify_input.num_tokens_per_batch, 2)
         self.assertTrue(torch.equal(verify_input.draft_token, block.draft_token))
         self.assertTrue(torch.equal(verify_input.positions, block.positions))
+
+    def test_builds_linear_verify_input_without_target_hidden(self):
+        import torch
+
+        block = LinearDraftBlock(
+            draft_token=torch.tensor([1, 2]),
+            positions=torch.tensor([7, 8]),
+            draft_token_num=2,
+        )
+
+        verify_input = build_linear_verify_input(
+            block,
+            requires_target_hidden=False,
+        )
+
+        self.assertFalse(verify_input.requires_target_hidden)
 
     def test_adapter_converts_independent_tokens_to_linear_proposal(self):
         import torch

@@ -86,7 +86,11 @@ def build_linear_draft_block(
     )
 
 
-def build_linear_verify_input(block: LinearDraftBlock) -> DFlashVerifyInput:
+def build_linear_verify_input(
+    block: LinearDraftBlock,
+    *,
+    requires_target_hidden: bool = True,
+) -> DFlashVerifyInput:
     """Create the existing target-verify payload for a linear draft block.
 
     DFlashVerifyInput is intentionally reused here because attention backends and
@@ -98,4 +102,5 @@ def build_linear_verify_input(block: LinearDraftBlock) -> DFlashVerifyInput:
         draft_token=block.draft_token,
         positions=block.positions,
         draft_token_num=block.draft_token_num,
+        requires_target_hidden=requires_target_hidden,
     )

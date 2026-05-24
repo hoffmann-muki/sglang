@@ -2527,7 +2527,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
-            elif self.spec_algorithm.is_dflash():
+            elif self.spec_algorithm.uses_linear_verify():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
                 # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
@@ -2539,8 +2539,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     capture_hidden_mode=(
                         CaptureHiddenMode.NULL
                         if self.is_draft_worker
+                        or self.spec_algorithm.is_fast_dllm_v2()
                         else CaptureHiddenMode.FULL
                     ),
+                    requires_target_hidden=self.spec_algorithm.is_dflash(),
                 )
 
             elif self.spec_algorithm.is_ngram():

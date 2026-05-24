@@ -22,6 +22,7 @@ from sglang.srt.speculative.co_draft.dllm_linear_adapter import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.co_draft.executor import DllmDraftExecutor
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +492,43 @@ class FastDllmV2RunnerConfig:
             model_path=executor.model_path,
             tokenizer_path=executor.tokenizer_path,
             proposed_token_num=executor.verification_plan.proposed_token_num,
+            block_size=int(raw_config.get("block_size", 32)),
+            small_block_size=int(raw_config.get("small_block_size", 8)),
+            threshold=float(raw_config.get("threshold", 0.9)),
+            generation_max_new_tokens=_optional_positive_int(
+                raw_config.get("generation_max_new_tokens")
+            ),
+            torch_dtype=str(raw_config.get("torch_dtype", "auto")),
+            device_map=str(raw_config.get("device_map", "auto")),
+            trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
+            attn_implementation=_optional_str(
+                raw_config.get("attn_implementation", "sdpa")
+            ),
+            disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
+            generation_kwargs=generation_kwargs,
+        )
+
+    @classmethod
+    def from_server_args(
+        cls, server_args: "ServerArgs"
+    ) -> "FastDllmV2RunnerConfig":
+        raw_config = _load_algorithm_config(
+            server_args.speculative_fast_dllm_v2_algorithm_config
+        )
+        generation_kwargs = dict(raw_config.get("generation_kwargs", {}))
+        proposed_token_num = int(server_args.speculative_num_draft_tokens) - 1
+        if proposed_token_num <= 0:
+            raise ValueError(
+                "FAST_DLLM_V2 requires --speculative-num-draft-tokens >= 2 "
+                "because the linear verify block includes the current token."
+            )
+        tokenizer_path = raw_config.get(
+            "tokenizer_path", server_args.speculative_draft_model_path
+        )
+        return cls(
+            model_path=server_args.speculative_draft_model_path,
+            tokenizer_path=tokenizer_path,
+            proposed_token_num=proposed_token_num,
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),

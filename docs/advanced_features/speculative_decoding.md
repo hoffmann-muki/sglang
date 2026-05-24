@@ -433,6 +433,25 @@ completion before slicing proposal tokens.
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 
+Fast_dLLM_v2 can also run as the only speculative draft model for an AR target,
+without an AR co-draft:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B \
+    --speculative-algorithm FAST_DLLM_V2 \
+    --speculative-draft-model-path Efficient-Large-Model/Fast_dLLM_v2_1.5B \
+    --speculative-num-draft-tokens 9 \
+    --speculative-fast-dllm-v2-algorithm-config fast_dllm_v2.yaml
+```
+
+`FAST_DLLM_V2` reuses the DFlash linear target-verification contract after the
+draft emits token ids, but it does not use DFlash's target-hidden-conditioned
+draft model or draft KV materialization. The verify block still includes the
+current token at column 0, so `--speculative-num-draft-tokens 9` means eight new
+Fast_dLLM_v2 proposal tokens per verify step. As with DFlash, this path is
+spec-v1 only and disables the overlap scheduler.
+
 ### Draft-forward target/draft disaggregation
 
 ### Constraints

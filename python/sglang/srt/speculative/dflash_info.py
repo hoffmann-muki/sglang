@@ -163,6 +163,7 @@ class DFlashVerifyInput(SpecInput):
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+    requires_target_hidden: bool = True
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
@@ -476,6 +477,15 @@ class DFlashVerifyInput(SpecInput):
         )
         # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
         batch.seq_lens_sum += sum(commit_lens_cpu)
+
+        if not self.requires_target_hidden:
+            logits_output.hidden_states = None
+            return (
+                new_verified_id,
+                commit_lens,
+                torch.empty((0,), dtype=torch.float32, device=device),
+                accept_length_per_req_cpu,
+            )
 
         # Build next-step context features from the committed verify-input tokens.
         hidden = logits_output.hidden_states

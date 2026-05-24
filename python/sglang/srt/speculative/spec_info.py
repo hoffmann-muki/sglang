@@ -16,6 +16,7 @@ class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
     DFLASH = auto()
+    FAST_DLLM_V2 = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
@@ -49,6 +50,15 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_fast_dllm_v2(self) -> bool:
+        return self == SpeculativeAlgorithm.FAST_DLLM_V2
+
+    def uses_linear_verify(self) -> bool:
+        return self in (
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.FAST_DLLM_V2,
+        )
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -81,6 +91,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_fast_dllm_v2():
+            if enable_overlap:
+                raise ValueError(
+                    "FAST_DLLM_V2 does not support overlap scheduling (spec v2)."
+                )
+            from sglang.srt.speculative.fast_dllm_v2_worker import FastDllmV2Worker
+
+            return FastDllmV2Worker
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker

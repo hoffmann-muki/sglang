@@ -749,7 +749,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_tli()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.uses_linear_verify()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1224,7 +1224,7 @@ class CudaGraphRunner:
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                     or self.model_runner.spec_algorithm.is_tli()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.uses_linear_verify()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1375,7 +1375,7 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash():
+        elif self.model_runner.spec_algorithm.uses_linear_verify():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,
@@ -1398,8 +1398,10 @@ class CudaGraphRunner:
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL
                     if self.model_runner.is_draft_worker
+                    or self.model_runner.spec_algorithm.is_fast_dllm_v2()
                     else CaptureHiddenMode.FULL
                 ),
+                requires_target_hidden=self.model_runner.spec_algorithm.is_dflash(),
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

@@ -298,9 +298,12 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
-def validate_dflash_request(req: Req) -> Optional[str]:
+def validate_linear_spec_request(req: Req, algorithm_name: str) -> Optional[str]:
     if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+        return (
+            f"{algorithm_name} speculative decoding does not support "
+            "return_logprob yet."
+        )
 
     if (
         req.sampling_params.json_schema is not None
@@ -309,7 +312,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         or req.sampling_params.structural_tag is not None
     ):
         return (
-            "DFLASH speculative decoding does not support "
+            f"{algorithm_name} speculative decoding does not support "
             "grammar-constrained decoding yet."
         )
 
@@ -1995,8 +1998,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req)
+        if self.spec_algorithm.uses_linear_verify():
+            error_msg = validate_linear_spec_request(req, self.spec_algorithm.name)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
