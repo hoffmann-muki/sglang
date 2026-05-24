@@ -213,6 +213,30 @@ def _ensure_transformers_v453_sdpa_support() -> None:
     )
 
 
+def _normalize_fast_dllm_v2_rope_config(config: Any) -> bool:
+    """Restore the RoPE config shape used by Fast_dLLM_v2's reference stack.
+
+    Transformers 5.x standardizes the checkpoint's plain Qwen RoPE fields into
+    ``rope_scaling``/``rope_parameters`` dictionaries with ``rope_type="default"``.
+    Fast_dLLM_v2's remote model was validated on Transformers 4.53.1, where
+    those attributes are absent/None for this checkpoint. Leaving the 5.x
+    normalized dictionaries in place makes the remote rotary module emit
+    identity rotations (cos=1, sin=0), which corrupts attention while preserving
+    tensor shapes.
+    """
+
+    if getattr(config, "model_type", None) != "Fast_dLLM_Qwen":
+        return False
+
+    changed = False
+    for attr in ("rope_scaling", "rope_parameters"):
+        value = getattr(config, attr, None)
+        if isinstance(value, dict) and value.get("rope_type") == "default":
+            setattr(config, attr, None)
+            changed = True
+    return changed
+
+
 def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     if lhs.device.type == "meta" or rhs.device.type == "meta":
         return False
@@ -491,6 +515,7 @@ class TransformersFastDllmV2Runtime:
     def __init__(self):
         self.model = None
         self.tokenizer = None
+        self._rope_config_normalized = False
 
     def propose(
         self,
@@ -572,6 +597,7 @@ class TransformersFastDllmV2Runtime:
             "hub_kernels_disabled": config.disable_hub_kernels,
             "hub_kernels_env_changed": hub_kernels_disabled,
             "sdpa_compat": "transformers_4.53.1",
+            "rope_config_normalized": self._rope_config_normalized,
         }
         self.tokenizer = self._load_tokenizer(config)
 
@@ -584,9 +610,16 @@ class TransformersFastDllmV2Runtime:
         *,
         device_map: Optional[str],
     ) -> Any:
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        hf_config = AutoConfig.from_pretrained(
+            config.model_path,
+            trust_remote_code=config.trust_remote_code,
+        )
+        self._rope_config_normalized = _normalize_fast_dllm_v2_rope_config(hf_config)
 
         kwargs: dict[str, Any] = {
+            "config": hf_config,
             "torch_dtype": config.torch_dtype,
             "trust_remote_code": config.trust_remote_code,
         }

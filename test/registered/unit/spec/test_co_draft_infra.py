@@ -24,6 +24,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     _ensure_transformers_legacy_dynamic_cache_support,
     _ensure_transformers_tied_weights_support,
     _ensure_transformers_v453_sdpa_support,
+    _normalize_fast_dllm_v2_rope_config,
 )
 from sglang.srt.speculative.linear_verify import (
     LinearDraftBlock,
@@ -630,6 +631,32 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                 ALL_ATTENTION_FUNCTIONS["sdpa"] = original_sdpa
             except TypeError:
                 ALL_ATTENTION_FUNCTIONS.register("sdpa", original_sdpa)
+
+    def test_fast_dllm_rope_config_restores_reference_shape(self):
+        config = SimpleNamespace(
+            model_type="Fast_dLLM_Qwen",
+            rope_scaling={"rope_type": "default", "rope_theta": 1000000.0},
+            rope_parameters={"rope_type": "default", "rope_theta": 1000000.0},
+        )
+
+        changed = _normalize_fast_dllm_v2_rope_config(config)
+
+        self.assertTrue(changed)
+        self.assertIsNone(config.rope_scaling)
+        self.assertIsNone(config.rope_parameters)
+
+    def test_fast_dllm_rope_config_preserves_non_default_scaling(self):
+        config = SimpleNamespace(
+            model_type="Fast_dLLM_Qwen",
+            rope_scaling={"rope_type": "yarn", "factor": 2.0},
+            rope_parameters={"rope_type": "yarn", "factor": 2.0},
+        )
+
+        changed = _normalize_fast_dllm_v2_rope_config(config)
+
+        self.assertFalse(changed)
+        self.assertEqual(config.rope_scaling["rope_type"], "yarn")
+        self.assertEqual(config.rope_parameters["rope_type"], "yarn")
 
     def test_dynamic_cache_shim_registers_list_backed_legacy_cache(self):
         import torch
