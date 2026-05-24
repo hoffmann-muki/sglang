@@ -452,8 +452,8 @@ def json_safe_summary(trace: dict[str, Any]) -> dict[str, Any]:
 
 
 def compare_traces(args: argparse.Namespace) -> None:
-    good = torch.load(args.good, map_location="cpu")
-    test = torch.load(args.test, map_location="cpu")
+    good = torch.load(args.good, map_location="cpu", weights_only=False)
+    test = torch.load(args.test, map_location="cpu", weights_only=False)
 
     print("good transformers:", good["metadata"].get("transformers_version"))
     print("test transformers:", test["metadata"].get("transformers_version"))
@@ -505,7 +505,13 @@ def compare_event_tensors(
         lhs = good_map[key]
         rhs = test_map[key]
         if lhs.shape != rhs.shape:
-            rows.append((float("inf"), key, f"shape {tuple(lhs.shape)} != {tuple(rhs.shape)}"))
+            rows.append(
+                (
+                    float("inf"),
+                    key,
+                    f"shape {tuple(lhs.shape)} != {tuple(rhs.shape)}",
+                )
+            )
             continue
         rows.append((max_abs_diff(lhs, rhs), key, metric_string(lhs, rhs)))
 
@@ -530,9 +536,15 @@ def collect_named_tensors(events: list[dict[str, Any]]) -> dict[str, torch.Tenso
     return out
 
 
-def collect_tensors_from_object(prefix: str, value: Any, out: dict[str, torch.Tensor]) -> None:
+def collect_tensors_from_object(
+    prefix: str,
+    value: Any,
+    out: dict[str, torch.Tensor],
+) -> None:
     if isinstance(value, dict):
-        if value.get("type") == "tensor_summary" and torch.is_tensor(value.get("tensor")):
+        if value.get("type") == "tensor_summary" and torch.is_tensor(
+            value.get("tensor")
+        ):
             out[prefix] = value["tensor"]
             return
         for key, child in value.items():

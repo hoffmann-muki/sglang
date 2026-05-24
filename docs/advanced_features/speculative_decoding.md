@@ -409,7 +409,7 @@ python3 -m sglang.launch_server \
 
 CO_DRAFT keeps the target worker in autoregressive verification mode. Do not set the global `--dllm-algorithm` flags with CO_DRAFT; use `--codraft-dllm-algorithm` and `--codraft-dllm-algorithm-config` for the dLLM draft descriptor. Both local drafts currently support only two TP shapes: asymmetric TP=1 or symmetric TP=target `--tp`.
 
-For Fast_dLLM_v2 experiments, use `--codraft-dllm-backend fast_dllm_v2` to select the independent Fast_dLLM_v2 proposal runner. The runner lazy-loads the Hugging Face model through its `trust_remote_code=True` `generate` path, owns dLLM request state, applies accepted-token updates, and emits token blocks for linear AR-target verification. The remaining validation work is to run the real model on GPU and measure proposal quality, acceptance behavior, and latency.
+For Fast_dLLM_v2 experiments, use `--codraft-dllm-backend fast_dllm_v2` to select the independent Fast_dLLM_v2 proposal runner. The runner lazy-loads the Hugging Face model through its `trust_remote_code=True` `generate` path, owns dLLM request state, applies accepted-token updates, and emits token blocks for linear AR-target verification. It also installs a narrow Transformers 4.53.1 compatibility layer for Fast_dLLM_v2's remote model code, including Qwen-style RoPE, tied embeddings, SDPA, and legacy cache semantics. The remaining validation work is target-side acceptance behavior and proposal latency under serving workloads.
 
 The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_v2 generation parameters:
 

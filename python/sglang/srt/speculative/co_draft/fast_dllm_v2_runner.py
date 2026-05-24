@@ -33,7 +33,7 @@ def _compute_default_rope_parameters(
     device: Optional[torch.device] = None,
     seq_len: Optional[int] = None,
 ) -> tuple[torch.Tensor, float]:
-    """Compute standard RoPE parameters for the Fast_dLLM_v2 compatibility shim."""
+    """Compute the Qwen-style RoPE parameters used by Fast_dLLM_v2."""
 
     del seq_len
     if config is None:
@@ -75,17 +75,13 @@ def _ensure_transformers_default_rope_support() -> None:
     if getattr(current, "_sglang_fast_dllm_v2_v453_compat", False):
         return
 
-    # Fast_dLLM_v2 checkpoints use standard Qwen2.5-style RoPE when no scaling
-    # override is present. The model was validated against Transformers 4.53.1,
-    # while newer Transformers releases route "default" through a changed
-    # rope_parameters contract. For this remote model that can produce identity
-    # rotations (cos=1, sin=0), so install the reference initializer explicitly.
+    # Fast_dLLM_v2 was validated against the Transformers 4.53.1 Qwen-style
+    # "default" RoPE contract. Newer Transformers releases route "default"
+    # through a different rope_parameters contract, which can produce identity
+    # rotations for this remote model, so install the reference initializer.
     _compute_default_rope_parameters._sglang_fast_dllm_v2_v453_compat = True
     ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
-    logger.warning(
-        "Registered a Transformers 4.53.1-compatible RoPE initializer for "
-        "Fast_dLLM_v2."
-    )
+    logger.info("Registered Fast_dLLM_v2 Transformers 4.53.1 RoPE compatibility.")
 
 
 def _ensure_transformers_tied_weights_support() -> None:
@@ -121,14 +117,11 @@ def _ensure_transformers_tied_weights_support() -> None:
 
     _patched_get_expanded_tied_weights_keys._sglang_fast_dllm_v2_compat = True
     PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded_tied_weights_keys
-    logger.warning(
-        "Registered a local Transformers tied-weights compatibility shim for "
-        "Fast_dLLM_v2."
-    )
+    logger.info("Registered Fast_dLLM_v2 tied-weights compatibility.")
 
 
 def _disable_transformers_hub_kernels_for_fast_dllm_v2() -> bool:
-    """Disable Transformers Hub kernels for Fast_dLLM_v2 remote-code fidelity."""
+    """Disable Hub kernels before importing Fast_dLLM_v2 remote model code."""
 
     previous = os.environ.get("USE_HUB_KERNELS")
     if previous is None or previous.strip().upper() not in {"0", "OFF", "NO"}:
@@ -162,7 +155,7 @@ def _fast_dllm_v2_sdpa_attention_forward(
     is_causal: Optional[bool] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
-    """Transformers 4.53.1 SDPA wrapper for Fast_dLLM_v2 remote model code."""
+    """SDPA wrapper matching the Transformers 4.53.1 call contract."""
 
     del kwargs
     if hasattr(module, "num_key_value_groups"):
@@ -211,16 +204,13 @@ def _ensure_transformers_v453_sdpa_support() -> None:
         ALL_ATTENTION_FUNCTIONS.register(
             "sdpa", _fast_dllm_v2_sdpa_attention_forward
         )
-    logger.warning(
-        "Registered a Transformers 4.53.1-compatible SDPA shim for "
-        "Fast_dLLM_v2."
-    )
+    logger.info("Registered Fast_dLLM_v2 Transformers 4.53.1 SDPA compatibility.")
 
 
 def _normalize_fast_dllm_v2_rope_config(config: Any) -> bool:
     """Restore the RoPE config shape used by Fast_dLLM_v2's reference stack.
 
-    Transformers 5.x standardizes the checkpoint's plain Qwen RoPE fields into
+    Transformers 5.x normalizes the checkpoint's plain Qwen RoPE fields into
     ``rope_scaling``/``rope_parameters`` dictionaries with ``rope_type="default"``.
     Fast_dLLM_v2's remote model was validated on Transformers 4.53.1, where
     those attributes are absent/None for this checkpoint. Leaving the 5.x
@@ -269,12 +259,13 @@ def _fast_dllm_v2_reference_rotary_forward(
 def _patch_fast_dllm_v2_rotary_embedding_forward(model: Any) -> bool:
     """Patch Fast_dLLM_v2 rotary modules to the reference Qwen RoPE behavior."""
 
-    patched = False
+    found = False
+    changed = False
     for module in model.modules():
         if module.__class__.__name__ != "Fast_dLLM_QwenRotaryEmbedding":
             continue
+        found = True
         if getattr(module.forward, "_sglang_fast_dllm_v2_v453_compat", False):
-            patched = True
             continue
 
         def _forward(self, x, position_ids):
@@ -282,13 +273,13 @@ def _patch_fast_dllm_v2_rotary_embedding_forward(model: Any) -> bool:
 
         _forward._sglang_fast_dllm_v2_v453_compat = True
         module.forward = types.MethodType(_forward, module)
-        patched = True
-    if patched:
-        logger.warning(
-            "Patched Fast_dLLM_v2 rotary embedding forward to reference "
-            "Transformers 4.53.1 behavior."
+        changed = True
+    if changed:
+        logger.info(
+            "Patched Fast_dLLM_v2 rotary embedding forward for Transformers "
+            "4.53.1 compatibility."
         )
-    return patched
+    return found
 
 
 def _tensors_share_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
@@ -469,10 +460,7 @@ def _ensure_transformers_legacy_dynamic_cache_support() -> None:
             return cache
 
     cache_utils.DynamicCache = FastDllmV2LegacyDynamicCache
-    logger.warning(
-        "Registered a local Transformers legacy DynamicCache compatibility "
-        "shim for Fast_dLLM_v2."
-    )
+    logger.info("Registered Fast_dLLM_v2 legacy DynamicCache compatibility.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,10 +609,7 @@ class TransformersFastDllmV2Runtime:
         if self.model is not None:
             return
 
-        _ensure_transformers_default_rope_support()
-        _ensure_transformers_tied_weights_support()
-        _ensure_transformers_legacy_dynamic_cache_support()
-        _ensure_transformers_v453_sdpa_support()
+        self._install_transformers_compat()
         hub_kernels_disabled = False
         if config.disable_hub_kernels:
             hub_kernels_disabled = _disable_transformers_hub_kernels_for_fast_dllm_v2()
@@ -658,6 +643,12 @@ class TransformersFastDllmV2Runtime:
             "rotary_forward_patched": rotary_forward_patched,
         }
         self.tokenizer = self._load_tokenizer(config)
+
+    def _install_transformers_compat(self) -> None:
+        _ensure_transformers_default_rope_support()
+        _ensure_transformers_tied_weights_support()
+        _ensure_transformers_legacy_dynamic_cache_support()
+        _ensure_transformers_v453_sdpa_support()
 
     def _has_accelerate(self) -> bool:
         return importlib.util.find_spec("accelerate") is not None

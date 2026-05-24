@@ -694,10 +694,13 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             torch.zeros(1, 4, 8),
             torch.arange(4).reshape(1, 4),
         )
+        expected_inv_freq = torch.tensor([1.0, 0.01])
+        expected_freqs = torch.arange(4).reshape(1, 4, 1) * expected_inv_freq
+        expected = torch.cat([expected_freqs, expected_freqs], dim=-1)
 
         self.assertTrue(patched)
-        self.assertGreater(cos.std().item(), 0.0)
-        self.assertGreater(sin.std().item(), 0.0)
+        self.assertTrue(torch.allclose(cos, expected.cos(), atol=1e-6))
+        self.assertTrue(torch.allclose(sin, expected.sin(), atol=1e-6))
 
     def test_dynamic_cache_shim_registers_list_backed_legacy_cache(self):
         import torch
