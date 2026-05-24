@@ -409,27 +409,35 @@ python3 -m sglang.launch_server \
 
 CO_DRAFT keeps the target worker in autoregressive verification mode. Do not set the global `--dllm-algorithm` flags with CO_DRAFT; use `--codraft-dllm-algorithm` and `--codraft-dllm-algorithm-config` for the dLLM draft descriptor. Both local drafts currently support only two TP shapes: asymmetric TP=1 or symmetric TP=target `--tp`.
 
-For Fast_dLLM_v2 experiments, use `--codraft-dllm-backend fast_dllm_v2` to select the independent Fast_dLLM_v2 proposal runner. The runner lazy-loads the Hugging Face model through its `trust_remote_code=True` `generate` path, owns dLLM request state, applies accepted-token updates, and emits token blocks for linear AR-target verification. It also installs a narrow Transformers 4.53.1 compatibility layer for Fast_dLLM_v2's remote model code, including Qwen-style RoPE, tied embeddings, SDPA, and legacy cache semantics. The remaining validation work is target-side acceptance behavior and proposal latency under serving workloads.
+For Fast_dLLM_v2 experiments, use `--codraft-dllm-backend fast_dllm_v2` to select
+the independent Fast_dLLM_v2 proposal runner. The runner lazy-loads the Hugging
+Face model with `trust_remote_code=True`, owns dLLM request state, applies
+accepted-token updates, and emits token blocks for linear AR-target
+verification. It uses a proposal loop that mirrors Fast_dLLM_v2's
+block-diffusion sampling behavior and returns as soon as the next contiguous
+proposal window is concrete. The SGLang path does not call the model's Hugging
+Face `generate()` wrapper during serving. It also installs a
+narrow Transformers 4.53.1 compatibility layer for Fast_dLLM_v2's remote model
+code, including Qwen-style RoPE, tied embeddings, SDPA, and legacy cache
+semantics. The remaining validation work is target-side acceptance behavior and
+proposal latency under serving workloads.
 
-The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_v2 generation parameters:
+The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_v2 proposal parameters:
 
 ```yaml
 block_size: 32
 small_block_size: 8
 threshold: 0.9
-generation_max_new_tokens: 128  # optional; omitting it uses the smallest block-aligned budget
 torch_dtype: auto
 device_map: auto
 trust_remote_code: true
-generation_kwargs: {}
+proposal_kwargs: {}
 ```
 
-Fast_dLLM_v2 decodes in complete diffusion blocks. The runner therefore
-requests enough internal block budget for the model's `generate` path and then
-slices the first `--speculative-num-draft-tokens` proposed tokens for target
-verification. Set `generation_max_new_tokens` when you want to match the
-standalone Hugging Face examples that generate a longer block-diffusion
-completion before slicing proposal tokens.
+Fast_dLLM_v2 decodes by iteratively filling masked diffusion blocks. The SGLang
+proposal loop computes the minimal block-aligned budget needed for the next
+proposal window and stops when the first `--speculative-num-draft-tokens`
+proposal positions are filled and contiguous.
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 

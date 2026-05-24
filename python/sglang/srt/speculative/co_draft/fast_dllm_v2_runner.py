@@ -27,6 +27,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FAST_DLLM_V2_REFERENCE_TRANSFORMERS_VERSION = "4.53.1"
+FAST_DLLM_V2_MASK_ID = 151665
+FAST_DLLM_V2_STOP_TOKEN = 151645
+FAST_DLLM_V2_PROPOSAL_KWARGS = {
+    "do_sample",
+    "mask_id",
+    "stop_token",
+    "temperature",
+    "top_p",
+    "use_block_cache",
+}
+
+
+class _FastDllmV2ProposalUnsupported(RuntimeError):
+    """Raised when SGLang's Fast_dLLM_v2 path cannot honor a request."""
 
 
 def _compute_default_rope_parameters(
@@ -474,20 +488,19 @@ class FastDllmV2RunnerConfig:
     block_size: int = 32
     small_block_size: int = 8
     threshold: float = 0.9
-    generation_max_new_tokens: Optional[int] = None
     torch_dtype: str = "auto"
     device_map: str = "auto"
     trust_remote_code: bool = True
     attn_implementation: Optional[str] = "sdpa"
     disable_hub_kernels: bool = True
-    generation_kwargs: dict[str, Any] = field(default_factory=dict)
+    proposal_kwargs: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_executor(
         cls, executor: "DllmDraftExecutor"
     ) -> "FastDllmV2RunnerConfig":
         raw_config = _load_algorithm_config(executor.algorithm_config)
-        generation_kwargs = dict(raw_config.get("generation_kwargs", {}))
+        proposal_kwargs = dict(raw_config.get("proposal_kwargs", {}))
         return cls(
             model_path=executor.model_path,
             tokenizer_path=executor.tokenizer_path,
@@ -495,9 +508,6 @@ class FastDllmV2RunnerConfig:
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
-            generation_max_new_tokens=_optional_positive_int(
-                raw_config.get("generation_max_new_tokens")
-            ),
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
             device_map=str(raw_config.get("device_map", "auto")),
             trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
@@ -505,7 +515,7 @@ class FastDllmV2RunnerConfig:
                 raw_config.get("attn_implementation", "sdpa")
             ),
             disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
-            generation_kwargs=generation_kwargs,
+            proposal_kwargs=proposal_kwargs,
         )
 
     @classmethod
@@ -515,7 +525,7 @@ class FastDllmV2RunnerConfig:
         raw_config = _load_algorithm_config(
             server_args.speculative_fast_dllm_v2_algorithm_config
         )
-        generation_kwargs = dict(raw_config.get("generation_kwargs", {}))
+        proposal_kwargs = dict(raw_config.get("proposal_kwargs", {}))
         proposed_token_num = int(server_args.speculative_num_draft_tokens) - 1
         if proposed_token_num <= 0:
             raise ValueError(
@@ -532,9 +542,6 @@ class FastDllmV2RunnerConfig:
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
-            generation_max_new_tokens=_optional_positive_int(
-                raw_config.get("generation_max_new_tokens")
-            ),
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
             device_map=str(raw_config.get("device_map", "auto")),
             trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
@@ -542,7 +549,7 @@ class FastDllmV2RunnerConfig:
                 raw_config.get("attn_implementation", "sdpa")
             ),
             disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
-            generation_kwargs=generation_kwargs,
+            proposal_kwargs=proposal_kwargs,
         )
 
 
@@ -586,10 +593,8 @@ class FastDllmV2Runtime(Protocol):
 class TransformersFastDllmV2Runtime:
     """Lazy Transformers runtime for Fast_dLLM_v2 proposal generation.
 
-    This path intentionally uses the model's own ``generate`` implementation
-    with ``trust_remote_code=True``. The surrounding runner owns request state;
-    model-specific hierarchical/block-cache behavior remains inside the
-    Fast_dLLM_v2 model implementation.
+    SGLang mirrors Fast_dLLM_v2's block-diffusion sampler directly so
+    speculative serving can stop once a contiguous proposal window is concrete.
     """
 
     def __init__(self):
@@ -607,7 +612,7 @@ class TransformersFastDllmV2Runtime:
         proposed = []
         for request_id in request.request_ids:
             input_ids = states[request_id].input_ids
-            generated = self._generate_one(config, input_ids)
+            generated = self._propose_one(config, input_ids)
             proposed.append(generated)
 
         proposed_token_ids = torch.stack(proposed).to(request.current_token_ids.device)
@@ -622,7 +627,6 @@ class TransformersFastDllmV2Runtime:
                 "block_size": config.block_size,
                 "small_block_size": config.small_block_size,
                 "threshold": config.threshold,
-                "generation_max_new_tokens": config.generation_max_new_tokens,
                 **getattr(self, "model_metadata", {}),
             },
         )
@@ -741,55 +745,300 @@ class TransformersFastDllmV2Runtime:
                 )
         return model
 
-    def _generate_one(
+    @torch.no_grad()
+    def _propose_one(
         self,
         config: FastDllmV2RunnerConfig,
         input_ids: list[int],
     ) -> torch.Tensor:
+        """Run Fast_dLLM_v2 sampling only until the next proposal block is ready.
+
+        In the speculative path we only need the next contiguous proposal
+        tokens, so this mirrors Fast_dLLM_v2's reference block-diffusion loop
+        and returns as soon as those positions are no longer masked.
+        """
+
         assert self.model is not None
         assert self.tokenizer is not None
+        self._validate_proposal_config(config)
+
         device = self.model.device
         prompt = torch.tensor([input_ids], dtype=torch.long, device=device)
-        internal_max_new_tokens = _fast_dllm_v2_internal_generation_budget(
-            prompt.shape[1],
-            config.proposed_token_num,
-            config.block_size,
-        )
-        if config.generation_max_new_tokens is not None:
-            internal_max_new_tokens = max(
-                internal_max_new_tokens,
-                config.generation_max_new_tokens,
+        original_prompt_len = prompt.shape[1]
+        proposed_token_num = config.proposed_token_num
+        block_size = config.block_size
+        small_block_size = config.small_block_size
+        if block_size <= 0 or small_block_size <= 0 or block_size % small_block_size:
+            raise ValueError(
+                "Fast_dLLM_v2 requires a positive small_block_size that divides "
+                "block_size."
             )
-        output = self.model.generate(
-            prompt,
-            tokenizer=self.tokenizer,
-            max_new_tokens=internal_max_new_tokens,
-            block_size=config.block_size,
-            small_block_size=config.small_block_size,
-            threshold=config.threshold,
-            **config.generation_kwargs,
+
+        kwargs = config.proposal_kwargs
+        mask_id = int(kwargs.get("mask_id", FAST_DLLM_V2_MASK_ID))
+        stop_token = int(kwargs.get("stop_token", FAST_DLLM_V2_STOP_TOKEN))
+        top_p = float(kwargs.get("top_p", 0.95))
+        temperature = float(kwargs.get("temperature", 0.0))
+        threshold = config.threshold
+        use_block_cache = bool(kwargs.get("use_block_cache", False))
+
+        max_new_tokens = _fast_dllm_v2_internal_generation_budget(
+            original_prompt_len,
+            proposed_token_num,
+            block_size,
         )
-        new_tokens = output[
-            0, prompt.shape[1] : prompt.shape[1] + config.proposed_token_num
-        ]
-        if new_tokens.numel() == config.proposed_token_num:
-            return new_tokens
+
+        input_tensor = prompt
+        seq_len = torch.tensor([original_prompt_len], device=device, dtype=torch.long)
+        min_len = int(seq_len.min().item())
+        num_blocks = max_new_tokens // block_size + int(seq_len.max().item()) // block_size
+
+        if min_len > block_size:
+            prefix_len = min_len // block_size * block_size
+            output = self.model.forward(
+                input_ids=input_tensor[:, :prefix_len],
+                use_cache=True,
+                update_past_key_values=True,
+                block_size=block_size,
+            )
+            logits, past_key_values = output.logits, output.past_key_values
+            if min_len % block_size == 0:
+                next_token = logits[:, -1:, :].argmax(dim=-1)
+                if input_tensor.shape[1] <= min_len:
+                    input_tensor = torch.cat([input_tensor, next_token], dim=1)
+                else:
+                    input_tensor[:, min_len] = next_token.squeeze(dim=-1)
+                ready = self._first_contiguous_proposal(
+                    input_tensor,
+                    original_prompt_len,
+                    proposed_token_num,
+                    mask_id,
+                )
+                if ready is not None:
+                    return ready
+        else:
+            past_key_values = None
+
+        seq_block_idx = seq_len // block_size
+        start_block_idx = min_len // block_size
+        num_small_blocks = block_size // small_block_size
+
+        for block_idx in range(start_block_idx, num_blocks):
+            if (seq_block_idx == block_idx).all():
+                mask_count = block_size - input_tensor.shape[1] % block_size
+                x_init = torch.full(
+                    (input_tensor.shape[0], mask_count),
+                    mask_id,
+                    device=device,
+                    dtype=torch.long,
+                )
+                x_init = torch.cat([input_tensor, x_init], dim=1)
+            else:
+                x_init = input_tensor[:, : (block_idx + 1) * block_size]
+
+            x_t = x_init.clone()
+            block_past_key_values = None
+
+            while True:
+                ready = self._first_contiguous_proposal(
+                    x_t,
+                    original_prompt_len,
+                    proposed_token_num,
+                    mask_id,
+                )
+                if ready is not None:
+                    return ready
+
+                mask_idx = x_t[:, -block_size:] == mask_id
+                if mask_idx.sum() == 0:
+                    output = self.model.forward(
+                        input_ids=x_t[:, -block_size:],
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                        update_past_key_values=True,
+                        block_size=block_size,
+                    )
+                    logits, past_key_values = output.logits, output.past_key_values
+                    next_token = logits[:, -1:, :].argmax(dim=-1)
+                    x_t = torch.cat([x_t, next_token], dim=1)
+                    break
+
+                for small_block_idx in range(num_small_blocks):
+                    small_block_start_idx = small_block_idx * small_block_size
+                    small_block_end_idx = small_block_start_idx + small_block_size
+                    start = -block_size + small_block_start_idx
+                    end = (
+                        None
+                        if block_size == small_block_end_idx
+                        else -block_size + small_block_end_idx
+                    )
+
+                    while True:
+                        ready = self._first_contiguous_proposal(
+                            x_t,
+                            original_prompt_len,
+                            proposed_token_num,
+                            mask_id,
+                        )
+                        if ready is not None:
+                            return ready
+
+                        mask_idx = x_t[:, -block_size:] == mask_id
+                        if mask_idx[:, start:end].sum() == 0:
+                            break
+
+                        if use_block_cache:
+                            block_start = -block_size + small_block_start_idx
+                            if (
+                                block_past_key_values is None
+                                or (x_t[:, block_start] == mask_id).any()
+                            ):
+                                output = self.model.forward(
+                                    input_ids=x_t[:, -block_size:],
+                                    use_cache=True,
+                                    past_key_values=past_key_values,
+                                    update_past_key_values=False,
+                                    use_block_cache=True,
+                                )
+                                logits = output.logits
+                                block_past_key_values = output.block_past_key_values
+                                logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                logits = logits[:, start:end]
+                            else:
+                                logits = self.model.forward(
+                                    input_ids=x_t[:, start:end],
+                                    use_cache=True,
+                                    past_key_values=past_key_values,
+                                    update_past_key_values=False,
+                                    use_block_cache=True,
+                                    block_past_key_values=block_past_key_values,
+                                    replace_position=small_block_start_idx,
+                                ).logits
+                                logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                        else:
+                            logits = self.model.forward(
+                                input_ids=x_t[:, -block_size:],
+                                use_cache=True,
+                                past_key_values=past_key_values,
+                                update_past_key_values=False,
+                            ).logits
+                            logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                            logits = logits[:, start:end]
+
+                        x_1, p_1t = self.model.sample_with_top_p(
+                            logits,
+                            top_p=top_p,
+                            temperature=temperature,
+                        )
+                        x1_p = torch.squeeze(
+                            torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)),
+                            -1,
+                        )
+                        x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
+
+                        unmask_idx = x1_p > threshold
+                        max_prob_idx = x1_p.argmax(dim=-1)
+                        row_idx = torch.arange(x_1.shape[0], device=x_1.device)
+                        unmask_idx[row_idx, max_prob_idx] = True
+                        unmask_idx = unmask_idx & mask_idx[:, start:end]
+                        target_slice = x_t[:, start:end]
+                        target_slice[unmask_idx] = x_1[unmask_idx]
+
+                        if ((x_1 == stop_token) & unmask_idx).any():
+                            ready = self._first_contiguous_proposal(
+                                x_t,
+                                original_prompt_len,
+                                proposed_token_num,
+                                mask_id,
+                            )
+                            if ready is not None:
+                                return ready
+
+            if input_tensor.shape[1] == x_t.shape[1]:
+                input_tensor = x_t
+            else:
+                input_tensor[:, : (block_idx + 1) * block_size] = x_t[:, :-1]
+                if (seq_block_idx == block_idx).all():
+                    input_tensor = torch.cat([input_tensor, x_t[:, -1:]], dim=1)
+                elif input_tensor.shape[1] <= (block_idx + 1) * block_size:
+                    input_tensor = x_t
+                else:
+                    input_tensor[
+                        seq_block_idx == block_idx, (block_idx + 1) * block_size
+                    ] = x_t[
+                        seq_block_idx == block_idx, (block_idx + 1) * block_size
+                    ]
+            seq_block_idx[seq_block_idx == block_idx] = block_idx + 1
+
+        ready = self._first_contiguous_proposal(
+            input_tensor,
+            original_prompt_len,
+            proposed_token_num,
+            mask_id,
+        )
+        if ready is not None:
+            return ready
+        return self._pad_proposal(input_tensor, original_prompt_len, config, mask_id)
+
+    def _validate_proposal_config(self, config: FastDllmV2RunnerConfig) -> None:
+        assert self.model is not None
+        unsupported_kwargs = sorted(
+            set(config.proposal_kwargs) - FAST_DLLM_V2_PROPOSAL_KWARGS
+        )
+        if unsupported_kwargs:
+            raise _FastDllmV2ProposalUnsupported(
+                "SGLang's Fast_dLLM_v2 proposal path does not support "
+                f"proposal_kwargs: {unsupported_kwargs}"
+            )
+        if not hasattr(self.model, "sample_with_top_p"):
+            raise _FastDllmV2ProposalUnsupported(
+                "Fast_dLLM_v2 model does not expose sample_with_top_p"
+            )
+
+    def _first_contiguous_proposal(
+        self,
+        token_ids: torch.Tensor,
+        prompt_len: int,
+        proposed_token_num: int,
+        mask_id: int,
+    ) -> Optional[torch.Tensor]:
+        end = prompt_len + proposed_token_num
+        if token_ids.shape[1] < end:
+            return None
+        candidate = token_ids[0, prompt_len:end]
+        if (candidate == mask_id).any():
+            return None
+        return candidate.clone()
+
+    def _pad_proposal(
+        self,
+        token_ids: torch.Tensor,
+        prompt_len: int,
+        config: FastDllmV2RunnerConfig,
+        mask_id: int,
+    ) -> torch.Tensor:
+        assert self.tokenizer is not None
+        device = token_ids.device
+        candidate = token_ids[0, prompt_len : prompt_len + config.proposed_token_num]
+        candidate = candidate[candidate != mask_id]
+        if candidate.numel() >= config.proposed_token_num:
+            return candidate[: config.proposed_token_num].clone()
 
         pad_id = self.tokenizer.eos_token_id
         if pad_id is None:
             pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
             raise ValueError(
-                "Fast_dLLM_v2 generated fewer tokens than requested and no EOS/PAD "
-                "token is available for padding."
+                "Fast_dLLM_v2 proposal produced too few concrete tokens and "
+                "no EOS/PAD token is available for padding."
             )
         padding = torch.full(
-            (config.proposed_token_num - new_tokens.numel(),),
+            (config.proposed_token_num - candidate.numel(),),
             int(pad_id),
             dtype=torch.long,
             device=device,
         )
-        return torch.cat([new_tokens, padding], dim=0)
+        return torch.cat([candidate.clone(), padding], dim=0)
 
 
 class FastDllmV2ProposalRunner:
@@ -854,15 +1103,6 @@ def _load_algorithm_config(config_path: Optional[str]) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("Fast_dLLM_v2 algorithm config must be a mapping.")
     return raw
-
-
-def _optional_positive_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    parsed = int(value)
-    if parsed <= 0:
-        raise ValueError("Fast_dLLM_v2 generation_max_new_tokens must be positive.")
-    return parsed
 
 
 def _optional_str(value: Any) -> Optional[str]:

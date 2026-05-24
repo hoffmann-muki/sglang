@@ -335,9 +335,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.8",
-                        "generation_max_new_tokens: 128",
                         "device_map: cuda:0",
-                        "generation_kwargs:",
+                        "proposal_kwargs:",
                         "  do_sample: false",
                     ]
                 )
@@ -356,9 +355,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.8)
-        self.assertEqual(config.generation_max_new_tokens, 128)
         self.assertEqual(config.device_map, "cuda:0")
-        self.assertEqual(config.generation_kwargs, {"do_sample": False})
+        self.assertEqual(config.proposal_kwargs, {"do_sample": False})
 
     def test_config_loads_generation_options_from_yaml(self):
         with NamedTemporaryFile("w", suffix=".yaml") as config_file:
@@ -368,11 +366,10 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.75",
-                        "generation_max_new_tokens: 128",
                         "device_map: cuda:0",
                         "attn_implementation: sdpa",
                         "disable_hub_kernels: true",
-                        "generation_kwargs:",
+                        "proposal_kwargs:",
                         "  do_sample: false",
                     ]
                 )
@@ -402,11 +399,10 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.75)
-        self.assertEqual(config.generation_max_new_tokens, 128)
         self.assertEqual(config.device_map, "cuda:0")
         self.assertEqual(config.attn_implementation, "sdpa")
         self.assertTrue(config.disable_hub_kernels)
-        self.assertEqual(config.generation_kwargs, {"do_sample": False})
+        self.assertEqual(config.proposal_kwargs, {"do_sample": False})
 
     def test_internal_generation_budget_is_block_aligned(self):
         self.assertEqual(
@@ -506,7 +502,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertNotIn("r0", runner.states)
         self.assertEqual(runtime.released, ["r0"])
 
-    def test_runner_falls_back_without_accelerate(self):
+    def test_runtime_loads_without_accelerate(self):
         import torch
         from unittest.mock import MagicMock
 
@@ -519,31 +515,33 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         transformer_runtime._has_accelerate = MagicMock(return_value=False)
         fake_model = MagicMock()
         fake_model.device = torch.device("cpu")
-        fake_model.generate = MagicMock(
-            return_value=torch.tensor([[10, 11, 12, 101, 102]])
-        )
         transformer_runtime._load_model = MagicMock(return_value=fake_model)
         transformer_runtime._load_tokenizer = MagicMock(return_value=MagicMock())
 
-        request = IndependentDllmDraftRequest(
-            request_ids=["r0"],
-            input_ids=[[10, 11, 12]],
-            current_token_ids=torch.tensor([12]),
-            prefix_lens=torch.tensor([3]),
-            proposed_token_num=2,
-        )
-
-        transformer_runtime.propose(
-            config,
-            request,
-            {"r0": MagicMock(input_ids=[10, 11, 12])},
-        )
+        transformer_runtime._ensure_loaded(config)
 
         transformer_runtime._load_model.assert_called_once()
         self.assertEqual(
             transformer_runtime._load_model.call_args.kwargs["device_map"],
             None,
         )
+
+    def test_transformers_runtime_rejects_unsupported_proposal_kwargs(self):
+        transformer_runtime = TransformersFastDllmV2Runtime()
+        transformer_runtime.model = SimpleNamespace()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "does not support proposal_kwargs",
+        ):
+            transformer_runtime._validate_proposal_config(
+                FastDllmV2RunnerConfig(
+                    model_path="fast-dllm",
+                    tokenizer_path="fast-dllm",
+                    proposed_token_num=2,
+                    proposal_kwargs={"unsupported": True},
+                )
+            )
 
     def test_default_rope_shim_installs_reference_initializer(self):
         import torch
