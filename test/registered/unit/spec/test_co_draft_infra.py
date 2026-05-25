@@ -525,6 +525,34 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(state.draft_lookahead, [12, 13, 14, 15, 16, 17])
         runtime._propose_one.assert_called_once_with(config, [10, 11, 12, 13])
 
+    def test_transformers_runtime_metadata_reports_default_block_cache(self):
+        import torch
+
+        runtime = TransformersFastDllmV2Runtime()
+        runtime._ensure_loaded = lambda _config: None
+        runtime._propose_from_state = lambda _config, _state: torch.tensor([11, 12])
+        runtime.model_metadata = {}
+        state = FastDllmV2RequestState(input_ids=[10])
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=2,
+        )
+
+        tokens = runtime.propose(
+            config,
+            IndependentDllmDraftRequest(
+                request_ids=["r0"],
+                input_ids=[[10]],
+                current_token_ids=torch.tensor([10]),
+                prefix_lens=torch.tensor([1]),
+                proposed_token_num=2,
+            ),
+            {"r0": state},
+        )
+
+        self.assertTrue(tokens.metadata["use_block_cache"])
+
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch
 

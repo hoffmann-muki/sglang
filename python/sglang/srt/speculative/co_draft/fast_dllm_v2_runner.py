@@ -628,6 +628,9 @@ class TransformersFastDllmV2Runtime:
                 "block_size": config.block_size,
                 "small_block_size": config.small_block_size,
                 "threshold": config.threshold,
+                "use_block_cache": bool(
+                    config.proposal_kwargs.get("use_block_cache", True)
+                ),
                 **getattr(self, "model_metadata", {}),
             },
         )
@@ -821,7 +824,7 @@ class TransformersFastDllmV2Runtime:
         top_p = float(kwargs.get("top_p", 0.95))
         temperature = float(kwargs.get("temperature", 0.0))
         threshold = config.threshold
-        use_block_cache = bool(kwargs.get("use_block_cache", False))
+        use_block_cache = bool(kwargs.get("use_block_cache", True))
 
         max_new_tokens = _fast_dllm_v2_internal_generation_budget(
             original_prompt_len,
