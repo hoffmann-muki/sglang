@@ -861,6 +861,35 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             [1, 2],
         )
 
+    def test_native_trace_recorder_can_write_shape_only_summaries(self):
+        import json
+        import tempfile
+        import torch
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "native_trace.pt"
+            recorder = _FastDllmV2NativeTraceRecorder(
+                str(trace_path),
+                max_events=2,
+                tensor_stats=False,
+                flush_interval=2,
+            )
+            recorder.set_phase("prefix")
+            recorder.record(
+                "model_runner.forward",
+                "output",
+                {"full_logits": torch.tensor([[0.1, 0.3, 0.2]])},
+            )
+            recorder.flush()
+
+            summary = json.loads(trace_path.with_suffix(".json").read_text())
+
+        logits_summary = summary["native"]["events"][0]["payload"]["full_logits"]
+        self.assertEqual(logits_summary["shape"], [1, 3])
+        self.assertNotIn("mean", logits_summary)
+        self.assertNotIn("last_row_topk", logits_summary)
+
     def test_transformers_runtime_metadata_reports_block_cache_setting(self):
         import torch
 

@@ -450,7 +450,9 @@ proposal_kwargs:
   # Optional native-runtime trace. Keep this disabled outside debugging.
   # trace_path: /tmp/fast_dllm_v2_native_trace.pt
   # trace_max_events: 128
+  # trace_tensor_stats: true
   # trace_full_tensors: false
+  # trace_flush_interval: 1
   # trace_topk: 8
 ```
 
@@ -460,7 +462,10 @@ time, sampling time, lookahead reuse, and block-cache path usage. Leave it off
 for normal serving. Set `proposal_kwargs.trace_path` only when debugging the
 experimental `runtime: sglang_native` path; it writes both `.pt` and `.json`
 native forward traces, including prefix/block-cache forward metadata and
-first-layer module hooks.
+first-layer module hooks. Full tracing is intrusive: even tensor summaries can
+force CUDA synchronization. For low-overhead event-shape traces, keep
+`trace_full_tensors: false`, set `trace_tensor_stats: false`, and use a larger
+`trace_flush_interval`. For performance runs, omit `trace_path` entirely.
 
 Fast_dLLM_v2 decodes by iteratively filling masked diffusion blocks. The current
 speculative proposal loop computes the minimal block-aligned budget needed for

@@ -39,8 +39,10 @@ FAST_DLLM_V2_PROPOSAL_KWARGS = {
     "temperature",
     "top_p",
     "trace_full_tensors",
+    "trace_flush_interval",
     "trace_max_events",
     "trace_path",
+    "trace_tensor_stats",
     "trace_topk",
     "use_block_cache",
 }
@@ -59,12 +61,16 @@ class _FastDllmV2NativeTraceRecorder:
         *,
         max_events: int = 128,
         full_tensors: bool = False,
+        tensor_stats: bool = True,
         topk: int = 8,
+        flush_interval: int = 1,
     ) -> None:
         self.path = Path(path)
         self.max_events = max(0, int(max_events))
         self.full_tensors = bool(full_tensors)
+        self.tensor_stats = bool(tensor_stats)
         self.topk = max(1, int(topk))
+        self.flush_interval = max(0, int(flush_interval))
         self.phase = "uninitialized"
         self.events: list[dict[str, Any]] = []
         self.hook_handles: list[Any] = []
@@ -74,8 +80,10 @@ class _FastDllmV2NativeTraceRecorder:
                 "runtime": "sglang_native",
                 "trace_path": str(self.path),
                 "trace_full_tensors": self.full_tensors,
+                "trace_tensor_stats": self.tensor_stats,
                 "trace_max_events": self.max_events,
                 "trace_topk": self.topk,
+                "trace_flush_interval": self.flush_interval,
             },
             "native": {"events": self.events},
         }
@@ -124,11 +132,18 @@ class _FastDllmV2NativeTraceRecorder:
                 "payload": _summarize_trace_object(
                     payload,
                     full_tensors=self.full_tensors,
+                    tensor_stats=self.tensor_stats,
                     topk=self.topk,
                 ),
             }
         )
-        self.flush()
+        should_flush = (
+            (self.flush_interval > 0 and len(self.events) % self.flush_interval == 0)
+            or (name == "proposal" and kind == "output")
+            or len(self.events) >= self.max_events
+        )
+        if should_flush:
+            self.flush()
 
     def flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,18 +211,34 @@ def _summarize_trace_object(
     value: Any,
     *,
     full_tensors: bool,
+    tensor_stats: bool,
     topk: int,
 ) -> Any:
     if torch.is_tensor(value):
-        return _summarize_trace_tensor(value, full_tensors=full_tensors, topk=topk)
+        return _summarize_trace_tensor(
+            value,
+            full_tensors=full_tensors,
+            tensor_stats=tensor_stats,
+            topk=topk,
+        )
     if isinstance(value, dict):
         return {
-            str(k): _summarize_trace_object(v, full_tensors=full_tensors, topk=topk)
+            str(k): _summarize_trace_object(
+                v,
+                full_tensors=full_tensors,
+                tensor_stats=tensor_stats,
+                topk=topk,
+            )
             for k, v in value.items()
         }
     if isinstance(value, (list, tuple)):
         return [
-            _summarize_trace_object(v, full_tensors=full_tensors, topk=topk)
+            _summarize_trace_object(
+                v,
+                full_tensors=full_tensors,
+                tensor_stats=tensor_stats,
+                topk=topk,
+            )
             for v in value
         ]
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -221,35 +252,41 @@ def _summarize_trace_tensor(
     tensor: torch.Tensor,
     *,
     full_tensors: bool,
+    tensor_stats: bool,
     topk: int,
 ) -> dict[str, Any]:
     detached = tensor.detach()
-    cpu = detached.float().cpu()
-    flat = cpu.reshape(-1)
     summary: dict[str, Any] = {
         "type": "tensor_summary",
         "shape": list(detached.shape),
         "dtype": str(detached.dtype),
         "device": str(detached.device),
-        "mean": float(cpu.mean()) if flat.numel() else 0.0,
-        "std": float(cpu.std(unbiased=False)) if flat.numel() else 0.0,
-        "min": float(cpu.min()) if flat.numel() else 0.0,
-        "max": float(cpu.max()) if flat.numel() else 0.0,
-        "head": flat[: min(8, flat.numel())].tolist(),
     }
-    if detached.ndim >= 1 and flat.numel():
-        values, indices = torch.topk(flat, k=min(topk, flat.numel()))
-        summary["flat_topk"] = {
-            "indices": indices.tolist(),
-            "values": values.tolist(),
-        }
-    if detached.ndim >= 2 and detached.shape[-1] > 0:
-        rows = cpu.reshape(-1, cpu.shape[-1])
-        values, indices = torch.topk(rows[-1], k=min(topk, rows.shape[-1]))
-        summary["last_row_topk"] = {
-            "indices": indices.tolist(),
-            "values": values.tolist(),
-        }
+    if tensor_stats or full_tensors:
+        cpu = detached.float().cpu()
+        flat = cpu.reshape(-1)
+        summary.update(
+            {
+                "mean": float(cpu.mean()) if flat.numel() else 0.0,
+                "std": float(cpu.std(unbiased=False)) if flat.numel() else 0.0,
+                "min": float(cpu.min()) if flat.numel() else 0.0,
+                "max": float(cpu.max()) if flat.numel() else 0.0,
+                "head": flat[: min(8, flat.numel())].tolist(),
+            }
+        )
+        if detached.ndim >= 1 and flat.numel():
+            values, indices = torch.topk(flat, k=min(topk, flat.numel()))
+            summary["flat_topk"] = {
+                "indices": indices.tolist(),
+                "values": values.tolist(),
+            }
+        if detached.ndim >= 2 and detached.shape[-1] > 0:
+            rows = cpu.reshape(-1, cpu.shape[-1])
+            values, indices = torch.topk(rows[-1], k=min(topk, rows.shape[-1]))
+            summary["last_row_topk"] = {
+                "indices": indices.tolist(),
+                "values": values.tolist(),
+            }
     if full_tensors:
         summary["tensor"] = cpu
     return summary
@@ -1549,7 +1586,13 @@ class SGLangNativeFastDllmV2Runtime:
                 full_tensors=bool(
                     config.proposal_kwargs.get("trace_full_tensors", False)
                 ),
+                tensor_stats=bool(
+                    config.proposal_kwargs.get("trace_tensor_stats", True)
+                ),
                 topk=int(config.proposal_kwargs.get("trace_topk", 8)),
+                flush_interval=int(
+                    config.proposal_kwargs.get("trace_flush_interval", 1)
+                ),
             )
             self._trace_path = trace_path
 
