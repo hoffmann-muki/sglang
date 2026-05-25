@@ -13,6 +13,7 @@ from huggingface_hub import snapshot_download
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed.parallel_state import (
+    GraphCaptureContext,
     GroupCoordinator,
     patch_tensor_parallel_group,
     patch_world_group,
@@ -22,6 +23,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -76,6 +78,26 @@ class SingleRankDraftGroup:
 
     def barrier(self):
         return None
+
+    @contextmanager
+    def graph_capture(
+        self,
+        graph_capture_context: Optional[GraphCaptureContext] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        if graph_capture_context is None:
+            if stream is None:
+                stream = self.device_module.Stream()
+            graph_capture_context = GraphCaptureContext(stream)
+        else:
+            stream = graph_capture_context.stream
+
+        curr_stream = get_current_device_stream_fast()
+        if curr_stream != stream:
+            stream.wait_stream(curr_stream)
+
+        with self.device_module.stream(stream):
+            yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor, *args, **kwargs):
         return input_
