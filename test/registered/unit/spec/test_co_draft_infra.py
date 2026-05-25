@@ -525,7 +525,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(state.draft_lookahead, [12, 13, 14, 15, 16, 17])
         runtime._propose_one.assert_called_once_with(config, [10, 11, 12, 13])
 
-    def test_transformers_runtime_metadata_reports_default_block_cache(self):
+    def test_transformers_runtime_metadata_reports_block_cache_setting(self):
         import torch
 
         runtime = TransformersFastDllmV2Runtime()
@@ -551,7 +551,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             {"r0": state},
         )
 
-        self.assertTrue(tokens.metadata["use_block_cache"])
+        self.assertFalse(tokens.metadata["use_block_cache"])
 
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch

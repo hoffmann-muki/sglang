@@ -436,7 +436,7 @@ torch_dtype: auto
 device_map: auto
 trust_remote_code: true
 proposal_kwargs:
-  use_block_cache: true
+  use_block_cache: false
 ```
 
 Fast_dLLM_v2 decodes by iteratively filling masked diffusion blocks. The SGLang
