@@ -278,11 +278,11 @@ class FastDLLMV2Model(nn.Module):
         decoder_layer_type = decoder_layer_type or FastDLLMV2DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, layer_prefix: decoder_layer_type(
+            lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
-                prefix=layer_prefix,
+                prefix=prefix,
                 alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
