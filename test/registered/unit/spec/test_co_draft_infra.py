@@ -15,6 +15,7 @@ from sglang.srt.speculative.co_draft.executor import (
 )
 from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2ProposalRunner,
+    FastDllmV2RequestState,
     FastDllmV2RunnerConfig,
     TransformersFastDllmV2Runtime,
     _disable_transformers_hub_kernels_for_fast_dllm_v2,
@@ -450,6 +451,79 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertTrue(torch.equal(x_init, updated_input))
         self.assertTrue(torch.equal(x_init[:, :26], input_tensor))
         self.assertTrue(torch.equal(x_init[:, 26:], torch.full((1, 6), 151666)))
+
+    def test_runner_consumes_matching_lookahead(self):
+        state = FastDllmV2RequestState(
+            input_ids=[10],
+            draft_lookahead=[11, 12, 13],
+        )
+
+        FastDllmV2ProposalRunner._consume_lookahead(state, [11, 12])
+
+        self.assertEqual(state.draft_lookahead, [13])
+
+    def test_runner_clears_lookahead_on_divergent_bonus_token(self):
+        state = FastDllmV2RequestState(
+            input_ids=[10],
+            draft_lookahead=[11, 12, 13],
+        )
+
+        FastDllmV2ProposalRunner._consume_lookahead(state, [11, 99])
+
+        self.assertEqual(state.draft_lookahead, [])
+
+    def test_runner_refresh_preserves_lookahead_for_external_progress(self):
+        import torch
+
+        runner = FastDllmV2ProposalRunner(
+            FastDllmV2RunnerConfig(
+                model_path="fast-dllm",
+                tokenizer_path="fast-dllm",
+                proposed_token_num=2,
+            )
+        )
+        runner.states["r0"] = FastDllmV2RequestState(
+            input_ids=[10],
+            draft_lookahead=[11, 12, 13],
+        )
+
+        runner._refresh_states(
+            IndependentDllmDraftRequest(
+                request_ids=["r0"],
+                input_ids=[[10, 11]],
+                current_token_ids=torch.tensor([11]),
+                prefix_lens=torch.tensor([2]),
+                proposed_token_num=2,
+            )
+        )
+
+        self.assertEqual(runner.states["r0"].input_ids, [10, 11])
+        self.assertEqual(runner.states["r0"].draft_lookahead, [12, 13])
+
+    def test_transformers_runtime_extends_short_lookahead_once(self):
+        import torch
+        from unittest.mock import MagicMock
+
+        runtime = TransformersFastDllmV2Runtime()
+        runtime.model = SimpleNamespace(device=torch.device("cpu"))
+        runtime._propose_one = MagicMock(return_value=torch.tensor([14, 15, 16, 17]))
+        state = FastDllmV2RequestState(
+            input_ids=[10, 11],
+            draft_lookahead=[12, 13],
+        )
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=4,
+        )
+
+        first = runtime._propose_from_state(config, state)
+        second = runtime._propose_from_state(config, state)
+
+        self.assertTrue(torch.equal(first, torch.tensor([12, 13, 14, 15])))
+        self.assertTrue(torch.equal(second, torch.tensor([12, 13, 14, 15])))
+        self.assertEqual(state.draft_lookahead, [12, 13, 14, 15, 16, 17])
+        runtime._propose_one.assert_called_once_with(config, [10, 11, 12, 13])
 
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch

@@ -420,7 +420,11 @@ Face `generate()` wrapper during serving. It also installs a
 narrow Transformers 4.53.1 compatibility layer for Fast_dLLM_v2's remote model
 code, including Qwen-style RoPE, tied embeddings, SDPA, and legacy cache
 semantics. The remaining validation work is target-side acceptance behavior and
-proposal latency under serving workloads.
+proposal latency under serving workloads. The runner keeps a per-request
+speculative lookahead buffer: accepted draft tokens consume the front of the
+buffer, a divergent target bonus token clears stale lookahead, and subsequent
+proposal calls reuse any remaining draft tokens before invoking Fast_dLLM_v2
+again.
 
 The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_v2 proposal parameters:
 

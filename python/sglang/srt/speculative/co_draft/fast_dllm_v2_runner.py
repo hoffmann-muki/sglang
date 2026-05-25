@@ -559,6 +559,7 @@ class FastDllmV2RequestState:
 
     input_ids: list[int]
     accepted_token_count: int = 0
+    draft_lookahead: list[int] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -611,8 +612,8 @@ class TransformersFastDllmV2Runtime:
         self._ensure_loaded(config)
         proposed = []
         for request_id in request.request_ids:
-            input_ids = states[request_id].input_ids
-            generated = self._propose_one(config, input_ids)
+            state = states[request_id]
+            generated = self._propose_from_state(config, state)
             proposed.append(generated)
 
         proposed_token_ids = torch.stack(proposed).to(request.current_token_ids.device)
@@ -744,6 +745,25 @@ class TransformersFastDllmV2Runtime:
                     exc,
                 )
         return model
+
+    def _propose_from_state(
+        self,
+        config: FastDllmV2RunnerConfig,
+        state: FastDllmV2RequestState,
+    ) -> torch.Tensor:
+        proposed_token_num = config.proposed_token_num
+        lookahead = state.draft_lookahead
+        if len(lookahead) < proposed_token_num:
+            seed_input_ids = state.input_ids + lookahead
+            generated = self._propose_one(config, seed_input_ids).tolist()
+            lookahead.extend(int(token_id) for token_id in generated)
+
+        device = self.model.device
+        return torch.tensor(
+            lookahead[:proposed_token_num],
+            dtype=torch.long,
+            device=device,
+        )
 
     @staticmethod
     def _initialize_proposal_block(
@@ -1091,6 +1111,7 @@ class FastDllmV2ProposalRunner:
                 continue
             state.input_ids.extend(accepted_token_ids)
             state.accepted_token_count += len(accepted_token_ids)
+            self._consume_lookahead(state, accepted_token_ids)
         self.runtime.extend_after_accept(self.config, accepted, self.states)
 
     def release(self, request_ids: list[str]) -> None:
@@ -1100,9 +1121,41 @@ class FastDllmV2ProposalRunner:
 
     def _refresh_states(self, request: IndependentDllmDraftRequest) -> None:
         for request_id, input_ids in zip(request.request_ids, request.input_ids):
-            self.states[request_id] = FastDllmV2RequestState(
-                input_ids=list(input_ids)
-            )
+            new_input_ids = list(input_ids)
+            state = self.states.get(request_id)
+            if state is None:
+                self.states[request_id] = FastDllmV2RequestState(
+                    input_ids=new_input_ids
+                )
+                continue
+
+            old_input_ids = state.input_ids
+            if len(new_input_ids) < len(old_input_ids) or (
+                new_input_ids[: len(old_input_ids)] != old_input_ids
+            ):
+                state.input_ids = new_input_ids
+                state.accepted_token_count = 0
+                state.draft_lookahead.clear()
+                state.metadata.clear()
+                continue
+
+            committed = new_input_ids[len(old_input_ids) :]
+            if committed:
+                state.input_ids = new_input_ids
+                state.accepted_token_count += len(committed)
+                self._consume_lookahead(state, committed)
+
+    @staticmethod
+    def _consume_lookahead(
+        state: FastDllmV2RequestState,
+        committed_token_ids: list[int],
+    ) -> None:
+        for token_id in committed_token_ids:
+            if state.draft_lookahead and state.draft_lookahead[0] == int(token_id):
+                del state.draft_lookahead[0]
+                continue
+            state.draft_lookahead.clear()
+            break
 
 
 def _load_algorithm_config(config_path: Optional[str]) -> dict[str, Any]:
