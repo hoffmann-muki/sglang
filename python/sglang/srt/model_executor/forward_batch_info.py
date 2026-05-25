@@ -334,6 +334,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Diffusion LLMs may need hidden states for a full block while projecting
+    # logits for only the positions consumed by the refinement sampler.
+    dllm_logit_positions: Optional[torch.Tensor] = None
 
     # For split prefill
     # intermediate values for split prefill

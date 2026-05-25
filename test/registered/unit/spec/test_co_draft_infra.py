@@ -779,6 +779,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             prefix_len,
             block_size,
             out_cache_loc,
+            phase,
+            logit_positions=None,
         ):
             calls.append(
                 {
@@ -786,6 +788,9 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                     "prefix_len": prefix_len,
                     "block_size": block_size,
                     "out_cache_loc": out_cache_loc.tolist(),
+                    "logit_positions": (
+                        None if logit_positions is None else logit_positions.tolist()
+                    ),
                 }
             )
             return torch.full((block_size, 4), len(calls), dtype=torch.float32)
@@ -809,17 +814,43 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                     "prefix_len": 0,
                     "block_size": 2,
                     "out_cache_loc": [0, 1],
+                    "logit_positions": None,
                 },
                 {
                     "input_ids": [12, 13],
                     "prefix_len": 2,
                     "block_size": 2,
                     "out_cache_loc": [2, 3],
+                    "logit_positions": None,
                 },
             ],
         )
         self.assertEqual(output.past_key_values.kv_len, 4)
         self.assertTrue(torch.equal(output.logits, torch.full((1, 2, 4), 2.0)))
+
+    def test_shifted_small_block_logit_positions_match_sampler_shift(self):
+        import torch
+
+        self.assertTrue(
+            torch.equal(
+                FastDllmV2BlockProposalEngine.shifted_small_block_logit_positions(
+                    0,
+                    4,
+                    device=torch.device("cpu"),
+                ),
+                torch.tensor([0, 0, 1, 2]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                FastDllmV2BlockProposalEngine.shifted_small_block_logit_positions(
+                    8,
+                    12,
+                    device=torch.device("cpu"),
+                ),
+                torch.tensor([7, 8, 9, 10]),
+            )
+        )
 
     def test_native_trace_recorder_writes_pt_and_json_summaries(self):
         import json

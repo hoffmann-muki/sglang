@@ -473,6 +473,15 @@ class FastDLLMV2(nn.Module):
         if get_embedding:
             return self.pooler(hidden_states, forward_batch)
 
+        if forward_batch.forward_mode.is_dllm_extend():
+            logit_positions = getattr(forward_batch, "dllm_logit_positions", None)
+            if logit_positions is not None:
+                logit_positions = logit_positions.to(
+                    device=hidden_states.device, dtype=torch.long
+                )
+                hidden_states = hidden_states.index_select(0, logit_positions)
+                input_ids = input_ids.index_select(0, logit_positions)
+
         return self.logits_processor(
             input_ids,
             hidden_states,

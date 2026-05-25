@@ -35,6 +35,7 @@ FAST_DLLM_V2_PROPOSAL_KWARGS = {
     "mask_id",
     "profile",
     "profile_log_interval",
+    "selective_logits",
     "stop_token",
     "temperature",
     "top_p",
@@ -983,6 +984,9 @@ class SGLangNativeFastDllmV2Runtime:
                 f"proposal_kwargs: {unsupported_kwargs}"
             )
 
+    def supports_selective_logits(self) -> bool:
+        return True
+
     def _propose_one(
         self,
         config: FastDllmV2RunnerConfig,
@@ -1025,6 +1029,7 @@ class SGLangNativeFastDllmV2Runtime:
                 prefix_cache=past_key_values,
                 block_cache=kwargs.get("block_past_key_values"),
                 replace_position=kwargs.get("replace_position"),
+                logit_positions=kwargs.get("logit_positions"),
             )
             logits = block_cache_state.logits
             cache_state = past_key_values
@@ -1035,6 +1040,7 @@ class SGLangNativeFastDllmV2Runtime:
                 keep_cache=update_past_key_values,
                 block_size=kwargs.get("block_size"),
                 phase=phase,
+                logit_positions=kwargs.get("logit_positions"),
             )
         if profile is not None:
             elapsed = time.perf_counter() - start
@@ -1044,6 +1050,9 @@ class SGLangNativeFastDllmV2Runtime:
             profile["forward_time_s"] += elapsed
             profile[phase_calls_key] = profile.get(phase_calls_key, 0) + 1
             profile[phase_time_key] = profile.get(phase_time_key, 0.0) + elapsed
+            if kwargs.get("logit_positions") is not None:
+                profile["selective_logits_forward_calls"] += 1
+                profile["selective_logits_rows"] += int(logits.shape[0])
         logit_len = int(logits.shape[0]) if logits.ndim == 2 else input_ids.shape[1]
         return types.SimpleNamespace(
             logits=logits.view(1, logit_len, logits.shape[-1]),
@@ -1087,12 +1096,14 @@ class SGLangNativeFastDllmV2Runtime:
         prefix_cache: Optional[_SGLangNativeCacheState],
         block_cache: Optional[_SGLangNativeBlockCacheState],
         replace_position: Optional[int],
+        logit_positions: Optional[torch.Tensor],
     ) -> Any:
         if block_cache is None:
             return self._refresh_block_cache(
                 input_ids.reshape(-1),
                 prefix_cache,
                 phase=phase,
+                logit_positions=logit_positions,
             )
         if replace_position is None:
             raise ValueError(
@@ -1103,6 +1114,7 @@ class SGLangNativeFastDllmV2Runtime:
             input_ids.reshape(-1),
             int(replace_position),
             phase=phase,
+            logit_positions=logit_positions,
         )
 
     def _forward_tokens(
@@ -1113,6 +1125,7 @@ class SGLangNativeFastDllmV2Runtime:
         keep_cache: bool,
         block_size: Optional[int],
         phase: str,
+        logit_positions: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[_SGLangNativeCacheState]]:
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -1148,6 +1161,11 @@ class SGLangNativeFastDllmV2Runtime:
                     keep_cache=True,
                     block_size=block_size,
                     phase=f"{phase}.block_{start // block_size}",
+                    logit_positions=(
+                        logit_positions
+                        if start + block_size >= num_tokens
+                        else None
+                    ),
                 )
             assert logits is not None
             return logits, cache_state
@@ -1156,6 +1174,11 @@ class SGLangNativeFastDllmV2Runtime:
                 "Fast_dLLM_v2 native DLLM_EXTEND forwards must be exactly one "
                 f"diffusion block, got num_tokens={num_tokens}, block_size={block_size}."
             )
+        logit_positions = self._normalize_logit_positions(
+            logit_positions,
+            block_size=block_size,
+            device=device,
+        )
 
         allocator = self.model_runner.token_to_kv_pool_allocator
         cache_state = prefix_cache
@@ -1223,6 +1246,7 @@ class SGLangNativeFastDllmV2Runtime:
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
+                dllm_logit_positions=logit_positions,
             )
             with torch.inference_mode():
                 full_logits = self._run_model_runner_forward(
@@ -1233,6 +1257,7 @@ class SGLangNativeFastDllmV2Runtime:
                     block_size=num_tokens,
                     out_cache_loc=out_cache_loc,
                     req_pool_idx=cache_state.req_pool_idx,
+                    logit_positions=logit_positions,
                 )
             if full_logits is None:
                 raise RuntimeError(
@@ -1255,6 +1280,7 @@ class SGLangNativeFastDllmV2Runtime:
         prefix_cache: Optional[_SGLangNativeCacheState],
         *,
         phase: str,
+        logit_positions: Optional[torch.Tensor],
     ) -> Any:
         block_size = int(block_ids.numel())
         if block_size <= 0:
@@ -1273,6 +1299,7 @@ class SGLangNativeFastDllmV2Runtime:
             block_size=block_size,
             out_cache_loc=self._block_cache_locs(block_cache),
             phase=phase,
+            logit_positions=logit_positions,
         )
         return types.SimpleNamespace(logits=logits, block_cache=block_cache)
 
@@ -1283,6 +1310,7 @@ class SGLangNativeFastDllmV2Runtime:
         replace_position: int,
         *,
         phase: str,
+        logit_positions: Optional[torch.Tensor],
     ) -> Any:
         if block_cache.released:
             raise RuntimeError("Fast_dLLM_v2 native block cache was already released.")
@@ -1301,15 +1329,17 @@ class SGLangNativeFastDllmV2Runtime:
         block_cache.token_ids[
             replace_position : replace_position + num_tokens
         ] = input_ids.to(block_cache.token_ids.device, dtype=torch.long)
-        full_logits = self._run_dllm_block_forward(
+        logits = self._run_dllm_block_forward(
             input_ids=block_cache.token_ids,
             req_pool_idx=block_cache.req_pool_idx,
             prefix_len=block_cache.prefix_len,
             block_size=block_cache.block_size,
             out_cache_loc=self._block_cache_locs(block_cache),
             phase=phase,
+            logit_positions=logit_positions,
         )
-        logits = full_logits[replace_position : replace_position + num_tokens]
+        if logit_positions is None:
+            logits = logits[replace_position : replace_position + num_tokens]
         return types.SimpleNamespace(logits=logits, block_cache=block_cache)
 
     def _run_dllm_block_forward(
@@ -1321,6 +1351,7 @@ class SGLangNativeFastDllmV2Runtime:
         block_size: int,
         out_cache_loc: torch.Tensor,
         phase: str,
+        logit_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -1335,6 +1366,11 @@ class SGLangNativeFastDllmV2Runtime:
                 "Fast_dLLM_v2 native block forward requires a complete block, "
                 f"got {input_ids.numel()} tokens for block_size={block_size}."
             )
+        logit_positions = self._normalize_logit_positions(
+            logit_positions,
+            block_size=block_size,
+            device=device,
+        )
 
         seq_len = int(prefix_len) + int(block_size)
         seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
@@ -1370,6 +1406,7 @@ class SGLangNativeFastDllmV2Runtime:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            dllm_logit_positions=logit_positions,
         )
         full_logits = self._run_model_runner_forward(
             forward_batch,
@@ -1379,6 +1416,7 @@ class SGLangNativeFastDllmV2Runtime:
             block_size=block_size,
             out_cache_loc=out_cache_loc,
             req_pool_idx=req_pool_idx,
+            logit_positions=logit_positions,
         )
         if full_logits is None:
             raise RuntimeError(
@@ -1397,6 +1435,7 @@ class SGLangNativeFastDllmV2Runtime:
         block_size: int,
         out_cache_loc: torch.Tensor,
         req_pool_idx: int,
+        logit_positions: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         self._trace_set_phase(phase)
         self._trace_record(
@@ -1413,6 +1452,7 @@ class SGLangNativeFastDllmV2Runtime:
                 "out_cache_loc": out_cache_loc,
                 "extend_prefix_lens": forward_batch.extend_prefix_lens,
                 "extend_seq_lens": forward_batch.extend_seq_lens,
+                "logit_positions": logit_positions,
             },
         )
         with torch.inference_mode():
@@ -1472,6 +1512,30 @@ class SGLangNativeFastDllmV2Runtime:
                 "Fast_dLLM_v2 native forward currently supports "
                 f"page_size=1 only, got page_size={allocator_page_size}."
             )
+
+    @staticmethod
+    def _normalize_logit_positions(
+        logit_positions: Optional[torch.Tensor],
+        *,
+        block_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if logit_positions is None:
+            return None
+        positions = torch.as_tensor(logit_positions, dtype=torch.long, device=device)
+        if positions.ndim != 1:
+            raise ValueError(
+                "Fast_dLLM_v2 native selective logits require a 1D position tensor, "
+                f"got shape={tuple(positions.shape)}."
+            )
+        if positions.numel() == 0:
+            raise ValueError("Fast_dLLM_v2 native selective logits need positions.")
+        if bool(((positions < 0) | (positions >= block_size)).any().item()):
+            raise ValueError(
+                "Fast_dLLM_v2 native selective logits position out of bounds: "
+                f"positions={positions.detach().cpu().tolist()}, block_size={block_size}."
+            )
+        return positions
 
     def _allocate_native_block_cache_state(
         self,
@@ -1760,6 +1824,8 @@ class FastDllmV2BlockProposalEngine:
             "refine_full_block_forward_calls": 0,
             "block_cache_refresh_forward_calls": 0,
             "block_cache_reuse_forward_calls": 0,
+            "selective_logits_forward_calls": 0,
+            "selective_logits_rows": 0,
             "sampling_calls": 0,
             "blocks_started": 0,
             "small_blocks_visited": 0,
@@ -1816,6 +1882,16 @@ class FastDllmV2BlockProposalEngine:
 
         return input_tensor[:, : (block_idx + 1) * block_size], input_tensor
 
+    @staticmethod
+    def shifted_small_block_logit_positions(
+        start: int,
+        end: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        positions = torch.arange(start, end, dtype=torch.long, device=device)
+        return torch.clamp(positions - 1, min=0)
+
     @torch.no_grad()
     def propose_one(
         self,
@@ -1846,6 +1922,9 @@ class FastDllmV2BlockProposalEngine:
         temperature = float(kwargs.get("temperature", 0.0))
         threshold = config.threshold
         use_block_cache = bool(kwargs.get("use_block_cache", False))
+        use_selective_logits = bool(
+            kwargs.get("selective_logits", True)
+        ) and bool(getattr(self.backend, "supports_selective_logits", lambda: False)())
 
         max_new_tokens = _fast_dllm_v2_internal_generation_budget(
             original_prompt_len,
@@ -1943,6 +2022,15 @@ class FastDllmV2BlockProposalEngine:
                         if block_size == small_block_end_idx
                         else -block_size + small_block_end_idx
                     )
+                    logit_positions = (
+                        self.shifted_small_block_logit_positions(
+                            small_block_start_idx,
+                            small_block_end_idx,
+                            device=device,
+                        )
+                        if use_selective_logits
+                        else None
+                    )
 
                     while True:
                         ready = self.first_contiguous_proposal(
@@ -1972,13 +2060,15 @@ class FastDllmV2BlockProposalEngine:
                                     past_key_values=past_key_values,
                                     update_past_key_values=False,
                                     use_block_cache=True,
+                                    logit_positions=logit_positions,
                                 )
                                 logits = output.logits
                                 block_past_key_values = output.block_past_key_values
-                                logits = torch.cat(
-                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
-                                )
-                                logits = logits[:, start:end]
+                                if not use_selective_logits:
+                                    logits = torch.cat(
+                                        [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                    )
+                                    logits = logits[:, start:end]
                             else:
                                 logits = self.backend.forward(
                                     profile,
@@ -1990,10 +2080,12 @@ class FastDllmV2BlockProposalEngine:
                                     use_block_cache=True,
                                     block_past_key_values=block_past_key_values,
                                     replace_position=small_block_start_idx,
+                                    logit_positions=logit_positions,
                                 ).logits
-                                logits = torch.cat(
-                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
-                                )
+                                if not use_selective_logits:
+                                    logits = torch.cat(
+                                        [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                    )
                         else:
                             logits = self.backend.forward(
                                 profile,
@@ -2002,11 +2094,13 @@ class FastDllmV2BlockProposalEngine:
                                 use_cache=True,
                                 past_key_values=past_key_values,
                                 update_past_key_values=False,
+                                logit_positions=logit_positions,
                             ).logits
-                            logits = torch.cat(
-                                [logits[:, :1, :], logits[:, :-1, :]], dim=1
-                            )
-                            logits = logits[:, start:end]
+                            if not use_selective_logits:
+                                logits = torch.cat(
+                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                )
+                                logits = logits[:, start:end]
 
                         x_1, p_1t = self.backend.sample_with_top_p(
                             profile,

@@ -445,6 +445,10 @@ device_map: auto
 trust_remote_code: true
 proposal_kwargs:
   use_block_cache: false
+  # Native runtime only. Project logits only for the small-block positions used
+  # by the sampler while still running the transformer layers over the full
+  # diffusion block.
+  selective_logits: true
   profile: false
   profile_log_interval: 1
   # Optional native-runtime trace. Keep this disabled outside debugging.
@@ -479,12 +483,12 @@ shares the same block-diffusion proposal loop. The native draft owns a compact
 KV pool sized by `native_max_total_tokens` and `native_max_running_requests`;
 it intentionally does not inherit the target model's serving KV capacity. The
 native path has an initial `ModelRunner/ForwardBatch` bridge with ephemeral
-SGLang KV handles for prefix and block-cache reuse. The block-cache path is
-currently correctness-first: it
-reuses native cache storage but reruns the full diffusion block when a slice is
-refined. The partial small-slice kernel path remains the next optimization
-milestone, so use `runtime: sglang_native` only while developing the native
-execution path.
+SGLang KV handles for prefix and block-cache reuse. The native path can project
+only the small-block logits consumed by the sampler (`selective_logits: true`)
+while preserving full-block hidden-state computation. The block-cache path still
+reruns the full diffusion block when a slice is refined; a true partial
+small-slice attention/kernel path remains the next optimization milestone, so
+use `runtime: sglang_native` only while developing the native execution path.
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 
