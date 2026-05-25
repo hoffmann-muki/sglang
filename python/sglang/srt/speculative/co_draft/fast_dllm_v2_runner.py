@@ -101,7 +101,7 @@ class _FastDllmV2NativeTraceRecorder:
             "model.layers.0.post_attention_layernorm",
             "model.layers.0.mlp",
             "model.norm",
-            "lm_head",
+            "logits_processor",
         ):
             module = _get_dotted_module(model, name)
             if module is not None:
@@ -861,6 +861,10 @@ class SGLangNativeFastDllmV2Runtime:
                 "current_token_ids": request.current_token_ids,
                 "proposed_token_num": request.proposed_token_num,
                 "input_lens": [len(input_ids) for input_ids in request.input_ids],
+                "input_ids": [
+                    torch.tensor(input_ids, dtype=torch.long)
+                    for input_ids in request.input_ids
+                ],
                 "config": {
                     "block_size": config.block_size,
                     "small_block_size": config.small_block_size,
