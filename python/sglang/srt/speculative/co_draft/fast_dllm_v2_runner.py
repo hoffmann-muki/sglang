@@ -38,12 +38,241 @@ FAST_DLLM_V2_PROPOSAL_KWARGS = {
     "stop_token",
     "temperature",
     "top_p",
+    "trace_full_tensors",
+    "trace_max_events",
+    "trace_path",
+    "trace_topk",
     "use_block_cache",
 }
 
 
 class _FastDllmV2ProposalUnsupported(RuntimeError):
     """Raised when SGLang's Fast_dLLM_v2 path cannot honor a request."""
+
+
+class _FastDllmV2NativeTraceRecorder:
+    """Small file-backed trace recorder for SGLang-native Fast_dLLM_v2 runs."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_events: int = 128,
+        full_tensors: bool = False,
+        topk: int = 8,
+    ) -> None:
+        self.path = Path(path)
+        self.max_events = max(0, int(max_events))
+        self.full_tensors = bool(full_tensors)
+        self.topk = max(1, int(topk))
+        self.phase = "uninitialized"
+        self.events: list[dict[str, Any]] = []
+        self.hook_handles: list[Any] = []
+        self.hooked_model_id: Optional[int] = None
+        self.trace: dict[str, Any] = {
+            "metadata": {
+                "runtime": "sglang_native",
+                "trace_path": str(self.path),
+                "trace_full_tensors": self.full_tensors,
+                "trace_max_events": self.max_events,
+                "trace_topk": self.topk,
+            },
+            "native": {"events": self.events},
+        }
+
+    def set_metadata(self, **metadata: Any) -> None:
+        self.trace["metadata"].update(_json_safe(metadata))
+
+    def set_phase(self, phase: str) -> None:
+        self.phase = phase
+
+    def install_model_hooks(self, model: Any) -> None:
+        if model is None or self.hooked_model_id == id(model):
+            return
+        self.remove_hooks()
+        self.hooked_model_id = id(model)
+        for name in (
+            "model.embed_tokens",
+            "model.layers.0.input_layernorm",
+            "model.layers.0.self_attn.qkv_proj",
+            "model.layers.0.self_attn.rotary_emb",
+            "model.layers.0.self_attn.attn",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.post_attention_layernorm",
+            "model.layers.0.mlp",
+            "model.norm",
+            "lm_head",
+        ):
+            module = _get_dotted_module(model, name)
+            if module is not None:
+                self._hook_module(name, module)
+
+    def remove_hooks(self) -> None:
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles.clear()
+        self.hooked_model_id = None
+
+    def record(self, name: str, kind: str, payload: dict[str, Any]) -> None:
+        if len(self.events) >= self.max_events:
+            return
+        self.events.append(
+            {
+                "phase": self.phase,
+                "name": name,
+                "kind": kind,
+                "payload": _summarize_trace_object(
+                    payload,
+                    full_tensors=self.full_tensors,
+                    topk=self.topk,
+                ),
+            }
+        )
+        self.flush()
+
+    def flush(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.trace, self.path)
+        self.path.with_suffix(".json").write_text(
+            json.dumps(_json_safe(self.trace), indent=2) + "\n"
+        )
+
+    def _hook_module(self, name: str, module: torch.nn.Module) -> None:
+        def pre_hook(_module, args, kwargs=None):
+            self.record(
+                name,
+                "input",
+                {
+                    "args": args,
+                    "kwargs": kwargs or {},
+                },
+            )
+
+        def post_hook(_module, args, kwargs_or_output, output=None):
+            if output is None:
+                kwargs = {}
+                actual_output = kwargs_or_output
+            else:
+                kwargs = kwargs_or_output or {}
+                actual_output = output
+            self.record(
+                name,
+                "output",
+                {
+                    "args": args,
+                    "kwargs": kwargs,
+                    "output": actual_output,
+                },
+            )
+
+        try:
+            self.hook_handles.append(
+                module.register_forward_pre_hook(pre_hook, with_kwargs=True)
+            )
+            self.hook_handles.append(
+                module.register_forward_hook(post_hook, with_kwargs=True)
+            )
+        except TypeError:
+            self.hook_handles.append(module.register_forward_pre_hook(pre_hook))
+            self.hook_handles.append(module.register_forward_hook(post_hook))
+
+
+def _get_dotted_module(root: Any, dotted_name: str) -> Optional[torch.nn.Module]:
+    current = root
+    for part in dotted_name.split("."):
+        if part.isdigit():
+            try:
+                current = current[int(part)]
+            except (IndexError, TypeError):
+                return None
+        else:
+            current = getattr(current, part, None)
+        if current is None:
+            return None
+    return current if isinstance(current, torch.nn.Module) else None
+
+
+def _summarize_trace_object(
+    value: Any,
+    *,
+    full_tensors: bool,
+    topk: int,
+) -> Any:
+    if torch.is_tensor(value):
+        return _summarize_trace_tensor(value, full_tensors=full_tensors, topk=topk)
+    if isinstance(value, dict):
+        return {
+            str(k): _summarize_trace_object(v, full_tensors=full_tensors, topk=topk)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _summarize_trace_object(v, full_tensors=full_tensors, topk=topk)
+            for v in value
+        ]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        return repr(value)
+    return repr(value)
+
+
+def _summarize_trace_tensor(
+    tensor: torch.Tensor,
+    *,
+    full_tensors: bool,
+    topk: int,
+) -> dict[str, Any]:
+    detached = tensor.detach()
+    cpu = detached.float().cpu()
+    flat = cpu.reshape(-1)
+    summary: dict[str, Any] = {
+        "type": "tensor_summary",
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "mean": float(cpu.mean()) if flat.numel() else 0.0,
+        "std": float(cpu.std(unbiased=False)) if flat.numel() else 0.0,
+        "min": float(cpu.min()) if flat.numel() else 0.0,
+        "max": float(cpu.max()) if flat.numel() else 0.0,
+        "head": flat[: min(8, flat.numel())].tolist(),
+    }
+    if detached.ndim >= 1 and flat.numel():
+        values, indices = torch.topk(flat, k=min(topk, flat.numel()))
+        summary["flat_topk"] = {
+            "indices": indices.tolist(),
+            "values": values.tolist(),
+        }
+    if detached.ndim >= 2 and detached.shape[-1] > 0:
+        rows = cpu.reshape(-1, cpu.shape[-1])
+        values, indices = torch.topk(rows[-1], k=min(topk, rows.shape[-1]))
+        summary["last_row_topk"] = {
+            "indices": indices.tolist(),
+            "values": values.tolist(),
+        }
+    if full_tensors:
+        summary["tensor"] = cpu
+    return summary
+
+
+def _json_safe(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return {
+            "type": "tensor",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items() if k != "tensor"}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return repr(value)
 
 
 def _compute_default_rope_parameters(
@@ -488,6 +717,7 @@ class FastDllmV2RunnerConfig:
     model_path: str
     tokenizer_path: str
     proposed_token_num: int
+    runtime: str = "transformers"
     block_size: int = 32
     small_block_size: int = 8
     threshold: float = 0.9
@@ -508,6 +738,7 @@ class FastDllmV2RunnerConfig:
             model_path=executor.model_path,
             tokenizer_path=executor.tokenizer_path,
             proposed_token_num=executor.verification_plan.proposed_token_num,
+            runtime=str(raw_config.get("runtime", "transformers")),
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
@@ -542,6 +773,7 @@ class FastDllmV2RunnerConfig:
             model_path=server_args.speculative_draft_model_path,
             tokenizer_path=tokenizer_path,
             proposed_token_num=proposed_token_num,
+            runtime=str(raw_config.get("runtime", "transformers")),
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
@@ -554,6 +786,820 @@ class FastDllmV2RunnerConfig:
             disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
             proposal_kwargs=proposal_kwargs,
         )
+
+
+@dataclass(slots=True)
+class _SGLangNativeCacheState:
+    """Ephemeral SGLang KV state used as native `past_key_values`."""
+
+    req: Any
+    req_pool_idx: int
+    allocator_state_before_alloc: Any
+    kv_len: int
+    released: bool = False
+
+
+@dataclass(slots=True)
+class _SGLangNativeBlockCacheState:
+    """Ephemeral native KV state for one Fast_dLLM_v2 refinement block."""
+
+    req: Any
+    req_pool_idx: int
+    allocator_state_before_alloc: Any
+    prefix_len: int
+    block_size: int
+    token_ids: torch.Tensor
+    released: bool = False
+
+
+class SGLangNativeFastDllmV2Runtime:
+    """Native SGLang runtime shell for Fast_dLLM_v2 proposal generation.
+
+    The proposal-control-flow pieces are intentionally shared with the
+    Transformers-backed reference path. This runtime owns the SGLang
+    ModelRunner/ForwardBatch bridge and ephemeral native KV handles used by the
+    block-diffusion proposal loop.
+    """
+
+    def __init__(self, model_runner: Any):
+        self.model_runner = model_runner
+        self._active_native_caches: list[_SGLangNativeCacheState] = []
+        self._active_native_block_caches: list[_SGLangNativeBlockCacheState] = []
+        self._trace: Optional[_FastDllmV2NativeTraceRecorder] = None
+        self._trace_path: Optional[str] = None
+
+    def propose(
+        self,
+        config: FastDllmV2RunnerConfig,
+        request: IndependentDllmDraftRequest,
+        states: dict[str, FastDllmV2RequestState],
+    ) -> IndependentDllmDraftTokens:
+        self._configure_trace(config)
+        self._trace_record(
+            "proposal",
+            "input",
+            {
+                "request_ids": list(request.request_ids),
+                "prefix_lens": request.prefix_lens,
+                "current_token_ids": request.current_token_ids,
+                "proposed_token_num": request.proposed_token_num,
+                "input_lens": [len(input_ids) for input_ids in request.input_ids],
+                "config": {
+                    "block_size": config.block_size,
+                    "small_block_size": config.small_block_size,
+                    "threshold": config.threshold,
+                    "use_block_cache": bool(
+                        config.proposal_kwargs.get("use_block_cache", False)
+                    ),
+                },
+            },
+        )
+        proposed = []
+        for request_id in request.request_ids:
+            state = states[request_id]
+            generated = _fast_dllm_v2_propose_from_state(self, config, state)
+            proposed.append(generated)
+
+        profiles = [
+            states[request_id].metadata.get("last_profile")
+            for request_id in request.request_ids
+        ]
+        profile_total = FastDllmV2BlockProposalEngine.aggregate_profiles(profiles)
+        metadata = {
+            "runner": "fast_dllm_v2",
+            "runtime": "sglang_native",
+            "block_size": config.block_size,
+            "small_block_size": config.small_block_size,
+            "threshold": config.threshold,
+            "use_block_cache": bool(
+                config.proposal_kwargs.get("use_block_cache", False)
+            ),
+            "profile_enabled": bool(config.proposal_kwargs.get("profile", False)),
+        }
+        if profile_total:
+            metadata["profile_total"] = profile_total
+            metadata["profile_log_interval"] = int(
+                config.proposal_kwargs.get("profile_log_interval", 1)
+            )
+
+        proposed_token_ids = torch.stack(proposed).to(request.current_token_ids.device)
+        self._trace_record(
+            "proposal",
+            "output",
+            {
+                "request_ids": list(request.request_ids),
+                "proposed_token_ids": proposed_token_ids,
+                "metadata": metadata,
+            },
+        )
+        return IndependentDllmDraftTokens(
+            request_ids=list(request.request_ids),
+            current_token_ids=request.current_token_ids,
+            proposed_token_ids=proposed_token_ids,
+            prefix_lens=request.prefix_lens,
+            metadata=metadata,
+        )
+
+    def extend_after_accept(
+        self,
+        config: FastDllmV2RunnerConfig,
+        accepted: IndependentDllmAcceptedTokens,
+        states: dict[str, FastDllmV2RequestState],
+    ) -> None:
+        return None
+
+    @property
+    def device(self) -> torch.device:
+        device = getattr(self.model_runner, "device", "cuda")
+        if isinstance(device, torch.device):
+            return device
+        return torch.device(device)
+
+    def validate_proposal_config(self, config: FastDllmV2RunnerConfig) -> None:
+        unsupported_kwargs = sorted(
+            set(config.proposal_kwargs) - FAST_DLLM_V2_PROPOSAL_KWARGS
+        )
+        if unsupported_kwargs:
+            raise _FastDllmV2ProposalUnsupported(
+                "SGLang's Fast_dLLM_v2 native proposal path does not support "
+                f"proposal_kwargs: {unsupported_kwargs}"
+            )
+
+    def _propose_one(
+        self,
+        config: FastDllmV2RunnerConfig,
+        input_ids: list[int],
+        profile: Optional[dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        try:
+            return FastDllmV2BlockProposalEngine(self).propose_one(
+                config,
+                input_ids,
+                profile,
+            )
+        finally:
+            self._release_active_native_caches()
+
+    def forward(
+        self,
+        profile: Optional[dict[str, Any]],
+        phase: str,
+        **kwargs,
+    ) -> Any:
+        self._validate_native_forward_kwargs(phase, kwargs)
+        input_ids = kwargs["input_ids"]
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise NotImplementedError(
+                "Fast_dLLM_v2 native forward currently supports a single "
+                f"request per draft invocation, got input_ids.shape={tuple(input_ids.shape)}."
+            )
+
+        past_key_values = kwargs.get("past_key_values")
+        update_past_key_values = bool(kwargs.get("update_past_key_values", False))
+
+        if profile is not None:
+            start = time.perf_counter()
+        block_cache_state = None
+        if kwargs.get("use_block_cache"):
+            block_cache_state = self._forward_with_block_cache(
+                phase,
+                input_ids,
+                prefix_cache=past_key_values,
+                block_cache=kwargs.get("block_past_key_values"),
+                replace_position=kwargs.get("replace_position"),
+            )
+            logits = block_cache_state.logits
+            cache_state = past_key_values
+        else:
+            logits, cache_state = self._forward_tokens(
+                input_ids.reshape(-1),
+                prefix_cache=past_key_values,
+                keep_cache=update_past_key_values,
+                block_size=kwargs.get("block_size"),
+                phase=phase,
+            )
+        if profile is not None:
+            elapsed = time.perf_counter() - start
+            phase_calls_key = f"{phase}_forward_calls"
+            phase_time_key = f"{phase}_forward_time_s"
+            profile["forward_calls"] += 1
+            profile["forward_time_s"] += elapsed
+            profile[phase_calls_key] = profile.get(phase_calls_key, 0) + 1
+            profile[phase_time_key] = profile.get(phase_time_key, 0.0) + elapsed
+        logit_len = int(logits.shape[0]) if logits.ndim == 2 else input_ids.shape[1]
+        return types.SimpleNamespace(
+            logits=logits.view(1, logit_len, logits.shape[-1]),
+            past_key_values=cache_state,
+            block_past_key_values=(
+                None if block_cache_state is None else block_cache_state.block_cache
+            ),
+        )
+
+    def _validate_native_forward_kwargs(
+        self,
+        phase: str,
+        kwargs: dict[str, Any],
+    ) -> None:
+        unsupported = []
+        past_key_values = kwargs.get("past_key_values")
+        if past_key_values is not None and not isinstance(
+            past_key_values, _SGLangNativeCacheState
+        ):
+            unsupported.append("foreign_past_key_values")
+        block_past_key_values = kwargs.get("block_past_key_values")
+        if block_past_key_values is not None and not isinstance(
+            block_past_key_values, _SGLangNativeBlockCacheState
+        ):
+            unsupported.append("foreign_block_past_key_values")
+        if kwargs.get("replace_position") is not None and not kwargs.get(
+            "use_block_cache"
+        ):
+            unsupported.append("replace_position_without_block_cache")
+        if unsupported:
+            raise NotImplementedError(
+                "Fast_dLLM_v2 native forward received unsupported cached "
+                f"state (phase={phase!r}, unsupported={unsupported})."
+            )
+
+    def _forward_with_block_cache(
+        self,
+        phase: str,
+        input_ids: torch.Tensor,
+        *,
+        prefix_cache: Optional[_SGLangNativeCacheState],
+        block_cache: Optional[_SGLangNativeBlockCacheState],
+        replace_position: Optional[int],
+    ) -> Any:
+        if block_cache is None:
+            return self._refresh_block_cache(
+                input_ids.reshape(-1),
+                prefix_cache,
+                phase=phase,
+            )
+        if replace_position is None:
+            raise ValueError(
+                "Fast_dLLM_v2 native block-cache reuse requires replace_position."
+            )
+        return self._reuse_block_cache(
+            block_cache,
+            input_ids.reshape(-1),
+            int(replace_position),
+            phase=phase,
+        )
+
+    def _forward_tokens(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        prefix_cache: Optional[_SGLangNativeCacheState],
+        keep_cache: bool,
+        block_size: Optional[int],
+        phase: str,
+    ) -> tuple[torch.Tensor, Optional[_SGLangNativeCacheState]]:
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        device = self.device
+        input_ids = input_ids.to(device=device, dtype=torch.long, non_blocking=True)
+        num_tokens = int(input_ids.numel())
+        if num_tokens <= 0:
+            raise ValueError("Fast_dLLM_v2 native forward requires at least one token.")
+
+        self._ensure_native_model_runner_ready()
+        self._ensure_native_page_size_one()
+        block_size = num_tokens if block_size is None else int(block_size)
+        if block_size <= 0:
+            raise ValueError(
+                f"Fast_dLLM_v2 native forward requires block_size > 0, got {block_size}."
+            )
+        if num_tokens > block_size:
+            if not keep_cache or num_tokens % block_size != 0:
+                raise ValueError(
+                    "Fast_dLLM_v2 native multi-block forward is only supported "
+                    "for cached prefix construction with a whole number of blocks."
+                )
+            logits = None
+            cache_state = prefix_cache
+            for start in range(0, num_tokens, block_size):
+                logits, cache_state = self._forward_tokens(
+                    input_ids[start : start + block_size],
+                    prefix_cache=cache_state,
+                    keep_cache=True,
+                    block_size=block_size,
+                    phase=f"{phase}.block_{start // block_size}",
+                )
+            assert logits is not None
+            return logits, cache_state
+        if num_tokens != block_size:
+            raise ValueError(
+                "Fast_dLLM_v2 native DLLM_EXTEND forwards must be exactly one "
+                f"diffusion block, got num_tokens={num_tokens}, block_size={block_size}."
+            )
+
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        cache_state = prefix_cache
+        if cache_state is None:
+            cache_state = self._allocate_native_cache_state()
+            if keep_cache:
+                self._active_native_caches.append(cache_state)
+
+        prefix_len = int(cache_state.kv_len)
+        req_pool_indices_tensor = torch.tensor(
+            [cache_state.req_pool_idx],
+            dtype=torch.int64,
+            device=device,
+        )
+        token_to_kv_pool_state = None if keep_cache else allocator.backup_state()
+        try:
+            out_cache_loc = allocator.alloc(num_tokens)
+            if out_cache_loc is None:
+                raise RuntimeError(
+                    "Fast_dLLM_v2 native forward ran out of KV slots while "
+                    f"allocating {num_tokens} tokens."
+                )
+
+            self.model_runner.req_to_token_pool.write(
+                (cache_state.req_pool_idx, slice(prefix_len, prefix_len + num_tokens)),
+                out_cache_loc,
+            )
+
+            seq_len = prefix_len + num_tokens
+            seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+            seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int32)
+            positions = torch.arange(
+                prefix_len,
+                seq_len,
+                dtype=torch.int64,
+                device=device,
+            )
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.DLLM_EXTEND,
+                batch_size=1,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices_tensor,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=seq_len,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=positions,
+                extend_num_tokens=num_tokens,
+                extend_seq_lens=torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                extend_prefix_lens=torch.tensor(
+                    [prefix_len],
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                extend_start_loc=torch.zeros(1, dtype=torch.int32, device=device),
+                extend_prefix_lens_cpu=[prefix_len],
+                extend_seq_lens_cpu=[num_tokens],
+                extend_logprob_start_lens_cpu=[0],
+                return_logprob=False,
+                req_to_token_pool=self.model_runner.req_to_token_pool,
+                token_to_kv_pool=self.model_runner.token_to_kv_pool,
+                attn_backend=self.model_runner.attn_backend,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            with torch.inference_mode():
+                full_logits = self._run_model_runner_forward(
+                    forward_batch,
+                    phase=phase,
+                    input_ids=input_ids,
+                    prefix_len=prefix_len,
+                    block_size=num_tokens,
+                    out_cache_loc=out_cache_loc,
+                    req_pool_idx=cache_state.req_pool_idx,
+                )
+            if full_logits is None:
+                raise RuntimeError(
+                    "Fast_dLLM_v2 native model did not return full_logits for "
+                    "DLLM_EXTEND forward."
+                )
+            if keep_cache:
+                cache_state.kv_len = seq_len
+            return full_logits, cache_state if keep_cache else None
+        finally:
+            if not keep_cache:
+                if token_to_kv_pool_state is not None:
+                    allocator.restore_state(token_to_kv_pool_state)
+                if prefix_cache is None:
+                    self._release_native_cache_state(cache_state)
+
+    def _refresh_block_cache(
+        self,
+        block_ids: torch.Tensor,
+        prefix_cache: Optional[_SGLangNativeCacheState],
+        *,
+        phase: str,
+    ) -> Any:
+        block_size = int(block_ids.numel())
+        if block_size <= 0:
+            raise ValueError("Fast_dLLM_v2 native block cache requires tokens.")
+
+        prefix_len = 0 if prefix_cache is None else int(prefix_cache.kv_len)
+        block_cache = self._allocate_native_block_cache_state(
+            prefix_cache=prefix_cache,
+            block_ids=block_ids,
+        )
+        self._active_native_block_caches.append(block_cache)
+        logits = self._run_dllm_block_forward(
+            input_ids=block_cache.token_ids,
+            req_pool_idx=block_cache.req_pool_idx,
+            prefix_len=prefix_len,
+            block_size=block_size,
+            out_cache_loc=self._block_cache_locs(block_cache),
+            phase=phase,
+        )
+        return types.SimpleNamespace(logits=logits, block_cache=block_cache)
+
+    def _reuse_block_cache(
+        self,
+        block_cache: _SGLangNativeBlockCacheState,
+        input_ids: torch.Tensor,
+        replace_position: int,
+        *,
+        phase: str,
+    ) -> Any:
+        if block_cache.released:
+            raise RuntimeError("Fast_dLLM_v2 native block cache was already released.")
+        num_tokens = int(input_ids.numel())
+        if num_tokens <= 0:
+            raise ValueError(
+                "Fast_dLLM_v2 native block-cache reuse requires at least one token."
+            )
+        if replace_position < 0 or replace_position + num_tokens > block_cache.block_size:
+            raise ValueError(
+                "Fast_dLLM_v2 native block-cache replace range is out of bounds: "
+                f"replace_position={replace_position}, num_tokens={num_tokens}, "
+                f"block_size={block_cache.block_size}."
+            )
+
+        block_cache.token_ids[
+            replace_position : replace_position + num_tokens
+        ] = input_ids.to(block_cache.token_ids.device, dtype=torch.long)
+        full_logits = self._run_dllm_block_forward(
+            input_ids=block_cache.token_ids,
+            req_pool_idx=block_cache.req_pool_idx,
+            prefix_len=block_cache.prefix_len,
+            block_size=block_cache.block_size,
+            out_cache_loc=self._block_cache_locs(block_cache),
+            phase=phase,
+        )
+        logits = full_logits[replace_position : replace_position + num_tokens]
+        return types.SimpleNamespace(logits=logits, block_cache=block_cache)
+
+    def _run_dllm_block_forward(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_pool_idx: int,
+        prefix_len: int,
+        block_size: int,
+        out_cache_loc: torch.Tensor,
+        phase: str,
+    ) -> torch.Tensor:
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+
+        device = self.device
+        input_ids = input_ids.to(device=device, dtype=torch.long, non_blocking=True)
+        if int(input_ids.numel()) != block_size:
+            raise ValueError(
+                "Fast_dLLM_v2 native block forward requires a complete block, "
+                f"got {input_ids.numel()} tokens for block_size={block_size}."
+            )
+
+        seq_len = int(prefix_len) + int(block_size)
+        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+        seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int32)
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DLLM_EXTEND,
+            batch_size=1,
+            input_ids=input_ids,
+            req_pool_indices=torch.tensor([req_pool_idx], dtype=torch.int64, device=device),
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_len,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=torch.arange(
+                prefix_len,
+                seq_len,
+                dtype=torch.int64,
+                device=device,
+            ),
+            extend_num_tokens=block_size,
+            extend_seq_lens=torch.tensor([block_size], dtype=torch.int32, device=device),
+            extend_prefix_lens=torch.tensor(
+                [prefix_len],
+                dtype=torch.int32,
+                device=device,
+            ),
+            extend_start_loc=torch.zeros(1, dtype=torch.int32, device=device),
+            extend_prefix_lens_cpu=[prefix_len],
+            extend_seq_lens_cpu=[block_size],
+            extend_logprob_start_lens_cpu=[0],
+            return_logprob=False,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        full_logits = self._run_model_runner_forward(
+            forward_batch,
+            phase=phase,
+            input_ids=input_ids,
+            prefix_len=prefix_len,
+            block_size=block_size,
+            out_cache_loc=out_cache_loc,
+            req_pool_idx=req_pool_idx,
+        )
+        if full_logits is None:
+            raise RuntimeError(
+                "Fast_dLLM_v2 native model did not return full_logits for "
+                "DLLM_EXTEND block-cache forward."
+            )
+        return full_logits
+
+    def _run_model_runner_forward(
+        self,
+        forward_batch: Any,
+        *,
+        phase: str,
+        input_ids: torch.Tensor,
+        prefix_len: int,
+        block_size: int,
+        out_cache_loc: torch.Tensor,
+        req_pool_idx: int,
+    ) -> Optional[torch.Tensor]:
+        self._trace_set_phase(phase)
+        self._trace_record(
+            "model_runner.forward",
+            "input",
+            {
+                "phase": phase,
+                "input_ids": input_ids,
+                "prefix_len": prefix_len,
+                "block_size": block_size,
+                "req_pool_idx": req_pool_idx,
+                "seq_lens": forward_batch.seq_lens,
+                "positions": forward_batch.positions,
+                "out_cache_loc": out_cache_loc,
+                "extend_prefix_lens": forward_batch.extend_prefix_lens,
+                "extend_seq_lens": forward_batch.extend_seq_lens,
+            },
+        )
+        with torch.inference_mode():
+            logits_output = self.model_runner.forward(forward_batch).logits_output
+        full_logits = getattr(logits_output, "full_logits", None)
+        self._trace_record(
+            "model_runner.forward",
+            "output",
+            {
+                "phase": phase,
+                "full_logits": full_logits,
+            },
+        )
+        return full_logits
+
+    def _allocate_native_cache_state(self) -> _SGLangNativeCacheState:
+        self._ensure_native_model_runner_ready()
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        fake_req = types.SimpleNamespace(
+            rid="fast_dllm_v2_native",
+            req_pool_idx=None,
+            is_chunked=0,
+            kv_committed_len=0,
+        )
+        req_pool_indices = self.model_runner.req_to_token_pool.alloc([fake_req])
+        if req_pool_indices is None:
+            raise RuntimeError("Fast_dLLM_v2 native forward ran out of request slots.")
+        return _SGLangNativeCacheState(
+            req=fake_req,
+            req_pool_idx=int(req_pool_indices[0]),
+            allocator_state_before_alloc=allocator.backup_state(),
+            kv_len=0,
+        )
+
+    def _ensure_native_model_runner_ready(self) -> None:
+        required_attrs = (
+            "attn_backend",
+            "forward",
+            "req_to_token_pool",
+            "token_to_kv_pool",
+            "token_to_kv_pool_allocator",
+        )
+        missing_attrs = [
+            attr for attr in required_attrs if not hasattr(self.model_runner, attr)
+        ]
+        if missing_attrs:
+            raise NotImplementedError(
+                "Fast_dLLM_v2 native forward requires an initialized SGLang "
+                f"ModelRunner, missing attributes={missing_attrs}."
+            )
+
+    def _ensure_native_page_size_one(self) -> None:
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        allocator_page_size = int(getattr(allocator, "page_size", 1))
+        if allocator_page_size != 1:
+            raise NotImplementedError(
+                "Fast_dLLM_v2 native forward currently supports "
+                f"page_size=1 only, got page_size={allocator_page_size}."
+            )
+
+    def _allocate_native_block_cache_state(
+        self,
+        *,
+        prefix_cache: Optional[_SGLangNativeCacheState],
+        block_ids: torch.Tensor,
+    ) -> _SGLangNativeBlockCacheState:
+        self._ensure_native_model_runner_ready()
+        self._ensure_native_page_size_one()
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        block_ids = block_ids.to(device=self.device, dtype=torch.long, non_blocking=True)
+        block_size = int(block_ids.numel())
+        prefix_len = 0 if prefix_cache is None else int(prefix_cache.kv_len)
+
+        fake_req = types.SimpleNamespace(
+            rid="fast_dllm_v2_native_block",
+            req_pool_idx=None,
+            is_chunked=0,
+            kv_committed_len=0,
+        )
+        req_pool_indices = self.model_runner.req_to_token_pool.alloc([fake_req])
+        if req_pool_indices is None:
+            raise RuntimeError(
+                "Fast_dLLM_v2 native block cache ran out of request slots."
+            )
+
+        allocator_state = allocator.backup_state()
+        block_cache = _SGLangNativeBlockCacheState(
+            req=fake_req,
+            req_pool_idx=int(req_pool_indices[0]),
+            allocator_state_before_alloc=allocator_state,
+            prefix_len=prefix_len,
+            block_size=block_size,
+            token_ids=block_ids.clone(),
+        )
+        if prefix_len > 0:
+            assert prefix_cache is not None
+            prefix_locs = self.model_runner.req_to_token_pool.req_to_token[
+                prefix_cache.req_pool_idx,
+                :prefix_len,
+            ]
+            self.model_runner.req_to_token_pool.write(
+                (block_cache.req_pool_idx, slice(0, prefix_len)),
+                prefix_locs,
+            )
+
+        block_locs = allocator.alloc(block_size)
+        if block_locs is None:
+            allocator.restore_state(allocator_state)
+            self.model_runner.req_to_token_pool.free(fake_req)
+            block_cache.released = True
+            raise RuntimeError(
+                "Fast_dLLM_v2 native block cache ran out of KV slots while "
+                f"allocating {block_size} tokens."
+            )
+        self.model_runner.req_to_token_pool.write(
+            (block_cache.req_pool_idx, slice(prefix_len, prefix_len + block_size)),
+            block_locs,
+        )
+        return block_cache
+
+    def _block_cache_locs(
+        self,
+        block_cache: _SGLangNativeBlockCacheState,
+    ) -> torch.Tensor:
+        start = block_cache.prefix_len
+        end = start + block_cache.block_size
+        return self.model_runner.req_to_token_pool.req_to_token[
+            block_cache.req_pool_idx,
+            start:end,
+        ].to(torch.int64)
+
+    def _release_native_cache_state(
+        self,
+        cache_state: Optional[_SGLangNativeCacheState],
+    ) -> None:
+        if cache_state is None or cache_state.released:
+            return
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        allocator.restore_state(cache_state.allocator_state_before_alloc)
+        self.model_runner.req_to_token_pool.free(cache_state.req)
+        cache_state.released = True
+
+    def _release_native_block_cache_state(
+        self,
+        block_cache: Optional[_SGLangNativeBlockCacheState],
+    ) -> None:
+        if block_cache is None or block_cache.released:
+            return
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        allocator.restore_state(block_cache.allocator_state_before_alloc)
+        self.model_runner.req_to_token_pool.free(block_cache.req)
+        block_cache.released = True
+
+    def _release_active_native_caches(self) -> None:
+        while self._active_native_block_caches:
+            self._release_native_block_cache_state(
+                self._active_native_block_caches.pop()
+            )
+        while self._active_native_caches:
+            self._release_native_cache_state(self._active_native_caches.pop())
+
+    def _configure_trace(self, config: FastDllmV2RunnerConfig) -> None:
+        trace_path = config.proposal_kwargs.get("trace_path")
+        if not trace_path:
+            return
+        trace_path = str(trace_path)
+        if self._trace is None or self._trace_path != trace_path:
+            self._trace = _FastDllmV2NativeTraceRecorder(
+                trace_path,
+                max_events=int(config.proposal_kwargs.get("trace_max_events", 128)),
+                full_tensors=bool(
+                    config.proposal_kwargs.get("trace_full_tensors", False)
+                ),
+                topk=int(config.proposal_kwargs.get("trace_topk", 8)),
+            )
+            self._trace_path = trace_path
+
+        model = getattr(self.model_runner, "model", None)
+        self._trace.install_model_hooks(model)
+        model_config = getattr(self.model_runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        self._trace.set_metadata(
+            model_path=config.model_path,
+            tokenizer_path=config.tokenizer_path,
+            block_size=config.block_size,
+            small_block_size=config.small_block_size,
+            threshold=config.threshold,
+            model_type=getattr(hf_config, "model_type", None),
+            architectures=getattr(hf_config, "architectures", None),
+            num_hidden_layers=getattr(hf_config, "num_hidden_layers", None),
+            num_attention_heads=getattr(hf_config, "num_attention_heads", None),
+            num_key_value_heads=getattr(hf_config, "num_key_value_heads", None),
+            hidden_size=getattr(hf_config, "hidden_size", None),
+            rope_theta=getattr(hf_config, "rope_theta", None),
+            rope_scaling=getattr(hf_config, "rope_scaling", None),
+        )
+
+    def _trace_set_phase(self, phase: str) -> None:
+        if self._trace is not None:
+            self._trace.set_phase(phase)
+
+    def _trace_record(self, name: str, kind: str, payload: dict[str, Any]) -> None:
+        if self._trace is not None:
+            self._trace.record(name, kind, payload)
+
+    def sample_with_top_p(
+        self,
+        profile: Optional[dict[str, Any]],
+        logits: torch.Tensor,
+        *,
+        top_p: float,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if profile is not None:
+            start = time.perf_counter()
+        probs = _fast_dllm_v2_sample_probs(
+            logits,
+            top_p=top_p,
+            temperature=temperature,
+        )
+        token_ids = probs.argmax(dim=-1)
+        if profile is not None:
+            profile["sampling_calls"] += 1
+            profile["sampling_time_s"] += time.perf_counter() - start
+        return token_ids, probs
+
+    def proposal_pad_token_id(self) -> int:
+        model_config = getattr(self.model_runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        token_id = getattr(hf_config, "eos_token_id", None)
+        if token_id is None:
+            token_id = getattr(hf_config, "pad_token_id", None)
+        if isinstance(token_id, (list, tuple)):
+            token_id = token_id[0] if token_id else None
+        if token_id is None:
+            token_id = FAST_DLLM_V2_STOP_TOKEN
+        return int(token_id)
+
+    def release(
+        self,
+        config: FastDllmV2RunnerConfig,
+        request_ids: list[str],
+        states: dict[str, FastDllmV2RequestState],
+    ) -> None:
+        return None
 
 
 @dataclass(slots=True)
@@ -592,6 +1638,470 @@ class FastDllmV2Runtime(Protocol):
         states: dict[str, FastDllmV2RequestState],
     ) -> None:
         ...
+
+
+class FastDllmV2ProposalBackend(Protocol):
+    """Model backend used by the backend-neutral Fast_dLLM_v2 proposal loop."""
+
+    @property
+    def device(self) -> torch.device:
+        ...
+
+    def validate_proposal_config(self, config: FastDllmV2RunnerConfig) -> None:
+        ...
+
+    def forward(
+        self,
+        profile: Optional[dict[str, Any]],
+        phase: str,
+        **kwargs,
+    ) -> Any:
+        ...
+
+    def sample_with_top_p(
+        self,
+        profile: Optional[dict[str, Any]],
+        logits: torch.Tensor,
+        *,
+        top_p: float,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ...
+
+    def proposal_pad_token_id(self) -> int:
+        ...
+
+
+class FastDllmV2BlockProposalEngine:
+    """Backend-neutral implementation of Fast_dLLM_v2 block proposals.
+
+    This class owns the sampling/refinement algorithm. Backends provide only
+    model execution, sampling, device placement, and padding-token resolution.
+    Keeping the control flow here prevents the native SGLang path from drifting
+    away from the validated Transformers reference path.
+    """
+
+    def __init__(self, backend: FastDllmV2ProposalBackend):
+        self.backend = backend
+
+    @staticmethod
+    def new_profile() -> dict[str, Any]:
+        return {
+            "proposal_wall_time_s": 0.0,
+            "forward_time_s": 0.0,
+            "sampling_time_s": 0.0,
+            "forward_calls": 0,
+            "prefix_forward_calls": 0,
+            "block_commit_forward_calls": 0,
+            "refine_full_block_forward_calls": 0,
+            "block_cache_refresh_forward_calls": 0,
+            "block_cache_reuse_forward_calls": 0,
+            "sampling_calls": 0,
+            "blocks_started": 0,
+            "small_blocks_visited": 0,
+            "draft_model_invocations": 0,
+            "lookahead_hit": 0,
+            "lookahead_tokens_before": 0,
+            "lookahead_tokens_after": 0,
+            "lookahead_generated_tokens": 0,
+        }
+
+    @staticmethod
+    def aggregate_profiles(
+        profiles: list[Optional[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        totals: dict[str, Any] = {}
+        for profile in profiles:
+            if not profile:
+                continue
+            for key, value in profile.items():
+                if isinstance(value, (int, float)):
+                    totals[key] = totals.get(key, 0) + value
+        if not totals:
+            return {}
+
+        totals["requests_profiled"] = sum(1 for profile in profiles if profile)
+        if totals.get("draft_model_invocations"):
+            totals["forward_calls_per_invocation"] = (
+                totals.get("forward_calls", 0) / totals["draft_model_invocations"]
+            )
+            totals["proposal_wall_time_per_invocation_s"] = (
+                totals.get("proposal_wall_time_s", 0.0)
+                / totals["draft_model_invocations"]
+            )
+        return totals
+
+    @staticmethod
+    def initialize_proposal_block(
+        input_tensor: torch.Tensor,
+        seq_block_idx: torch.Tensor,
+        block_idx: int,
+        block_size: int,
+        mask_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (seq_block_idx == block_idx).all():
+            mask_count = block_size - input_tensor.shape[1] % block_size
+            mask_tokens = torch.full(
+                (input_tensor.shape[0], mask_count),
+                mask_id,
+                device=input_tensor.device,
+                dtype=torch.long,
+            )
+            x_init = torch.cat([input_tensor, mask_tokens], dim=1)
+            return x_init, x_init
+
+        return input_tensor[:, : (block_idx + 1) * block_size], input_tensor
+
+    @torch.no_grad()
+    def propose_one(
+        self,
+        config: FastDllmV2RunnerConfig,
+        input_ids: list[int],
+        profile: Optional[dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        """Run Fast_dLLM_v2 sampling until the next proposal window is ready."""
+
+        self.backend.validate_proposal_config(config)
+
+        device = self.backend.device
+        prompt = torch.tensor([input_ids], dtype=torch.long, device=device)
+        original_prompt_len = prompt.shape[1]
+        proposed_token_num = config.proposed_token_num
+        block_size = config.block_size
+        small_block_size = config.small_block_size
+        if block_size <= 0 or small_block_size <= 0 or block_size % small_block_size:
+            raise ValueError(
+                "Fast_dLLM_v2 requires a positive small_block_size that divides "
+                "block_size."
+            )
+
+        kwargs = config.proposal_kwargs
+        mask_id = int(kwargs.get("mask_id", FAST_DLLM_V2_MASK_ID))
+        stop_token = int(kwargs.get("stop_token", FAST_DLLM_V2_STOP_TOKEN))
+        top_p = float(kwargs.get("top_p", 0.95))
+        temperature = float(kwargs.get("temperature", 0.0))
+        threshold = config.threshold
+        use_block_cache = bool(kwargs.get("use_block_cache", False))
+
+        max_new_tokens = _fast_dllm_v2_internal_generation_budget(
+            original_prompt_len,
+            proposed_token_num,
+            block_size,
+        )
+
+        input_tensor = prompt
+        seq_len = torch.tensor([original_prompt_len], device=device, dtype=torch.long)
+        min_len = int(seq_len.min().item())
+        num_blocks = (
+            max_new_tokens // block_size + int(seq_len.max().item()) // block_size
+        )
+
+        if min_len > block_size:
+            prefix_len = min_len // block_size * block_size
+            output = self.backend.forward(
+                profile,
+                "prefix",
+                input_ids=input_tensor[:, :prefix_len],
+                use_cache=True,
+                update_past_key_values=True,
+                block_size=block_size,
+            )
+            logits, past_key_values = output.logits, output.past_key_values
+            if min_len % block_size == 0:
+                next_token = logits[:, -1:, :].argmax(dim=-1)
+                if input_tensor.shape[1] <= min_len:
+                    input_tensor = torch.cat([input_tensor, next_token], dim=1)
+                else:
+                    input_tensor[:, min_len] = next_token.squeeze(dim=-1)
+                ready = self.first_contiguous_proposal(
+                    input_tensor,
+                    original_prompt_len,
+                    proposed_token_num,
+                    mask_id,
+                )
+                if ready is not None:
+                    return ready
+        else:
+            past_key_values = None
+
+        seq_block_idx = seq_len // block_size
+        start_block_idx = min_len // block_size
+        num_small_blocks = block_size // small_block_size
+
+        for block_idx in range(start_block_idx, num_blocks):
+            if profile is not None:
+                profile["blocks_started"] += 1
+            x_init, input_tensor = self.initialize_proposal_block(
+                input_tensor,
+                seq_block_idx,
+                block_idx,
+                block_size,
+                mask_id,
+            )
+
+            x_t = x_init.clone()
+            block_past_key_values = None
+
+            while True:
+                ready = self.first_contiguous_proposal(
+                    x_t,
+                    original_prompt_len,
+                    proposed_token_num,
+                    mask_id,
+                )
+                if ready is not None:
+                    return ready
+
+                mask_idx = x_t[:, -block_size:] == mask_id
+                if mask_idx.sum() == 0:
+                    output = self.backend.forward(
+                        profile,
+                        "block_commit",
+                        input_ids=x_t[:, -block_size:],
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                        update_past_key_values=True,
+                        block_size=block_size,
+                    )
+                    logits, past_key_values = output.logits, output.past_key_values
+                    next_token = logits[:, -1:, :].argmax(dim=-1)
+                    x_t = torch.cat([x_t, next_token], dim=1)
+                    break
+
+                for small_block_idx in range(num_small_blocks):
+                    if profile is not None:
+                        profile["small_blocks_visited"] += 1
+                    small_block_start_idx = small_block_idx * small_block_size
+                    small_block_end_idx = small_block_start_idx + small_block_size
+                    start = -block_size + small_block_start_idx
+                    end = (
+                        None
+                        if block_size == small_block_end_idx
+                        else -block_size + small_block_end_idx
+                    )
+
+                    while True:
+                        ready = self.first_contiguous_proposal(
+                            x_t,
+                            original_prompt_len,
+                            proposed_token_num,
+                            mask_id,
+                        )
+                        if ready is not None:
+                            return ready
+
+                        mask_idx = x_t[:, -block_size:] == mask_id
+                        if mask_idx[:, start:end].sum() == 0:
+                            break
+
+                        if use_block_cache:
+                            block_start = -block_size + small_block_start_idx
+                            if (
+                                block_past_key_values is None
+                                or (x_t[:, block_start] == mask_id).any()
+                            ):
+                                output = self.backend.forward(
+                                    profile,
+                                    "block_cache_refresh",
+                                    input_ids=x_t[:, -block_size:],
+                                    use_cache=True,
+                                    past_key_values=past_key_values,
+                                    update_past_key_values=False,
+                                    use_block_cache=True,
+                                )
+                                logits = output.logits
+                                block_past_key_values = output.block_past_key_values
+                                logits = torch.cat(
+                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                )
+                                logits = logits[:, start:end]
+                            else:
+                                logits = self.backend.forward(
+                                    profile,
+                                    "block_cache_reuse",
+                                    input_ids=x_t[:, start:end],
+                                    use_cache=True,
+                                    past_key_values=past_key_values,
+                                    update_past_key_values=False,
+                                    use_block_cache=True,
+                                    block_past_key_values=block_past_key_values,
+                                    replace_position=small_block_start_idx,
+                                ).logits
+                                logits = torch.cat(
+                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                )
+                        else:
+                            logits = self.backend.forward(
+                                profile,
+                                "refine_full_block",
+                                input_ids=x_t[:, -block_size:],
+                                use_cache=True,
+                                past_key_values=past_key_values,
+                                update_past_key_values=False,
+                            ).logits
+                            logits = torch.cat(
+                                [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                            )
+                            logits = logits[:, start:end]
+
+                        x_1, p_1t = self.backend.sample_with_top_p(
+                            profile,
+                            logits,
+                            top_p=top_p,
+                            temperature=temperature,
+                        )
+                        x1_p = torch.squeeze(
+                            torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)),
+                            -1,
+                        )
+                        x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
+
+                        unmask_idx = x1_p > threshold
+                        max_prob_idx = x1_p.argmax(dim=-1)
+                        row_idx = torch.arange(x_1.shape[0], device=x_1.device)
+                        unmask_idx[row_idx, max_prob_idx] = True
+                        unmask_idx = unmask_idx & mask_idx[:, start:end]
+                        target_slice = x_t[:, start:end]
+                        target_slice[unmask_idx] = x_1[unmask_idx]
+
+                        if ((x_1 == stop_token) & unmask_idx).any():
+                            ready = self.first_contiguous_proposal(
+                                x_t,
+                                original_prompt_len,
+                                proposed_token_num,
+                                mask_id,
+                            )
+                            if ready is not None:
+                                return ready
+
+            if input_tensor.shape[1] == x_t.shape[1]:
+                input_tensor = x_t
+            else:
+                input_tensor[:, : (block_idx + 1) * block_size] = x_t[:, :-1]
+                if (seq_block_idx == block_idx).all():
+                    input_tensor = torch.cat([input_tensor, x_t[:, -1:]], dim=1)
+                elif input_tensor.shape[1] <= (block_idx + 1) * block_size:
+                    input_tensor = x_t
+                else:
+                    input_tensor[
+                        seq_block_idx == block_idx, (block_idx + 1) * block_size
+                    ] = x_t[
+                        seq_block_idx == block_idx, (block_idx + 1) * block_size
+                    ]
+            seq_block_idx[seq_block_idx == block_idx] = block_idx + 1
+
+        ready = self.first_contiguous_proposal(
+            input_tensor,
+            original_prompt_len,
+            proposed_token_num,
+            mask_id,
+        )
+        if ready is not None:
+            return ready
+        return self.pad_proposal(input_tensor, original_prompt_len, config, mask_id)
+
+    @staticmethod
+    def first_contiguous_proposal(
+        token_ids: torch.Tensor,
+        prompt_len: int,
+        proposed_token_num: int,
+        mask_id: int,
+    ) -> Optional[torch.Tensor]:
+        end = prompt_len + proposed_token_num
+        if token_ids.shape[1] < end:
+            return None
+        candidate = token_ids[0, prompt_len:end]
+        if (candidate == mask_id).any():
+            return None
+        return candidate.clone()
+
+    def pad_proposal(
+        self,
+        token_ids: torch.Tensor,
+        prompt_len: int,
+        config: FastDllmV2RunnerConfig,
+        mask_id: int,
+    ) -> torch.Tensor:
+        device = token_ids.device
+        candidate = token_ids[0, prompt_len : prompt_len + config.proposed_token_num]
+        candidate = candidate[candidate != mask_id]
+        if candidate.numel() >= config.proposed_token_num:
+            return candidate[: config.proposed_token_num].clone()
+
+        padding = torch.full(
+            (config.proposed_token_num - candidate.numel(),),
+            self.backend.proposal_pad_token_id(),
+            dtype=torch.long,
+            device=device,
+        )
+        return torch.cat([candidate.clone(), padding], dim=0)
+
+
+def _fast_dllm_v2_propose_from_state(
+    runtime: Any,
+    config: FastDllmV2RunnerConfig,
+    state: FastDllmV2RequestState,
+) -> torch.Tensor:
+    profile = (
+        FastDllmV2BlockProposalEngine.new_profile()
+        if config.proposal_kwargs.get("profile")
+        else None
+    )
+    if profile is None:
+        state.metadata.pop("last_profile", None)
+    profile_start = time.perf_counter() if profile is not None else 0.0
+    proposed_token_num = config.proposed_token_num
+    lookahead = state.draft_lookahead
+    if profile is not None:
+        profile["lookahead_tokens_before"] = len(lookahead)
+
+    if len(lookahead) < proposed_token_num:
+        seed_input_ids = state.input_ids + lookahead
+        generated = runtime._propose_one(config, seed_input_ids, profile).tolist()
+        lookahead.extend(int(token_id) for token_id in generated)
+        if profile is not None:
+            profile["draft_model_invocations"] += 1
+            profile["lookahead_generated_tokens"] += len(generated)
+    elif profile is not None:
+        profile["lookahead_hit"] += 1
+
+    if profile is not None:
+        profile["lookahead_tokens_after"] = len(lookahead)
+        profile["proposal_wall_time_s"] = time.perf_counter() - profile_start
+        state.metadata["last_profile"] = profile
+
+    return torch.tensor(
+        lookahead[:proposed_token_num],
+        dtype=torch.long,
+        device=runtime.device,
+    )
+
+
+def _fast_dllm_v2_sample_probs(
+    logits: torch.Tensor,
+    *,
+    top_p: float,
+    temperature: float,
+) -> torch.Tensor:
+    if temperature > 0:
+        logits = logits / temperature
+    probs = torch.softmax(logits, dim=-1)
+    if top_p >= 1.0:
+        return probs
+
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    sorted_remove = cumulative_probs > top_p
+    sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+    sorted_remove[..., 0] = False
+    filtered_sorted_probs = sorted_probs.masked_fill(sorted_remove, 0.0)
+    filtered_probs = torch.zeros_like(probs).scatter(
+        -1,
+        sorted_indices,
+        filtered_sorted_probs,
+    )
+    normalizer = filtered_probs.sum(dim=-1, keepdim=True)
+    return torch.where(normalizer > 0, filtered_probs / normalizer, probs)
 
 
 class TransformersFastDllmV2Runtime:
@@ -770,58 +2280,66 @@ class TransformersFastDllmV2Runtime:
         config: FastDllmV2RunnerConfig,
         state: FastDllmV2RequestState,
     ) -> torch.Tensor:
-        profile = self._new_profile() if config.proposal_kwargs.get("profile") else None
-        if profile is None:
-            state.metadata.pop("last_profile", None)
-        profile_start = time.perf_counter() if profile is not None else 0.0
-        proposed_token_num = config.proposed_token_num
-        lookahead = state.draft_lookahead
-        if profile is not None:
-            profile["lookahead_tokens_before"] = len(lookahead)
+        return _fast_dllm_v2_propose_from_state(self, config, state)
 
-        if len(lookahead) < proposed_token_num:
-            seed_input_ids = state.input_ids + lookahead
-            generated = self._propose_one(config, seed_input_ids, profile).tolist()
-            lookahead.extend(int(token_id) for token_id in generated)
-            if profile is not None:
-                profile["draft_model_invocations"] += 1
-                profile["lookahead_generated_tokens"] += len(generated)
-        elif profile is not None:
-            profile["lookahead_hit"] += 1
+    @property
+    def device(self) -> torch.device:
+        assert self.model is not None
+        return self.model.device
 
-        device = self.model.device
-        if profile is not None:
-            profile["lookahead_tokens_after"] = len(lookahead)
-            profile["proposal_wall_time_s"] = time.perf_counter() - profile_start
-            state.metadata["last_profile"] = profile
-
-        return torch.tensor(
-            lookahead[:proposed_token_num],
-            dtype=torch.long,
-            device=device,
+    def validate_proposal_config(self, config: FastDllmV2RunnerConfig) -> None:
+        assert self.model is not None
+        unsupported_kwargs = sorted(
+            set(config.proposal_kwargs) - FAST_DLLM_V2_PROPOSAL_KWARGS
         )
+        if unsupported_kwargs:
+            raise _FastDllmV2ProposalUnsupported(
+                "SGLang's Fast_dLLM_v2 proposal path does not support "
+                f"proposal_kwargs: {unsupported_kwargs}"
+            )
+        if not hasattr(self.model, "sample_with_top_p"):
+            raise _FastDllmV2ProposalUnsupported(
+                "Fast_dLLM_v2 model does not expose sample_with_top_p"
+            )
+
+    def forward(
+        self,
+        profile: Optional[dict[str, Any]],
+        phase: str,
+        **kwargs,
+    ) -> Any:
+        return self._profiled_forward(profile, phase, **kwargs)
+
+    def sample_with_top_p(
+        self,
+        profile: Optional[dict[str, Any]],
+        logits: torch.Tensor,
+        *,
+        top_p: float,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._profiled_sample_with_top_p(
+            profile,
+            logits,
+            top_p=top_p,
+            temperature=temperature,
+        )
+
+    def proposal_pad_token_id(self) -> int:
+        assert self.tokenizer is not None
+        pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            raise ValueError(
+                "Fast_dLLM_v2 proposal produced too few concrete tokens and "
+                "no EOS/PAD token is available for padding."
+            )
+        return int(pad_id)
 
     @staticmethod
     def _new_profile() -> dict[str, Any]:
-        return {
-            "proposal_wall_time_s": 0.0,
-            "forward_time_s": 0.0,
-            "sampling_time_s": 0.0,
-            "forward_calls": 0,
-            "prefix_forward_calls": 0,
-            "block_commit_forward_calls": 0,
-            "refine_full_block_forward_calls": 0,
-            "block_cache_refresh_forward_calls": 0,
-            "block_cache_reuse_forward_calls": 0,
-            "sampling_calls": 0,
-            "blocks_started": 0,
-            "small_blocks_visited": 0,
-            "draft_model_invocations": 0,
-            "lookahead_hit": 0,
-            "lookahead_tokens_before": 0,
-            "lookahead_tokens_after": 0,
-            "lookahead_generated_tokens": 0,
-        }
+        return FastDllmV2BlockProposalEngine.new_profile()
 
     def _profiled_forward(
         self,
@@ -870,26 +2388,7 @@ class TransformersFastDllmV2Runtime:
 
     @staticmethod
     def _aggregate_profiles(profiles: list[Optional[dict[str, Any]]]) -> dict[str, Any]:
-        totals: dict[str, Any] = {}
-        for profile in profiles:
-            if not profile:
-                continue
-            for key, value in profile.items():
-                if isinstance(value, (int, float)):
-                    totals[key] = totals.get(key, 0) + value
-        if not totals:
-            return {}
-
-        totals["requests_profiled"] = sum(1 for profile in profiles if profile)
-        if totals.get("draft_model_invocations"):
-            totals["forward_calls_per_invocation"] = (
-                totals.get("forward_calls", 0) / totals["draft_model_invocations"]
-            )
-            totals["proposal_wall_time_per_invocation_s"] = (
-                totals.get("proposal_wall_time_s", 0.0)
-                / totals["draft_model_invocations"]
-            )
-        return totals
+        return FastDllmV2BlockProposalEngine.aggregate_profiles(profiles)
 
     @staticmethod
     def _initialize_proposal_block(
@@ -899,18 +2398,13 @@ class TransformersFastDllmV2Runtime:
         block_size: int,
         mask_id: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (seq_block_idx == block_idx).all():
-            mask_count = block_size - input_tensor.shape[1] % block_size
-            mask_tokens = torch.full(
-                (input_tensor.shape[0], mask_count),
-                mask_id,
-                device=input_tensor.device,
-                dtype=torch.long,
-            )
-            x_init = torch.cat([input_tensor, mask_tokens], dim=1)
-            return x_init, x_init
-
-        return input_tensor[:, : (block_idx + 1) * block_size], input_tensor
+        return FastDllmV2BlockProposalEngine.initialize_proposal_block(
+            input_tensor,
+            seq_block_idx,
+            block_idx,
+            block_size,
+            mask_id,
+        )
 
     @torch.no_grad()
     def _propose_one(
@@ -919,268 +2413,16 @@ class TransformersFastDllmV2Runtime:
         input_ids: list[int],
         profile: Optional[dict[str, Any]] = None,
     ) -> torch.Tensor:
-        """Run Fast_dLLM_v2 sampling only until the next proposal block is ready.
-
-        In the speculative path we only need the next contiguous proposal
-        tokens, so this mirrors Fast_dLLM_v2's reference block-diffusion loop
-        and returns as soon as those positions are no longer masked.
-        """
-
         assert self.model is not None
         assert self.tokenizer is not None
-        self._validate_proposal_config(config)
-
-        device = self.model.device
-        prompt = torch.tensor([input_ids], dtype=torch.long, device=device)
-        original_prompt_len = prompt.shape[1]
-        proposed_token_num = config.proposed_token_num
-        block_size = config.block_size
-        small_block_size = config.small_block_size
-        if block_size <= 0 or small_block_size <= 0 or block_size % small_block_size:
-            raise ValueError(
-                "Fast_dLLM_v2 requires a positive small_block_size that divides "
-                "block_size."
-            )
-
-        kwargs = config.proposal_kwargs
-        mask_id = int(kwargs.get("mask_id", FAST_DLLM_V2_MASK_ID))
-        stop_token = int(kwargs.get("stop_token", FAST_DLLM_V2_STOP_TOKEN))
-        top_p = float(kwargs.get("top_p", 0.95))
-        temperature = float(kwargs.get("temperature", 0.0))
-        threshold = config.threshold
-        use_block_cache = bool(kwargs.get("use_block_cache", False))
-
-        max_new_tokens = _fast_dllm_v2_internal_generation_budget(
-            original_prompt_len,
-            proposed_token_num,
-            block_size,
+        return FastDllmV2BlockProposalEngine(self).propose_one(
+            config,
+            input_ids,
+            profile,
         )
-
-        input_tensor = prompt
-        seq_len = torch.tensor([original_prompt_len], device=device, dtype=torch.long)
-        min_len = int(seq_len.min().item())
-        num_blocks = (
-            max_new_tokens // block_size + int(seq_len.max().item()) // block_size
-        )
-
-        if min_len > block_size:
-            prefix_len = min_len // block_size * block_size
-            output = self._profiled_forward(
-                profile,
-                "prefix",
-                input_ids=input_tensor[:, :prefix_len],
-                use_cache=True,
-                update_past_key_values=True,
-                block_size=block_size,
-            )
-            logits, past_key_values = output.logits, output.past_key_values
-            if min_len % block_size == 0:
-                next_token = logits[:, -1:, :].argmax(dim=-1)
-                if input_tensor.shape[1] <= min_len:
-                    input_tensor = torch.cat([input_tensor, next_token], dim=1)
-                else:
-                    input_tensor[:, min_len] = next_token.squeeze(dim=-1)
-                ready = self._first_contiguous_proposal(
-                    input_tensor,
-                    original_prompt_len,
-                    proposed_token_num,
-                    mask_id,
-                )
-                if ready is not None:
-                    return ready
-        else:
-            past_key_values = None
-
-        seq_block_idx = seq_len // block_size
-        start_block_idx = min_len // block_size
-        num_small_blocks = block_size // small_block_size
-
-        for block_idx in range(start_block_idx, num_blocks):
-            if profile is not None:
-                profile["blocks_started"] += 1
-            x_init, input_tensor = self._initialize_proposal_block(
-                input_tensor,
-                seq_block_idx,
-                block_idx,
-                block_size,
-                mask_id,
-            )
-
-            x_t = x_init.clone()
-            block_past_key_values = None
-
-            while True:
-                ready = self._first_contiguous_proposal(
-                    x_t,
-                    original_prompt_len,
-                    proposed_token_num,
-                    mask_id,
-                )
-                if ready is not None:
-                    return ready
-
-                mask_idx = x_t[:, -block_size:] == mask_id
-                if mask_idx.sum() == 0:
-                    output = self._profiled_forward(
-                        profile,
-                        "block_commit",
-                        input_ids=x_t[:, -block_size:],
-                        use_cache=True,
-                        past_key_values=past_key_values,
-                        update_past_key_values=True,
-                        block_size=block_size,
-                    )
-                    logits, past_key_values = output.logits, output.past_key_values
-                    next_token = logits[:, -1:, :].argmax(dim=-1)
-                    x_t = torch.cat([x_t, next_token], dim=1)
-                    break
-
-                for small_block_idx in range(num_small_blocks):
-                    if profile is not None:
-                        profile["small_blocks_visited"] += 1
-                    small_block_start_idx = small_block_idx * small_block_size
-                    small_block_end_idx = small_block_start_idx + small_block_size
-                    start = -block_size + small_block_start_idx
-                    end = (
-                        None
-                        if block_size == small_block_end_idx
-                        else -block_size + small_block_end_idx
-                    )
-
-                    while True:
-                        ready = self._first_contiguous_proposal(
-                            x_t,
-                            original_prompt_len,
-                            proposed_token_num,
-                            mask_id,
-                        )
-                        if ready is not None:
-                            return ready
-
-                        mask_idx = x_t[:, -block_size:] == mask_id
-                        if mask_idx[:, start:end].sum() == 0:
-                            break
-
-                        if use_block_cache:
-                            block_start = -block_size + small_block_start_idx
-                            if (
-                                block_past_key_values is None
-                                or (x_t[:, block_start] == mask_id).any()
-                            ):
-                                output = self._profiled_forward(
-                                    profile,
-                                    "block_cache_refresh",
-                                    input_ids=x_t[:, -block_size:],
-                                    use_cache=True,
-                                    past_key_values=past_key_values,
-                                    update_past_key_values=False,
-                                    use_block_cache=True,
-                                )
-                                logits = output.logits
-                                block_past_key_values = output.block_past_key_values
-                                logits = torch.cat(
-                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
-                                )
-                                logits = logits[:, start:end]
-                            else:
-                                logits = self._profiled_forward(
-                                    profile,
-                                    "block_cache_reuse",
-                                    input_ids=x_t[:, start:end],
-                                    use_cache=True,
-                                    past_key_values=past_key_values,
-                                    update_past_key_values=False,
-                                    use_block_cache=True,
-                                    block_past_key_values=block_past_key_values,
-                                    replace_position=small_block_start_idx,
-                                ).logits
-                                logits = torch.cat(
-                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
-                                )
-                        else:
-                            logits = self._profiled_forward(
-                                profile,
-                                "refine_full_block",
-                                input_ids=x_t[:, -block_size:],
-                                use_cache=True,
-                                past_key_values=past_key_values,
-                                update_past_key_values=False,
-                            ).logits
-                            logits = torch.cat(
-                                [logits[:, :1, :], logits[:, :-1, :]], dim=1
-                            )
-                            logits = logits[:, start:end]
-
-                        x_1, p_1t = self._profiled_sample_with_top_p(
-                            profile,
-                            logits,
-                            top_p=top_p,
-                            temperature=temperature,
-                        )
-                        x1_p = torch.squeeze(
-                            torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)),
-                            -1,
-                        )
-                        x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
-
-                        unmask_idx = x1_p > threshold
-                        max_prob_idx = x1_p.argmax(dim=-1)
-                        row_idx = torch.arange(x_1.shape[0], device=x_1.device)
-                        unmask_idx[row_idx, max_prob_idx] = True
-                        unmask_idx = unmask_idx & mask_idx[:, start:end]
-                        target_slice = x_t[:, start:end]
-                        target_slice[unmask_idx] = x_1[unmask_idx]
-
-                        if ((x_1 == stop_token) & unmask_idx).any():
-                            ready = self._first_contiguous_proposal(
-                                x_t,
-                                original_prompt_len,
-                                proposed_token_num,
-                                mask_id,
-                            )
-                            if ready is not None:
-                                return ready
-
-            if input_tensor.shape[1] == x_t.shape[1]:
-                input_tensor = x_t
-            else:
-                input_tensor[:, : (block_idx + 1) * block_size] = x_t[:, :-1]
-                if (seq_block_idx == block_idx).all():
-                    input_tensor = torch.cat([input_tensor, x_t[:, -1:]], dim=1)
-                elif input_tensor.shape[1] <= (block_idx + 1) * block_size:
-                    input_tensor = x_t
-                else:
-                    input_tensor[
-                        seq_block_idx == block_idx, (block_idx + 1) * block_size
-                    ] = x_t[
-                        seq_block_idx == block_idx, (block_idx + 1) * block_size
-                    ]
-            seq_block_idx[seq_block_idx == block_idx] = block_idx + 1
-
-        ready = self._first_contiguous_proposal(
-            input_tensor,
-            original_prompt_len,
-            proposed_token_num,
-            mask_id,
-        )
-        if ready is not None:
-            return ready
-        return self._pad_proposal(input_tensor, original_prompt_len, config, mask_id)
 
     def _validate_proposal_config(self, config: FastDllmV2RunnerConfig) -> None:
-        assert self.model is not None
-        unsupported_kwargs = sorted(
-            set(config.proposal_kwargs) - FAST_DLLM_V2_PROPOSAL_KWARGS
-        )
-        if unsupported_kwargs:
-            raise _FastDllmV2ProposalUnsupported(
-                "SGLang's Fast_dLLM_v2 proposal path does not support "
-                f"proposal_kwargs: {unsupported_kwargs}"
-            )
-        if not hasattr(self.model, "sample_with_top_p"):
-            raise _FastDllmV2ProposalUnsupported(
-                "Fast_dLLM_v2 model does not expose sample_with_top_p"
-            )
+        self.validate_proposal_config(config)
 
     def _first_contiguous_proposal(
         self,
@@ -1189,13 +2431,12 @@ class TransformersFastDllmV2Runtime:
         proposed_token_num: int,
         mask_id: int,
     ) -> Optional[torch.Tensor]:
-        end = prompt_len + proposed_token_num
-        if token_ids.shape[1] < end:
-            return None
-        candidate = token_ids[0, prompt_len:end]
-        if (candidate == mask_id).any():
-            return None
-        return candidate.clone()
+        return FastDllmV2BlockProposalEngine.first_contiguous_proposal(
+            token_ids,
+            prompt_len,
+            proposed_token_num,
+            mask_id,
+        )
 
     def _pad_proposal(
         self,
@@ -1204,28 +2445,12 @@ class TransformersFastDllmV2Runtime:
         config: FastDllmV2RunnerConfig,
         mask_id: int,
     ) -> torch.Tensor:
-        assert self.tokenizer is not None
-        device = token_ids.device
-        candidate = token_ids[0, prompt_len : prompt_len + config.proposed_token_num]
-        candidate = candidate[candidate != mask_id]
-        if candidate.numel() >= config.proposed_token_num:
-            return candidate[: config.proposed_token_num].clone()
-
-        pad_id = self.tokenizer.eos_token_id
-        if pad_id is None:
-            pad_id = self.tokenizer.pad_token_id
-        if pad_id is None:
-            raise ValueError(
-                "Fast_dLLM_v2 proposal produced too few concrete tokens and "
-                "no EOS/PAD token is available for padding."
-            )
-        padding = torch.full(
-            (config.proposed_token_num - candidate.numel(),),
-            int(pad_id),
-            dtype=torch.long,
-            device=device,
+        return FastDllmV2BlockProposalEngine(self).pad_proposal(
+            token_ids,
+            prompt_len,
+            config,
+            mask_id,
         )
-        return torch.cat([candidate.clone(), padding], dim=0)
 
 
 class FastDllmV2ProposalRunner:

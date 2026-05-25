@@ -31,6 +31,12 @@ def main() -> None:
     trace_parser.add_argument("--model-path", required=True)
     trace_parser.add_argument("--out", required=True)
     trace_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    trace_parser.add_argument(
+        "--prompt-format",
+        choices=("chat", "raw"),
+        default="chat",
+        help="Use chat template formatting or trace the raw prompt text.",
+    )
     trace_parser.add_argument("--device-map", default="cuda:0")
     trace_parser.add_argument("--torch-dtype", default="auto")
     trace_parser.add_argument("--max-new-tokens", type=int, default=16)
@@ -79,11 +85,14 @@ def write_trace(args: argparse.Namespace) -> None:
     if args.apply_sglang_compat:
         apply_sglang_fast_dllm_v2_model_compat(model)
 
-    text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": args.prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    if args.prompt_format == "chat":
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        text = args.prompt
     inputs = tokenizer([text], return_tensors="pt").to(next(model.parameters()).device)
 
     tracer = FastDllmTrace(model, capture_calls=args.capture_calls)
@@ -335,6 +344,7 @@ def collect_metadata(
         "disable_hub_kernels": args.disable_hub_kernels,
         "use_hub_kernels_env": os.environ.get("USE_HUB_KERNELS"),
         "prompt": args.prompt,
+        "prompt_format": args.prompt_format,
         "chat_text": text,
         "input_ids": input_ids[0].detach().cpu().tolist(),
         "input_text": tokenizer.decode(input_ids[0].detach().cpu().tolist()),
@@ -458,8 +468,15 @@ def compare_traces(args: argparse.Namespace) -> None:
     print("good transformers:", good["metadata"].get("transformers_version"))
     print("test transformers:", test["metadata"].get("transformers_version"))
     print("good generated:", good["generate"].get("new_text"))
-    print("test generated:", test["generate"].get("new_text"))
+    if "generate" in test:
+        print("test generated:", test["generate"].get("new_text"))
+    elif "native" in test:
+        print("test generated: <native server trace; see proposal events>")
     print()
+
+    if "native" in test:
+        compare_native_trace(good, test, top=args.top)
+        return
 
     compare_logits(good, test)
     compare_event_tensors(
@@ -474,6 +491,39 @@ def compare_traces(args: argparse.Namespace) -> None:
         "generate",
         top=args.top,
     )
+
+
+def compare_native_trace(
+    transformers_trace: dict[str, Any],
+    native_trace: dict[str, Any],
+    *,
+    top: int,
+) -> None:
+    native_events = native_trace.get("native", {}).get("events", [])
+    print("native metadata:", json.dumps(native_trace.get("metadata", {}), indent=2))
+    print("native event count:", len(native_events))
+    print("native event names:")
+    for event in native_events[:top]:
+        print(
+            f"  {event.get('phase')} :: {event.get('name')} :: {event.get('kind')}"
+        )
+    print()
+
+    native_tensors = collect_named_tensors(native_events)
+    if not native_tensors:
+        print(
+            "native trace contains no full tensors. Re-run native with "
+            "proposal_kwargs.trace_full_tensors: true for numeric tensor diffs."
+        )
+        return
+
+    print("native tensor keys:")
+    for key in sorted(native_tensors)[:top]:
+        print(f"  {key}: shape={tuple(native_tensors[key].shape)}")
+    print()
+
+    hf_events = transformers_trace.get("generate", {}).get("events", [])
+    compare_event_tensors(hf_events, native_events, "transformers.generate_vs_native", top)
 
 
 def compare_logits(good: dict[str, Any], test: dict[str, Any]) -> None:

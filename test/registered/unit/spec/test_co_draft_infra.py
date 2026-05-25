@@ -2,6 +2,7 @@ import unittest
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.speculative.co_draft.bridge import UnimplementedCoDraftBridge
 from sglang.srt.speculative.co_draft.dllm_linear_adapter import (
     FastDllmV2LinearAdapter,
@@ -14,10 +15,15 @@ from sglang.srt.speculative.co_draft.executor import (
     LinearVerificationPlan,
 )
 from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
+    FastDllmV2BlockProposalEngine,
     FastDllmV2ProposalRunner,
     FastDllmV2RequestState,
     FastDllmV2RunnerConfig,
+    SGLangNativeFastDllmV2Runtime,
     TransformersFastDllmV2Runtime,
+    _FastDllmV2NativeTraceRecorder,
+    _SGLangNativeBlockCacheState,
+    _SGLangNativeCacheState,
     _disable_transformers_hub_kernels_for_fast_dllm_v2,
     _fast_dllm_v2_internal_generation_budget,
     _ensure_fast_dllm_v2_tied_embeddings,
@@ -314,6 +320,38 @@ class TestDllmDraftExecutor(unittest.TestCase):
 
 
 class TestFastDllmV2ProposalRunner(unittest.TestCase):
+    def test_native_model_entrypoint_uses_hf_architecture_name(self):
+        from sglang.srt.models.fast_dllm_v2 import EntryClass
+
+        self.assertEqual(EntryClass.__name__, "Fast_dLLM_QwenForCausalLM")
+
+    def test_dllm_config_recognizes_fast_dllm_v2_native_architecture(self):
+        from unittest.mock import patch
+
+        server_args = SimpleNamespace(
+            dllm_algorithm="HierarchyBlock",
+            dllm_algorithm_config=None,
+            max_running_requests=None,
+            model_path="fast-dllm",
+            revision=None,
+        )
+
+        with patch(
+            "sglang.srt.dllm.config.ModelConfig.from_server_args"
+        ) as from_server_args:
+            from_server_args.return_value = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["Fast_dLLM_QwenForCausalLM"]
+                )
+            )
+
+            config = DllmConfig.from_server_args(server_args)
+
+        self.assertEqual(config.algorithm, "HierarchyBlock")
+        self.assertEqual(config.block_size, 32)
+        self.assertEqual(config.mask_id, 151665)
+        self.assertEqual(config.max_running_requests, 1)
+
     def test_standalone_config_uses_linear_verify_width(self):
         server_args = SimpleNamespace(
             speculative_draft_model_path="fast-dllm",
@@ -333,6 +371,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                 "\n".join(
                     [
                         "tokenizer_path: fast-dllm-tokenizer",
+                        "runtime: sglang_native",
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.8",
@@ -353,6 +392,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
 
         self.assertEqual(config.tokenizer_path, "fast-dllm-tokenizer")
         self.assertEqual(config.proposed_token_num, 4)
+        self.assertEqual(config.runtime, "sglang_native")
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.8)
@@ -452,6 +492,30 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertTrue(torch.equal(x_init[:, :26], input_tensor))
         self.assertTrue(torch.equal(x_init[:, 26:], torch.full((1, 6), 151666)))
 
+    def test_block_proposal_engine_uses_backend_padding_contract(self):
+        import torch
+
+        class FakeBackend:
+            def proposal_pad_token_id(self):
+                return 99
+
+        engine = FastDllmV2BlockProposalEngine(FakeBackend())
+        token_ids = torch.tensor([[10, 11, 151665]], dtype=torch.long)
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=3,
+        )
+
+        proposal = engine.pad_proposal(
+            token_ids=token_ids,
+            prompt_len=1,
+            config=config,
+            mask_id=151665,
+        )
+
+        self.assertTrue(torch.equal(proposal, torch.tensor([11, 99, 99])))
+
     def test_runner_consumes_matching_lookahead(self):
         state = FastDllmV2RequestState(
             input_ids=[10],
@@ -524,6 +588,268 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertTrue(torch.equal(second, torch.tensor([12, 13, 14, 15])))
         self.assertEqual(state.draft_lookahead, [12, 13, 14, 15, 16, 17])
         runtime._propose_one.assert_called_once_with(config, [10, 11, 12, 13], None)
+
+    def test_native_runtime_fails_at_forward_adapter_until_wired(self):
+        import torch
+
+        runtime = SGLangNativeFastDllmV2Runtime(
+            model_runner=SimpleNamespace(device=torch.device("cpu"))
+        )
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=2,
+            runtime="sglang_native",
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "initialized SGLang ModelRunner"):
+            runtime.propose(
+                config,
+                IndependentDllmDraftRequest(
+                    request_ids=["r0"],
+                    input_ids=[[10]],
+                    current_token_ids=torch.tensor([10]),
+                    prefix_lens=torch.tensor([1]),
+                    proposed_token_num=2,
+                ),
+                {"r0": FastDllmV2RequestState(input_ids=[10])},
+            )
+
+    def test_native_runtime_can_serve_existing_lookahead_without_forward(self):
+        import torch
+
+        runtime = SGLangNativeFastDllmV2Runtime(
+            model_runner=SimpleNamespace(device=torch.device("cpu"))
+        )
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=2,
+            runtime="sglang_native",
+        )
+
+        tokens = runtime.propose(
+            config,
+            IndependentDllmDraftRequest(
+                request_ids=["r0"],
+                input_ids=[[10]],
+                current_token_ids=torch.tensor([10]),
+                prefix_lens=torch.tensor([1]),
+                proposed_token_num=2,
+            ),
+            {"r0": FastDllmV2RequestState(input_ids=[10], draft_lookahead=[11, 12])},
+        )
+
+        self.assertTrue(torch.equal(tokens.proposed_token_ids, torch.tensor([[11, 12]])))
+        self.assertEqual(tokens.metadata["runtime"], "sglang_native")
+
+    def test_native_runtime_rejects_foreign_block_cache(self):
+        import torch
+
+        runtime = SGLangNativeFastDllmV2Runtime(
+            model_runner=SimpleNamespace(device=torch.device("cpu"))
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "foreign_block_past_key_values"):
+            runtime.forward(
+                profile=None,
+                phase="block_cache_reuse",
+                input_ids=torch.tensor([[10, 11]], dtype=torch.long),
+                use_block_cache=True,
+                block_past_key_values=object(),
+                replace_position=0,
+            )
+
+    def test_native_runtime_releases_block_caches_before_prefix_caches(self):
+        import torch
+
+        class FakeAllocator:
+            page_size = 1
+
+            def __init__(self):
+                self.restored = []
+
+            def restore_state(self, state):
+                self.restored.append(state)
+
+        class FakeReqPool:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, req):
+                self.freed.append(req.rid)
+
+        allocator = FakeAllocator()
+        req_pool = FakeReqPool()
+        runtime = SGLangNativeFastDllmV2Runtime(
+            model_runner=SimpleNamespace(
+                device=torch.device("cpu"),
+                token_to_kv_pool_allocator=allocator,
+                req_to_token_pool=req_pool,
+            )
+        )
+        prefix_req = SimpleNamespace(rid="prefix")
+        block_req = SimpleNamespace(rid="block")
+        runtime._active_native_caches.append(
+            _SGLangNativeCacheState(
+                req=prefix_req,
+                req_pool_idx=0,
+                allocator_state_before_alloc="prefix-state",
+                kv_len=4,
+            )
+        )
+        runtime._active_native_block_caches.append(
+            _SGLangNativeBlockCacheState(
+                req=block_req,
+                req_pool_idx=1,
+                allocator_state_before_alloc="block-state",
+                prefix_len=4,
+                block_size=2,
+                token_ids=torch.tensor([10, 11]),
+            )
+        )
+
+        runtime._release_active_native_caches()
+
+        self.assertEqual(allocator.restored, ["block-state", "prefix-state"])
+        self.assertEqual(req_pool.freed, ["block", "prefix"])
+
+    def test_native_runtime_builds_cached_prefix_in_block_sized_forwards(self):
+        import types
+        import torch
+
+        class FakeAllocator:
+            page_size = 1
+
+            def __init__(self):
+                self.next_loc = 0
+
+            def backup_state(self):
+                return self.next_loc
+
+            def restore_state(self, state):
+                self.next_loc = state
+
+            def alloc(self, size):
+                locs = torch.arange(self.next_loc, self.next_loc + size)
+                self.next_loc += size
+                return locs
+
+        class FakeReqPool:
+            def __init__(self):
+                self.writes = []
+
+            def alloc(self, reqs):
+                reqs[0].req_pool_idx = 0
+                return [0]
+
+            def write(self, index, values):
+                self.writes.append((index, values.clone()))
+
+            def free(self, req):
+                return None
+
+        runtime = SGLangNativeFastDllmV2Runtime(
+            model_runner=SimpleNamespace(
+                device=torch.device("cpu"),
+                attn_backend=object(),
+                forward=lambda _batch: None,
+                req_to_token_pool=FakeReqPool(),
+                token_to_kv_pool=object(),
+                token_to_kv_pool_allocator=FakeAllocator(),
+            )
+        )
+        calls = []
+
+        def fake_block_forward(
+            self,
+            *,
+            input_ids,
+            req_pool_idx,
+            prefix_len,
+            block_size,
+            out_cache_loc,
+        ):
+            calls.append(
+                {
+                    "input_ids": input_ids.tolist(),
+                    "prefix_len": prefix_len,
+                    "block_size": block_size,
+                    "out_cache_loc": out_cache_loc.tolist(),
+                }
+            )
+            return torch.full((block_size, 4), len(calls), dtype=torch.float32)
+
+        runtime._run_dllm_block_forward = types.MethodType(fake_block_forward, runtime)
+
+        output = runtime.forward(
+            profile=None,
+            phase="prefix",
+            input_ids=torch.tensor([[10, 11, 12, 13]], dtype=torch.long),
+            use_cache=True,
+            update_past_key_values=True,
+            block_size=2,
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "input_ids": [10, 11],
+                    "prefix_len": 0,
+                    "block_size": 2,
+                    "out_cache_loc": [0, 1],
+                },
+                {
+                    "input_ids": [12, 13],
+                    "prefix_len": 2,
+                    "block_size": 2,
+                    "out_cache_loc": [2, 3],
+                },
+            ],
+        )
+        self.assertEqual(output.past_key_values.kv_len, 4)
+        self.assertTrue(torch.equal(output.logits, torch.full((1, 2, 4), 2.0)))
+
+    def test_native_trace_recorder_writes_pt_and_json_summaries(self):
+        import json
+        import tempfile
+        import torch
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_path = Path(tmpdir) / "native_trace.pt"
+            recorder = _FastDllmV2NativeTraceRecorder(
+                str(trace_path),
+                max_events=2,
+                full_tensors=True,
+                topk=2,
+            )
+            recorder.set_phase("prefix")
+            recorder.record(
+                "model_runner.forward",
+                "output",
+                {"full_logits": torch.tensor([[0.1, 0.3, 0.2]])},
+            )
+
+            loaded = torch.load(trace_path, map_location="cpu", weights_only=False)
+            summary = json.loads(trace_path.with_suffix(".json").read_text())
+
+        self.assertEqual(loaded["native"]["events"][0]["phase"], "prefix")
+        self.assertIn(
+            "tensor",
+            loaded["native"]["events"][0]["payload"]["full_logits"],
+        )
+        self.assertNotIn(
+            "tensor",
+            summary["native"]["events"][0]["payload"]["full_logits"],
+        )
+        self.assertEqual(
+            summary["native"]["events"][0]["payload"]["full_logits"][
+                "last_row_topk"
+            ]["indices"],
+            [1, 2],
+        )
 
     def test_transformers_runtime_metadata_reports_block_cache_setting(self):
         import torch

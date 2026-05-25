@@ -432,6 +432,7 @@ The optional `--codraft-dllm-algorithm-config` YAML/JSON file can set Fast_dLLM_
 block_size: 32
 small_block_size: 8
 threshold: 0.9
+runtime: transformers
 torch_dtype: auto
 device_map: auto
 trust_remote_code: true
@@ -439,17 +440,36 @@ proposal_kwargs:
   use_block_cache: false
   profile: false
   profile_log_interval: 1
+  # Optional native-runtime trace. Keep this disabled outside debugging.
+  # trace_path: /tmp/fast_dllm_v2_native_trace.pt
+  # trace_max_events: 128
+  # trace_full_tensors: false
+  # trace_topk: 8
 ```
 
 Set `proposal_kwargs.profile: true` during performance investigations to log
 draft-rank proposal counters such as model forward calls, phase-specific forward
 time, sampling time, lookahead reuse, and block-cache path usage. Leave it off
-for normal serving.
+for normal serving. Set `proposal_kwargs.trace_path` only when debugging the
+experimental `runtime: sglang_native` path; it writes both `.pt` and `.json`
+native forward traces, including prefix/block-cache forward metadata and
+first-layer module hooks.
 
-Fast_dLLM_v2 decodes by iteratively filling masked diffusion blocks. The SGLang
-proposal loop computes the minimal block-aligned budget needed for the next
-proposal window and stops when the first `--speculative-num-draft-tokens`
-proposal positions are filled and contiguous.
+Fast_dLLM_v2 decodes by iteratively filling masked diffusion blocks. The current
+speculative proposal loop computes the minimal block-aligned budget needed for
+the next proposal window and stops when the first
+`--speculative-num-draft-tokens` proposal positions are filled and contiguous.
+SGLang also registers a native `Fast_dLLM_QwenForCausalLM` model entrypoint as
+the foundation for the native proposal runtime. The Transformers-backed runner
+remains the serving correctness reference, while the experimental
+`runtime: sglang_native` setting now bootstraps the native draft model and
+shares the same block-diffusion proposal loop. The native path has an initial
+`ModelRunner/ForwardBatch` bridge with ephemeral SGLang KV handles for prefix
+and block-cache reuse. The block-cache path is currently correctness-first: it
+reuses native cache storage but reruns the full diffusion block when a slice is
+refined. The partial small-slice kernel path remains the next optimization
+milestone, so use `runtime: sglang_native` only while developing the native
+execution path.
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 

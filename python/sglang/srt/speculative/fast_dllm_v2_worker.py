@@ -5,17 +5,29 @@ from __future__ import annotations
 import json
 import logging
 import traceback
+from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
 
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.co_draft.dllm_linear_adapter import (
     IndependentDllmAcceptedTokens,
     IndependentDllmDraftRequest,
@@ -23,7 +35,9 @@ from sglang.srt.speculative.co_draft.dllm_linear_adapter import (
 from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     FastDllmV2ProposalRunner,
     FastDllmV2RunnerConfig,
+    SGLangNativeFastDllmV2Runtime,
 )
+from sglang.srt.speculative.co_draft.tp import LocalDraftTpPlan
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import resolve_dflash_verify_mask_policy
 from sglang.srt.speculative.linear_verify import (
@@ -32,6 +46,10 @@ from sglang.srt.speculative.linear_verify import (
     build_linear_verify_input,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import (
+    SingleRankDraftGroup,
+    single_rank_draft_context,
+)
 from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
@@ -71,7 +89,6 @@ class FastDllmV2Worker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        del gpu_id, dp_rank, moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port
         self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -80,15 +97,47 @@ class FastDllmV2Worker:
         self.device = target_worker.device
         self.tp_size = int(server_args.tp_size)
         self.draft_tp_size = int(server_args.speculative_draft_tp_size)
-        self._is_draft_rank = tp_rank < self.draft_tp_size
+        self.draft_tp_plan = LocalDraftTpPlan(
+            name="FAST_DLLM_V2",
+            target_tp_size=self.tp_size,
+            draft_tp_size=self.draft_tp_size,
+        )
+        self._is_draft_rank = self.draft_tp_plan.owns_rank(tp_rank)
         self.speculative_num_draft_tokens = int(
             server_args.speculative_num_draft_tokens
         )
         self.proposed_token_num = self.speculative_num_draft_tokens - 1
-        self.runner = (
-            FastDllmV2ProposalRunner(
-                FastDllmV2RunnerConfig.from_server_args(server_args)
+        self.runner_config = FastDllmV2RunnerConfig.from_server_args(server_args)
+        self.native_draft_worker: Optional[TpModelWorker] = None
+        self.native_draft_model_runner: Optional[ModelRunner] = None
+        if self.runner_config.runtime not in (
+            "transformers",
+            "sglang_native",
+            "native",
+        ):
+            raise ValueError(
+                "FAST_DLLM_V2 runtime must be 'transformers' or "
+                f"'sglang_native', got {self.runner_config.runtime!r}."
             )
+
+        runtime = None
+        if self._is_draft_rank and self.runner_config.runtime in (
+            "sglang_native",
+            "native",
+        ):
+            self.native_draft_model_runner = self._init_native_draft_model_runner(
+                server_args=server_args,
+                gpu_id=gpu_id,
+                dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                nccl_port=nccl_port,
+            )
+            runtime = SGLangNativeFastDllmV2Runtime(self.native_draft_model_runner)
+
+        self.runner = (
+            FastDllmV2ProposalRunner(self.runner_config, runtime=runtime)
             if self._is_draft_rank
             else None
         )
@@ -97,9 +146,10 @@ class FastDllmV2Worker:
         if self.tp_rank == 0:
             logger.info(
                 "Initialized FAST_DLLM_V2 standalone speculator. "
-                "model=%s, target_tp=%s, draft_tp=%s, verify_block=%s, "
+                "model=%s, runtime=%s, target_tp=%s, draft_tp=%s, verify_block=%s, "
                 "proposed_tokens=%s.",
                 server_args.speculative_draft_model_path,
+                self.runner_config.runtime,
                 self.tp_size,
                 self.draft_tp_size,
                 self.speculative_num_draft_tokens,
@@ -110,6 +160,128 @@ class FastDllmV2Worker:
                 "FAST_DLLM_V2: target TP rank %s is a passive draft participant.",
                 tp_rank,
             )
+
+    @contextmanager
+    def _native_draft_context(self):
+        if self.draft_tp_size == 1 and self.tp_size > 1:
+            draft_group = SingleRankDraftGroup(self.target_worker.world_group)
+            with (
+                single_rank_draft_context(draft_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                yield
+        else:
+            with (
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                yield
+
+    def _build_native_draft_args(self, server_args: ServerArgs) -> ServerArgs:
+        draft_args = deepcopy(server_args)
+        draft_args.skip_tokenizer_init = True
+        draft_args.trust_remote_code = self.runner_config.trust_remote_code
+        draft_args.context_length = (
+            self.target_worker.model_runner.model_config.context_len
+        )
+        draft_args.disable_cuda_graph = True
+
+        if self.draft_tp_size == 1 and self.tp_size > 1:
+            draft_args.tp_size = 1
+            draft_args.ep_size = 1
+            draft_args.enable_dp_attention = False
+
+        draft_backend = draft_args.speculative_draft_attention_backend
+        if draft_backend is None:
+            draft_backend, _ = draft_args.get_attention_backends()
+        if draft_backend is not None:
+            draft_args.attention_backend = draft_backend
+            draft_args.prefill_attention_backend = None
+            draft_args.decode_attention_backend = None
+            draft_args.speculative_draft_attention_backend = None
+
+        return draft_args
+
+    def _init_native_draft_model_runner(
+        self,
+        *,
+        server_args: ServerArgs,
+        gpu_id: int,
+        dp_rank: Optional[int],
+        moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
+        nccl_port: int,
+    ) -> ModelRunner:
+        draft_args = self._build_native_draft_args(server_args)
+        target_req_to_token_pool, target_token_to_kv_pool_allocator = (
+            self.target_worker.get_memory_pool()
+        )
+        saved_server_args = get_global_server_args()
+        try:
+            with self._native_draft_context():
+                if self.draft_tp_size == 1 and self.tp_size > 1:
+                    draft_model_config = ModelConfig.from_server_args(
+                        draft_args,
+                        model_path=draft_args.speculative_draft_model_path,
+                        model_revision=draft_args.speculative_draft_model_revision,
+                        is_draft_model=True,
+                    )
+                    draft_model_runner = ModelRunner(
+                        model_config=draft_model_config,
+                        mem_fraction_static=draft_args.mem_fraction_static,
+                        gpu_id=gpu_id,
+                        tp_rank=0,
+                        tp_size=1,
+                        moe_ep_rank=0,
+                        moe_ep_size=1,
+                        pp_rank=0,
+                        pp_size=draft_args.pp_size,
+                        nccl_port=nccl_port,
+                        dp_rank=dp_rank,
+                        attn_cp_rank=attn_cp_rank,
+                        moe_dp_rank=moe_dp_rank,
+                        server_args=draft_args,
+                        is_draft_worker=True,
+                        req_to_token_pool=target_req_to_token_pool,
+                        token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+                        memory_pool_config=(
+                            self.target_worker.model_runner.memory_pool_config
+                        ),
+                    )
+                else:
+                    self.native_draft_worker = TpModelWorker(
+                        server_args=draft_args,
+                        gpu_id=gpu_id,
+                        tp_rank=self.draft_tp_plan.local_rank(self.tp_rank),
+                        moe_ep_rank=moe_ep_rank,
+                        pp_rank=0,
+                        attn_cp_rank=attn_cp_rank,
+                        moe_dp_rank=moe_dp_rank,
+                        dp_rank=dp_rank,
+                        nccl_port=nccl_port,
+                        is_draft_worker=True,
+                        req_to_token_pool=target_req_to_token_pool,
+                        token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+                        memory_pool_config=(
+                            self.target_worker.model_runner.memory_pool_config
+                        ),
+                    )
+                    draft_model_runner = self.native_draft_worker.model_runner
+        finally:
+            set_global_server_args_for_scheduler(saved_server_args)
+
+        if self.tp_rank == 0:
+            logger.info(
+                "FAST_DLLM_V2 native draft model loaded. model=%s, "
+                "target_tp=%s, draft_tp=%s, local_rank=%s.",
+                server_args.speculative_draft_model_path,
+                self.tp_size,
+                self.draft_tp_size,
+                self.draft_tp_plan.local_rank(self.tp_rank),
+            )
+        return draft_model_runner
 
     def __getattr__(self, name):
         return getattr(self.target_worker, name)

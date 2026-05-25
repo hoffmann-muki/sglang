@@ -32,6 +32,7 @@ class DllmConfig:
             model_revision=server_args.revision,
         )
         DLLM_PARAMS = {
+            "Fast_dLLM_QwenForCausalLM": {"block_size": 32, "mask_id": 151665},
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
