@@ -433,6 +433,8 @@ block_size: 32
 small_block_size: 8
 threshold: 0.9
 runtime: transformers
+# Optional. Defaults to the Fast_dLLM_v2 checkpoint's own derived context length.
+# context_length: 32768
 torch_dtype: auto
 device_map: auto
 trust_remote_code: true

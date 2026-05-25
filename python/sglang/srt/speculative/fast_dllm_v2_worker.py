@@ -182,9 +182,10 @@ class FastDllmV2Worker:
         draft_args = deepcopy(server_args)
         draft_args.skip_tokenizer_init = True
         draft_args.trust_remote_code = self.runner_config.trust_remote_code
-        draft_args.context_length = (
-            self.target_worker.model_runner.model_config.context_len
-        )
+        # Fast_dLLM_v2 is an independent draft model, not a target-context
+        # extension model. Let ModelConfig derive the draft's own safe context
+        # length unless the Fast_dLLM_v2 algorithm config explicitly overrides it.
+        draft_args.context_length = self.runner_config.context_length
         draft_args.disable_cuda_graph = True
 
         if self.draft_tp_size == 1 and self.tp_size > 1:

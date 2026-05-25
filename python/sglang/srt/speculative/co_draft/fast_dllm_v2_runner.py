@@ -718,6 +718,7 @@ class FastDllmV2RunnerConfig:
     tokenizer_path: str
     proposed_token_num: int
     runtime: str = "transformers"
+    context_length: Optional[int] = None
     block_size: int = 32
     small_block_size: int = 8
     threshold: float = 0.9
@@ -739,6 +740,7 @@ class FastDllmV2RunnerConfig:
             tokenizer_path=executor.tokenizer_path,
             proposed_token_num=executor.verification_plan.proposed_token_num,
             runtime=str(raw_config.get("runtime", "transformers")),
+            context_length=_optional_int(raw_config.get("context_length")),
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
@@ -774,6 +776,7 @@ class FastDllmV2RunnerConfig:
             tokenizer_path=tokenizer_path,
             proposed_token_num=proposed_token_num,
             runtime=str(raw_config.get("runtime", "transformers")),
+            context_length=_optional_int(raw_config.get("context_length")),
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
@@ -2557,6 +2560,15 @@ def _optional_str(value: Any) -> Optional[str]:
     if parsed.lower() in ("", "none", "null"):
         return None
     return parsed
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    parsed = str(value)
+    if parsed.lower() in ("", "none", "null"):
+        return None
+    return int(value)
 
 
 def _fast_dllm_v2_internal_generation_budget(

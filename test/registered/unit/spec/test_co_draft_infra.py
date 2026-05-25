@@ -372,6 +372,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                     [
                         "tokenizer_path: fast-dllm-tokenizer",
                         "runtime: sglang_native",
+                        "context_length: 2048",
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.8",
@@ -393,6 +394,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.tokenizer_path, "fast-dllm-tokenizer")
         self.assertEqual(config.proposed_token_num, 4)
         self.assertEqual(config.runtime, "sglang_native")
+        self.assertEqual(config.context_length, 2048)
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.8)
