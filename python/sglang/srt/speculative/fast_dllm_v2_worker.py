@@ -72,10 +72,10 @@ def _cpu_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 class FastDllmV2Worker:
     """Spec-v1 worker that verifies independent Fast_dLLM_v2 token blocks.
 
-    Fast_dLLM_v2 owns proposal generation through its Hugging Face
-    ``trust_remote_code`` path. Once it emits token ids, the AR target verifies
-    the linear block using the same target-side contract as DFlash, but without
-    DFlash's target-hidden-conditioned draft cache.
+    Fast_dLLM_v2 owns proposal generation through either the Transformers
+    reference path or the SGLang-native draft runner. Once it emits token ids,
+    the AR target verifies the linear block using the same target-side contract
+    as DFlash, but without DFlash's target-hidden-conditioned draft cache.
     """
 
     def __init__(
@@ -187,8 +187,52 @@ class FastDllmV2Worker:
         # extension model. Let ModelConfig derive the draft's own safe context
         # length unless the Fast_dLLM_v2 algorithm config explicitly overrides it.
         draft_args.context_length = self.runner_config.context_length
-        draft_args.disable_cuda_graph = True
-        draft_args.max_total_tokens = self.runner_config.native_max_total_tokens
+        draft_args.speculative_algorithm = None
+        draft_args.dllm_algorithm = self.runner_config.native_dllm_algorithm
+        draft_args.dllm_algorithm_config = None
+        draft_args.disable_overlap_schedule = True
+        draft_args.disable_cuda_graph = self.runner_config.native_disable_cuda_graph
+        draft_args.disable_piecewise_cuda_graph = (
+            self.runner_config.native_disable_piecewise_cuda_graph
+        )
+        if (
+            not draft_args.disable_cuda_graph
+            and self.runner_config.proposal_kwargs.get("selective_logits", True)
+        ):
+            draft_args.dllm_cuda_graph_logit_positions_size = (
+                self.runner_config.small_block_size
+            )
+        if not draft_args.disable_cuda_graph:
+            if self.runner_config.native_cuda_graph_bs is None:
+                draft_args.cuda_graph_bs = [1]
+            else:
+                draft_args.cuda_graph_bs = list(
+                    self.runner_config.native_cuda_graph_bs
+                )
+            if not draft_args.cuda_graph_bs:
+                raise ValueError(
+                    "FAST_DLLM_V2 native_cuda_graph_bs cannot be empty."
+                )
+            draft_args.cuda_graph_max_bs = (
+                self.runner_config.native_cuda_graph_max_bs
+                if self.runner_config.native_cuda_graph_max_bs is not None
+                else max(draft_args.cuda_graph_bs)
+            )
+            if draft_args.cuda_graph_max_bs < max(draft_args.cuda_graph_bs):
+                raise ValueError(
+                    "FAST_DLLM_V2 native_cuda_graph_max_bs must be greater than "
+                    "or equal to max(native_cuda_graph_bs)."
+                )
+        else:
+            if self.runner_config.native_cuda_graph_max_bs is not None:
+                draft_args.cuda_graph_max_bs = (
+                    self.runner_config.native_cuda_graph_max_bs
+                )
+            if self.runner_config.native_cuda_graph_bs is not None:
+                draft_args.cuda_graph_bs = list(
+                    self.runner_config.native_cuda_graph_bs
+                )
+        draft_args.max_total_tokens = self._resolved_native_max_total_tokens()
         draft_args.max_running_requests = (
             self.runner_config.native_max_running_requests
         )
@@ -206,11 +250,59 @@ class FastDllmV2Worker:
             draft_args.prefill_attention_backend = None
             draft_args.decode_attention_backend = None
             draft_args.speculative_draft_attention_backend = None
+        if (
+            not draft_args.disable_cuda_graph
+            and draft_args.attention_backend != "flashinfer"
+        ):
+            logger.info(
+                "FAST_DLLM_V2 native CUDA graph requires the flashinfer "
+                "attention backend; overriding draft attention_backend=%s.",
+                draft_args.attention_backend,
+            )
+            draft_args.attention_backend = "flashinfer"
 
         return draft_args
 
+    def _minimum_native_total_tokens(self) -> int:
+        active_requests = int(self.runner_config.proposal_batch_size)
+        if active_requests <= 0:
+            active_requests = 1
+        active_requests = min(
+            active_requests,
+            int(self.runner_config.native_max_running_requests),
+        )
+        active_requests = max(1, active_requests)
+
+        slack_blocks = max(0, int(self.runner_config.native_memory_pool_slack_blocks))
+        # Each active proposal can hold a prefix/cache handle plus one refinement
+        # block. Slack absorbs temporary block-cache refreshes and allocator
+        # rounding without inheriting the target model's large serving pool.
+        return max(
+            int(self.runner_config.block_size) * 4,
+            int(self.runner_config.block_size)
+            * (2 * active_requests + slack_blocks),
+        )
+
+    def _resolved_native_max_total_tokens(self) -> int:
+        minimum_tokens = self._minimum_native_total_tokens()
+        configured_tokens = self.runner_config.native_max_total_tokens
+        if configured_tokens is None:
+            return max(4096, minimum_tokens)
+        configured_tokens = int(configured_tokens)
+        if configured_tokens < minimum_tokens:
+            logger.warning(
+                "FAST_DLLM_V2 native_max_total_tokens=%s is below the minimum "
+                "safe pool size %s for proposal_batch_size=%s; using %s.",
+                configured_tokens,
+                minimum_tokens,
+                self.runner_config.proposal_batch_size,
+                minimum_tokens,
+            )
+            return minimum_tokens
+        return configured_tokens
+
     def _native_draft_memory_pool_config(self) -> MemoryPoolConfig:
-        max_total_tokens = int(self.runner_config.native_max_total_tokens)
+        max_total_tokens = self._resolved_native_max_total_tokens()
         max_running_requests = int(self.runner_config.native_max_running_requests)
         if max_running_requests <= 0:
             raise ValueError(
@@ -286,13 +378,16 @@ class FastDllmV2Worker:
             logger.info(
                 "FAST_DLLM_V2 native draft model loaded. model=%s, "
                 "target_tp=%s, draft_tp=%s, local_rank=%s, "
-                "draft_max_total_tokens=%s, draft_max_running_requests=%s.",
+                "draft_max_total_tokens=%s, draft_max_running_requests=%s, "
+                "draft_cuda_graph=%s, draft_piecewise_cuda_graph=%s.",
                 server_args.speculative_draft_model_path,
                 self.tp_size,
                 self.draft_tp_size,
                 self.draft_tp_plan.local_rank(self.tp_rank),
                 memory_pool_config.max_total_num_tokens,
                 memory_pool_config.max_running_requests,
+                not draft_args.disable_cuda_graph,
+                not draft_args.disable_piecewise_cuda_graph,
             )
         return draft_model_runner
 

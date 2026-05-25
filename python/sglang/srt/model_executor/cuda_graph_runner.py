@@ -140,6 +140,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
+    dllm_logit_positions: Optional[torch.Tensor]
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
@@ -171,6 +172,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        dllm_logit_positions_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
     ) -> "DecodeInputBuffers":
@@ -186,6 +188,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            dllm_logit_positions = (
+                torch.zeros(
+                    (max_bs * dllm_logit_positions_size,),
+                    dtype=torch.int64,
+                )
+                if dllm_logit_positions_size is not None
+                else None
+            )
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
@@ -258,6 +268,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             out_cache_loc=out_cache_loc,
             out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
+            dllm_logit_positions=dllm_logit_positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
@@ -338,6 +349,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if forward_batch.mrope_positions is not None:
             dsts.append(self.mrope_positions[:, :raw_num_token])
             srcs.append(forward_batch.mrope_positions)
+
+        if self.dllm_logit_positions is not None:
+            if forward_batch.dllm_logit_positions is None:
+                raise ValueError(
+                    "CUDA graph replay expected dllm_logit_positions but the "
+                    "ForwardBatch did not provide them."
+                )
+            num_logit_positions = int(forward_batch.dllm_logit_positions.numel())
+            dsts.append(self.dllm_logit_positions[:num_logit_positions])
+            srcs.append(forward_batch.dllm_logit_positions)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
@@ -620,6 +641,7 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        self.dllm_logit_positions_size = None
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # DFLASH draft workers reuse this runner for TARGET_VERIFY mode.
@@ -630,6 +652,11 @@ class CudaGraphRunner:
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
+            self.dllm_logit_positions_size = getattr(
+                model_runner.server_args,
+                "dllm_cuda_graph_logit_positions_size",
+                None,
+            )
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -698,6 +725,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            dllm_logit_positions_size=self.dllm_logit_positions_size,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -803,12 +831,26 @@ class CudaGraphRunner:
             else True
         )
 
+        is_dllm_logit_positions_supported = True
+        if self.is_dllm:
+            if self.dllm_logit_positions_size is None:
+                is_dllm_logit_positions_supported = (
+                    forward_batch.dllm_logit_positions is None
+                )
+            else:
+                is_dllm_logit_positions_supported = (
+                    forward_batch.dllm_logit_positions is not None
+                    and int(forward_batch.dllm_logit_positions.numel())
+                    == forward_batch.batch_size * self.dllm_logit_positions_size
+                )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dllm_logit_positions_supported
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -963,6 +1005,25 @@ class CudaGraphRunner:
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
+        if self.dllm_logit_positions_size is None:
+            dllm_logit_positions = None
+        else:
+            dllm_logit_positions = buffers.dllm_logit_positions[
+                : bs * self.dllm_logit_positions_size
+            ]
+            dllm_logit_positions.copy_(
+                torch.arange(
+                    self.dllm_logit_positions_size,
+                    dtype=torch.int64,
+                    device=dllm_logit_positions.device,
+                ).repeat(bs)
+                + torch.arange(
+                    bs,
+                    dtype=torch.int64,
+                    device=dllm_logit_positions.device,
+                ).repeat_interleave(self.dllm_logit_positions_size)
+                * self.num_tokens_per_bs
+            )
         if self.is_encoder_decoder:
             encoder_lens = buffers.encoder_lens[:bs]
         else:
@@ -1076,6 +1137,7 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            dllm_logit_positions=dllm_logit_positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -1283,6 +1345,11 @@ class CudaGraphRunner:
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
+        self.raw_num_logits = (
+            int(forward_batch.dllm_logit_positions.numel())
+            if self.is_dllm and forward_batch.dllm_logit_positions is not None
+            else raw_num_token
+        )
         self.bs = bs
 
         if self.model_runner.hisparse_coordinator is not None:
@@ -1302,6 +1369,10 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if self.buffers.dllm_logit_positions is not None:
+                self.buffers.dllm_logit_positions[: self.raw_num_logits].copy_(
+                    forward_batch.dllm_logit_positions
+                )
             if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
@@ -1322,7 +1393,7 @@ class CudaGraphRunner:
             if self.is_dllm:
                 next_token_logits = None
                 full_logits = (
-                    output.full_logits[: self.raw_num_token]
+                    output.full_logits[: self.raw_num_logits]
                     if output.full_logits is not None
                     else None
                 )

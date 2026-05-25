@@ -435,11 +435,24 @@ threshold: 0.9
 runtime: transformers
 # Optional. Defaults to the Fast_dLLM_v2 checkpoint's own derived context length.
 # context_length: 32768
+# Proposal requests are chunked through the draft runner in this many request
+# states at a time. 0 means "use the current scheduler batch".
+proposal_batch_size: 0
 # Native runtime only: size the independent Fast_dLLM_v2 draft KV pool.
 # Keep this much smaller than the target's serving KV pool; raise it for long
 # prompts if the native draft reports KV-slot exhaustion.
-# native_max_total_tokens: 4096
+# Use "auto" to select a compact pool from block size and proposal batch size.
+native_max_total_tokens: auto
 # native_max_running_requests: 8
+# native_memory_pool_slack_blocks: 4
+# Native runtime only: CUDA graph controls for the independent draft runner.
+# The native runner captures only bs=1 by default to avoid inheriting the
+# target runner's large CUDA graph memory footprint.
+native_disable_cuda_graph: false
+native_disable_piecewise_cuda_graph: true
+# native_cuda_graph_max_bs: 1
+# native_cuda_graph_bs: [1]
+# native_dllm_algorithm: FastDLLMv2
 torch_dtype: auto
 device_map: auto
 trust_remote_code: true
@@ -485,10 +498,12 @@ it intentionally does not inherit the target model's serving KV capacity. The
 native path has an initial `ModelRunner/ForwardBatch` bridge with ephemeral
 SGLang KV handles for prefix and block-cache reuse. The native path can project
 only the small-block logits consumed by the sampler (`selective_logits: true`)
-while preserving full-block hidden-state computation. The block-cache path still
-reruns the full diffusion block when a slice is refined; a true partial
-small-slice attention/kernel path remains the next optimization milestone, so
-use `runtime: sglang_native` only while developing the native execution path.
+while preserving full-block hidden-state computation. The native CUDA graph path
+also replays these selective dLLM logit positions, so it avoids falling back to
+full-block vocabulary projection. The block-cache path still reruns the full
+diffusion block when a slice is refined; a true partial small-slice
+attention/kernel path remains the next optimization milestone, so use
+`runtime: sglang_native` only while developing the native execution path.
 
 The bridge contract is bidirectional. AR-to-dLLM strategies can pass AR-generated anchor tokens into a dLLM completion pass, while dLLM-to-AR strategies can feed dLLM candidates back to the AR side for refinement, qualification, or agreement checks. The default bridge is fail-fast until a concrete strategy adapter is implemented.
 

@@ -375,6 +375,13 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                         "context_length: 2048",
                         "native_max_total_tokens: 8192",
                         "native_max_running_requests: 4",
+                        "native_memory_pool_slack_blocks: 6",
+                        "native_disable_cuda_graph: false",
+                        "native_disable_piecewise_cuda_graph: true",
+                        "native_cuda_graph_max_bs: 2",
+                        "native_cuda_graph_bs: [1, 2]",
+                        "native_dllm_algorithm: FastDLLMv2",
+                        "proposal_batch_size: 2",
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.8",
@@ -399,6 +406,13 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.context_length, 2048)
         self.assertEqual(config.native_max_total_tokens, 8192)
         self.assertEqual(config.native_max_running_requests, 4)
+        self.assertEqual(config.native_memory_pool_slack_blocks, 6)
+        self.assertFalse(config.native_disable_cuda_graph)
+        self.assertTrue(config.native_disable_piecewise_cuda_graph)
+        self.assertEqual(config.native_cuda_graph_max_bs, 2)
+        self.assertEqual(config.native_cuda_graph_bs, [1, 2])
+        self.assertEqual(config.native_dllm_algorithm, "FastDLLMv2")
+        self.assertEqual(config.proposal_batch_size, 2)
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.8)
@@ -412,8 +426,11 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                     [
                         "block_size: 16",
                         "small_block_size: 4",
-                        "native_max_total_tokens: 6144",
+                        "native_max_total_tokens: auto",
                         "native_max_running_requests: 6",
+                        "native_disable_cuda_graph: false",
+                        "native_cuda_graph_bs: 1,3",
+                        "proposal_batch_size: 3",
                         "threshold: 0.75",
                         "device_map: cuda:0",
                         "attn_implementation: sdpa",
@@ -445,8 +462,11 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.model_path, "fast-dllm")
         self.assertEqual(config.tokenizer_path, "fast-dllm-tokenizer")
         self.assertEqual(config.proposed_token_num, 3)
-        self.assertEqual(config.native_max_total_tokens, 6144)
+        self.assertIsNone(config.native_max_total_tokens)
         self.assertEqual(config.native_max_running_requests, 6)
+        self.assertFalse(config.native_disable_cuda_graph)
+        self.assertEqual(config.native_cuda_graph_bs, [1, 3])
+        self.assertEqual(config.proposal_batch_size, 3)
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.75)
@@ -994,6 +1014,49 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(profile["sampling_calls"], 2)
         self.assertEqual(profile["draft_model_invocations"], 1)
         self.assertEqual(profile["forward_calls_per_invocation"], 3)
+
+    def test_transformers_runtime_reports_proposal_batch_size(self):
+        import torch
+
+        runtime = TransformersFastDllmV2Runtime()
+        runtime._ensure_loaded = lambda _config: None
+        runtime.model = SimpleNamespace(device=torch.device("cpu"))
+        seen_inputs = []
+
+        def _fake_propose_from_state(_config, state):
+            seen_inputs.append(list(state.input_ids))
+            return torch.tensor([state.input_ids[-1] + 1])
+
+        runtime._propose_from_state = _fake_propose_from_state
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=1,
+            proposal_batch_size=2,
+        )
+
+        tokens = runtime.propose(
+            config,
+            IndependentDllmDraftRequest(
+                request_ids=["r0", "r1", "r2"],
+                input_ids=[[10], [20], [30]],
+                current_token_ids=torch.tensor([10, 20, 30]),
+                prefix_lens=torch.tensor([1, 1, 1]),
+                proposed_token_num=1,
+            ),
+            {
+                "r0": FastDllmV2RequestState(input_ids=[10]),
+                "r1": FastDllmV2RequestState(input_ids=[20]),
+                "r2": FastDllmV2RequestState(input_ids=[30]),
+            },
+        )
+
+        self.assertEqual(seen_inputs, [[10], [20], [30]])
+        self.assertTrue(
+            torch.equal(tokens.proposed_token_ids, torch.tensor([[11], [21], [31]]))
+        )
+        self.assertEqual(tokens.metadata["request_batch_size"], 3)
+        self.assertEqual(tokens.metadata["proposal_batch_size"], 2)
 
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch

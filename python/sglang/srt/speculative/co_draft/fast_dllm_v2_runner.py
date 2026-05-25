@@ -757,8 +757,15 @@ class FastDllmV2RunnerConfig:
     proposed_token_num: int
     runtime: str = "transformers"
     context_length: Optional[int] = None
-    native_max_total_tokens: int = 4096
+    native_max_total_tokens: Optional[int] = 4096
     native_max_running_requests: int = 8
+    native_memory_pool_slack_blocks: int = 4
+    native_disable_cuda_graph: bool = False
+    native_disable_piecewise_cuda_graph: bool = True
+    native_cuda_graph_max_bs: Optional[int] = None
+    native_cuda_graph_bs: Optional[list[int]] = None
+    native_dllm_algorithm: str = "FastDLLMv2"
+    proposal_batch_size: int = 0
     block_size: int = 32
     small_block_size: int = 8
     threshold: float = 0.9
@@ -781,22 +788,45 @@ class FastDllmV2RunnerConfig:
             proposed_token_num=executor.verification_plan.proposed_token_num,
             runtime=str(raw_config.get("runtime", "transformers")),
             context_length=_optional_int(raw_config.get("context_length")),
-            native_max_total_tokens=int(
-                raw_config.get("native_max_total_tokens", 4096)
+            native_max_total_tokens=_optional_int_or_auto(
+                raw_config.get("native_max_total_tokens"), 4096
             ),
             native_max_running_requests=int(
                 raw_config.get("native_max_running_requests", 8)
             ),
+            native_memory_pool_slack_blocks=int(
+                raw_config.get("native_memory_pool_slack_blocks", 4)
+            ),
+            native_disable_cuda_graph=_bool_config(
+                raw_config.get("native_disable_cuda_graph", False)
+            ),
+            native_disable_piecewise_cuda_graph=_bool_config(
+                raw_config.get("native_disable_piecewise_cuda_graph", True)
+            ),
+            native_cuda_graph_max_bs=_optional_int(
+                raw_config.get("native_cuda_graph_max_bs")
+            ),
+            native_cuda_graph_bs=_optional_int_list(
+                raw_config.get("native_cuda_graph_bs")
+            ),
+            native_dllm_algorithm=str(
+                raw_config.get("native_dllm_algorithm", "FastDLLMv2")
+            ),
+            proposal_batch_size=int(raw_config.get("proposal_batch_size", 0)),
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
             device_map=str(raw_config.get("device_map", "auto")),
-            trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
+            trust_remote_code=_bool_config(
+                raw_config.get("trust_remote_code", True)
+            ),
             attn_implementation=_optional_str(
                 raw_config.get("attn_implementation", "sdpa")
             ),
-            disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
+            disable_hub_kernels=_bool_config(
+                raw_config.get("disable_hub_kernels", True)
+            ),
             proposal_kwargs=proposal_kwargs,
         )
 
@@ -823,22 +853,45 @@ class FastDllmV2RunnerConfig:
             proposed_token_num=proposed_token_num,
             runtime=str(raw_config.get("runtime", "transformers")),
             context_length=_optional_int(raw_config.get("context_length")),
-            native_max_total_tokens=int(
-                raw_config.get("native_max_total_tokens", 4096)
+            native_max_total_tokens=_optional_int_or_auto(
+                raw_config.get("native_max_total_tokens"), 4096
             ),
             native_max_running_requests=int(
                 raw_config.get("native_max_running_requests", 8)
             ),
+            native_memory_pool_slack_blocks=int(
+                raw_config.get("native_memory_pool_slack_blocks", 4)
+            ),
+            native_disable_cuda_graph=_bool_config(
+                raw_config.get("native_disable_cuda_graph", False)
+            ),
+            native_disable_piecewise_cuda_graph=_bool_config(
+                raw_config.get("native_disable_piecewise_cuda_graph", True)
+            ),
+            native_cuda_graph_max_bs=_optional_int(
+                raw_config.get("native_cuda_graph_max_bs")
+            ),
+            native_cuda_graph_bs=_optional_int_list(
+                raw_config.get("native_cuda_graph_bs")
+            ),
+            native_dllm_algorithm=str(
+                raw_config.get("native_dllm_algorithm", "FastDLLMv2")
+            ),
+            proposal_batch_size=int(raw_config.get("proposal_batch_size", 0)),
             block_size=int(raw_config.get("block_size", 32)),
             small_block_size=int(raw_config.get("small_block_size", 8)),
             threshold=float(raw_config.get("threshold", 0.9)),
             torch_dtype=str(raw_config.get("torch_dtype", "auto")),
             device_map=str(raw_config.get("device_map", "auto")),
-            trust_remote_code=bool(raw_config.get("trust_remote_code", True)),
+            trust_remote_code=_bool_config(
+                raw_config.get("trust_remote_code", True)
+            ),
             attn_implementation=_optional_str(
                 raw_config.get("attn_implementation", "sdpa")
             ),
-            disable_hub_kernels=bool(raw_config.get("disable_hub_kernels", True)),
+            disable_hub_kernels=_bool_config(
+                raw_config.get("disable_hub_kernels", True)
+            ),
             proposal_kwargs=proposal_kwargs,
         )
 
@@ -914,10 +967,16 @@ class SGLangNativeFastDllmV2Runtime:
             },
         )
         proposed = []
-        for request_id in request.request_ids:
-            state = states[request_id]
-            generated = _fast_dllm_v2_propose_from_state(self, config, state)
-            proposed.append(generated)
+        proposal_batch_size = _effective_proposal_batch_size(
+            config, len(request.request_ids)
+        )
+        for request_ids in _iter_request_id_batches(
+            request.request_ids, proposal_batch_size
+        ):
+            for request_id in request_ids:
+                state = states[request_id]
+                generated = _fast_dllm_v2_propose_from_state(self, config, state)
+                proposed.append(generated)
 
         profiles = [
             states[request_id].metadata.get("last_profile")
@@ -930,6 +989,8 @@ class SGLangNativeFastDllmV2Runtime:
             "block_size": config.block_size,
             "small_block_size": config.small_block_size,
             "threshold": config.threshold,
+            "request_batch_size": len(request.request_ids),
+            "proposal_batch_size": proposal_batch_size,
             "use_block_cache": bool(
                 config.proposal_kwargs.get("use_block_cache", False)
             ),
@@ -2282,10 +2343,16 @@ class TransformersFastDllmV2Runtime:
     ) -> IndependentDllmDraftTokens:
         self._ensure_loaded(config)
         proposed = []
-        for request_id in request.request_ids:
-            state = states[request_id]
-            generated = self._propose_from_state(config, state)
-            proposed.append(generated)
+        proposal_batch_size = _effective_proposal_batch_size(
+            config, len(request.request_ids)
+        )
+        for request_ids in _iter_request_id_batches(
+            request.request_ids, proposal_batch_size
+        ):
+            for request_id in request_ids:
+                state = states[request_id]
+                generated = self._propose_from_state(config, state)
+                proposed.append(generated)
 
         profiles = [
             states[request_id].metadata.get("last_profile")
@@ -2299,6 +2366,8 @@ class TransformersFastDllmV2Runtime:
             "block_size": config.block_size,
             "small_block_size": config.small_block_size,
             "threshold": config.threshold,
+            "request_batch_size": len(request.request_ids),
+            "proposal_batch_size": proposal_batch_size,
             "use_block_cache": bool(
                 config.proposal_kwargs.get("use_block_cache", False)
             ),
@@ -2724,6 +2793,62 @@ def _optional_int(value: Any) -> Optional[int]:
     if parsed.lower() in ("", "none", "null"):
         return None
     return int(value)
+
+
+def _optional_int_or_auto(value: Any, default: Optional[int]) -> Optional[int]:
+    if value is None:
+        return default
+    parsed = str(value)
+    if parsed.lower() in ("", "none", "null", "auto"):
+        return None
+    return int(value)
+
+
+def _optional_int_list(value: Any) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parsed = value.strip()
+        if parsed.lower() in ("", "none", "null"):
+            return None
+        return [int(item.strip()) for item in parsed.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
+def _bool_config(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    parsed = str(value).strip().lower()
+    if parsed in ("1", "true", "yes", "y", "on"):
+        return True
+    if parsed in ("0", "false", "no", "n", "off", "", "none", "null"):
+        return False
+    raise ValueError(f"Cannot parse boolean config value {value!r}.")
+
+
+def _effective_proposal_batch_size(
+    config: FastDllmV2RunnerConfig,
+    request_count: int,
+) -> int:
+    configured = int(config.proposal_batch_size)
+    if configured <= 0:
+        return max(1, request_count)
+    return max(1, min(configured, request_count))
+
+
+def _iter_request_id_batches(
+    request_ids: list[str],
+    batch_size: int,
+) -> list[list[str]]:
+    batch_size = max(1, int(batch_size))
+    return [
+        list(request_ids[start : start + batch_size])
+        for start in range(0, len(request_ids), batch_size)
+    ]
 
 
 def _fast_dllm_v2_internal_generation_budget(
