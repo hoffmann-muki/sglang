@@ -435,6 +435,11 @@ threshold: 0.9
 runtime: transformers
 # Optional. Defaults to the Fast_dLLM_v2 checkpoint's own derived context length.
 # context_length: 32768
+# Native runtime only: size the independent Fast_dLLM_v2 draft KV pool.
+# Keep this much smaller than the target's serving KV pool; raise it for long
+# prompts if the native draft reports KV-slot exhaustion.
+# native_max_total_tokens: 4096
+# native_max_running_requests: 8
 torch_dtype: auto
 device_map: auto
 trust_remote_code: true
@@ -465,9 +470,12 @@ SGLang also registers a native `Fast_dLLM_QwenForCausalLM` model entrypoint as
 the foundation for the native proposal runtime. The Transformers-backed runner
 remains the serving correctness reference, while the experimental
 `runtime: sglang_native` setting now bootstraps the native draft model and
-shares the same block-diffusion proposal loop. The native path has an initial
-`ModelRunner/ForwardBatch` bridge with ephemeral SGLang KV handles for prefix
-and block-cache reuse. The block-cache path is currently correctness-first: it
+shares the same block-diffusion proposal loop. The native draft owns a compact
+KV pool sized by `native_max_total_tokens` and `native_max_running_requests`;
+it intentionally does not inherit the target model's serving KV capacity. The
+native path has an initial `ModelRunner/ForwardBatch` bridge with ephemeral
+SGLang KV handles for prefix and block-cache reuse. The block-cache path is
+currently correctness-first: it
 reuses native cache storage but reruns the full diffusion block when a slice is
 refined. The partial small-slice kernel path remains the next optimization
 milestone, so use `runtime: sglang_native` only while developing the native

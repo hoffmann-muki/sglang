@@ -373,6 +373,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                         "tokenizer_path: fast-dllm-tokenizer",
                         "runtime: sglang_native",
                         "context_length: 2048",
+                        "native_max_total_tokens: 8192",
+                        "native_max_running_requests: 4",
                         "block_size: 16",
                         "small_block_size: 4",
                         "threshold: 0.8",
@@ -395,6 +397,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.proposed_token_num, 4)
         self.assertEqual(config.runtime, "sglang_native")
         self.assertEqual(config.context_length, 2048)
+        self.assertEqual(config.native_max_total_tokens, 8192)
+        self.assertEqual(config.native_max_running_requests, 4)
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.8)
@@ -408,6 +412,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                     [
                         "block_size: 16",
                         "small_block_size: 4",
+                        "native_max_total_tokens: 6144",
+                        "native_max_running_requests: 6",
                         "threshold: 0.75",
                         "device_map: cuda:0",
                         "attn_implementation: sdpa",
@@ -439,6 +445,8 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertEqual(config.model_path, "fast-dllm")
         self.assertEqual(config.tokenizer_path, "fast-dllm-tokenizer")
         self.assertEqual(config.proposed_token_num, 3)
+        self.assertEqual(config.native_max_total_tokens, 6144)
+        self.assertEqual(config.native_max_running_requests, 6)
         self.assertEqual(config.block_size, 16)
         self.assertEqual(config.small_block_size, 4)
         self.assertEqual(config.threshold, 0.75)

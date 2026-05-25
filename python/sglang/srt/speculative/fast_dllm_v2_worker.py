@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import (
     ServerArgs,
@@ -187,6 +188,10 @@ class FastDllmV2Worker:
         # length unless the Fast_dLLM_v2 algorithm config explicitly overrides it.
         draft_args.context_length = self.runner_config.context_length
         draft_args.disable_cuda_graph = True
+        draft_args.max_total_tokens = self.runner_config.native_max_total_tokens
+        draft_args.max_running_requests = (
+            self.runner_config.native_max_running_requests
+        )
 
         if self.draft_tp_size == 1 and self.tp_size > 1:
             draft_args.tp_size = 1
@@ -204,6 +209,20 @@ class FastDllmV2Worker:
 
         return draft_args
 
+    def _native_draft_memory_pool_config(self) -> MemoryPoolConfig:
+        max_total_tokens = int(self.runner_config.native_max_total_tokens)
+        max_running_requests = int(self.runner_config.native_max_running_requests)
+        if max_running_requests <= 0:
+            raise ValueError(
+                "FAST_DLLM_V2 native_max_running_requests must be positive, "
+                f"got {max_running_requests}."
+            )
+
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_tokens,
+            max_running_requests=max_running_requests,
+        )
+
     def _init_native_draft_model_runner(
         self,
         *,
@@ -216,9 +235,7 @@ class FastDllmV2Worker:
         nccl_port: int,
     ) -> ModelRunner:
         draft_args = self._build_native_draft_args(server_args)
-        target_req_to_token_pool, target_token_to_kv_pool_allocator = (
-            self.target_worker.get_memory_pool()
-        )
+        memory_pool_config = self._native_draft_memory_pool_config()
         saved_server_args = get_global_server_args()
         try:
             with self._native_draft_context():
@@ -245,11 +262,7 @@ class FastDllmV2Worker:
                         moe_dp_rank=moe_dp_rank,
                         server_args=draft_args,
                         is_draft_worker=True,
-                        req_to_token_pool=target_req_to_token_pool,
-                        token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-                        memory_pool_config=(
-                            self.target_worker.model_runner.memory_pool_config
-                        ),
+                        memory_pool_config=memory_pool_config,
                     )
                 else:
                     self.native_draft_worker = TpModelWorker(
@@ -263,11 +276,7 @@ class FastDllmV2Worker:
                         dp_rank=dp_rank,
                         nccl_port=nccl_port,
                         is_draft_worker=True,
-                        req_to_token_pool=target_req_to_token_pool,
-                        token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-                        memory_pool_config=(
-                            self.target_worker.model_runner.memory_pool_config
-                        ),
+                        memory_pool_config=memory_pool_config,
                     )
                     draft_model_runner = self.native_draft_worker.model_runner
         finally:
@@ -276,11 +285,14 @@ class FastDllmV2Worker:
         if self.tp_rank == 0:
             logger.info(
                 "FAST_DLLM_V2 native draft model loaded. model=%s, "
-                "target_tp=%s, draft_tp=%s, local_rank=%s.",
+                "target_tp=%s, draft_tp=%s, local_rank=%s, "
+                "draft_max_total_tokens=%s, draft_max_running_requests=%s.",
                 server_args.speculative_draft_model_path,
                 self.tp_size,
                 self.draft_tp_size,
                 self.draft_tp_plan.local_rank(self.tp_rank),
+                memory_pool_config.max_total_num_tokens,
+                memory_pool_config.max_running_requests,
             )
         return draft_model_runner
 
