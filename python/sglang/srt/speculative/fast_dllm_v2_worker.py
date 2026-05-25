@@ -181,6 +181,10 @@ class FastDllmV2Worker:
 
     def _build_native_draft_args(self, server_args: ServerArgs) -> ServerArgs:
         draft_args = deepcopy(server_args)
+        draft_args.model_path = self.runner_config.model_path
+        draft_args.tokenizer_path = self.runner_config.tokenizer_path
+        draft_args.served_model_name = self.runner_config.model_path
+        draft_args.revision = draft_args.speculative_draft_model_revision
         draft_args.skip_tokenizer_init = True
         draft_args.trust_remote_code = self.runner_config.trust_remote_code
         # Fast_dLLM_v2 is an independent draft model, not a target-context
