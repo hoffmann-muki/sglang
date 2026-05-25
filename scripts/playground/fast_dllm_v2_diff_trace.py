@@ -32,6 +32,15 @@ def main() -> None:
     trace_parser.add_argument("--out", required=True)
     trace_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     trace_parser.add_argument(
+        "--input-ids",
+        default=None,
+        help=(
+            "Comma-separated token ids to trace directly. Use this to match an "
+            "SGLang native proposal input exactly, including any target current "
+            "token already appended before draft proposal."
+        ),
+    )
+    trace_parser.add_argument(
         "--prompt-format",
         choices=("chat", "raw"),
         default="chat",
@@ -85,15 +94,32 @@ def write_trace(args: argparse.Namespace) -> None:
     if args.apply_sglang_compat:
         apply_sglang_fast_dllm_v2_model_compat(model)
 
-    if args.prompt_format == "chat":
+    if args.input_ids:
+        ids = [int(token_id.strip()) for token_id in args.input_ids.split(",")]
+        if not ids:
+            raise ValueError("--input-ids must contain at least one token id.")
+        inputs = {
+            "input_ids": torch.tensor(
+                [ids],
+                dtype=torch.long,
+                device=next(model.parameters()).device,
+            )
+        }
+        text = tokenizer.decode(ids, skip_special_tokens=False)
+    elif args.prompt_format == "chat":
         text = tokenizer.apply_chat_template(
             [{"role": "user", "content": args.prompt}],
             tokenize=False,
             add_generation_prompt=True,
         )
+        inputs = tokenizer([text], return_tensors="pt").to(
+            next(model.parameters()).device
+        )
     else:
         text = args.prompt
-    inputs = tokenizer([text], return_tensors="pt").to(next(model.parameters()).device)
+        inputs = tokenizer([text], return_tensors="pt").to(
+            next(model.parameters()).device
+        )
 
     tracer = FastDllmTrace(model, capture_calls=args.capture_calls)
     tracer.install_hooks()
@@ -345,6 +371,7 @@ def collect_metadata(
         "use_hub_kernels_env": os.environ.get("USE_HUB_KERNELS"),
         "prompt": args.prompt,
         "prompt_format": args.prompt_format,
+        "explicit_input_ids": args.input_ids,
         "chat_text": text,
         "input_ids": input_ids[0].detach().cpu().tolist(),
         "input_text": tokenizer.decode(input_ids[0].detach().cpu().tolist()),
