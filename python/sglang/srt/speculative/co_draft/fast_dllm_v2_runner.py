@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,8 @@ FAST_DLLM_V2_STOP_TOKEN = 151645
 FAST_DLLM_V2_PROPOSAL_KWARGS = {
     "do_sample",
     "mask_id",
+    "profile",
+    "profile_log_interval",
     "stop_token",
     "temperature",
     "top_p",
@@ -616,23 +619,36 @@ class TransformersFastDllmV2Runtime:
             generated = self._propose_from_state(config, state)
             proposed.append(generated)
 
+        profiles = [
+            states[request_id].metadata.get("last_profile")
+            for request_id in request.request_ids
+        ]
+        profile_total = self._aggregate_profiles(profiles)
         proposed_token_ids = torch.stack(proposed).to(request.current_token_ids.device)
+        metadata = {
+            "runner": "fast_dllm_v2",
+            "runtime": "transformers",
+            "block_size": config.block_size,
+            "small_block_size": config.small_block_size,
+            "threshold": config.threshold,
+            "use_block_cache": bool(
+                config.proposal_kwargs.get("use_block_cache", False)
+            ),
+            "profile_enabled": bool(config.proposal_kwargs.get("profile", False)),
+            **getattr(self, "model_metadata", {}),
+        }
+        if profile_total:
+            metadata["profile_total"] = profile_total
+            metadata["profile_log_interval"] = int(
+                config.proposal_kwargs.get("profile_log_interval", 1)
+            )
+
         return IndependentDllmDraftTokens(
             request_ids=list(request.request_ids),
             current_token_ids=request.current_token_ids,
             proposed_token_ids=proposed_token_ids,
             prefix_lens=request.prefix_lens,
-            metadata={
-                "runner": "fast_dllm_v2",
-                "runtime": "transformers",
-                "block_size": config.block_size,
-                "small_block_size": config.small_block_size,
-                "threshold": config.threshold,
-                "use_block_cache": bool(
-                    config.proposal_kwargs.get("use_block_cache", False)
-                ),
-                **getattr(self, "model_metadata", {}),
-            },
+            metadata=metadata,
         )
 
     def extend_after_accept(
@@ -754,19 +770,126 @@ class TransformersFastDllmV2Runtime:
         config: FastDllmV2RunnerConfig,
         state: FastDllmV2RequestState,
     ) -> torch.Tensor:
+        profile = self._new_profile() if config.proposal_kwargs.get("profile") else None
+        if profile is None:
+            state.metadata.pop("last_profile", None)
+        profile_start = time.perf_counter() if profile is not None else 0.0
         proposed_token_num = config.proposed_token_num
         lookahead = state.draft_lookahead
+        if profile is not None:
+            profile["lookahead_tokens_before"] = len(lookahead)
+
         if len(lookahead) < proposed_token_num:
             seed_input_ids = state.input_ids + lookahead
-            generated = self._propose_one(config, seed_input_ids).tolist()
+            generated = self._propose_one(config, seed_input_ids, profile).tolist()
             lookahead.extend(int(token_id) for token_id in generated)
+            if profile is not None:
+                profile["draft_model_invocations"] += 1
+                profile["lookahead_generated_tokens"] += len(generated)
+        elif profile is not None:
+            profile["lookahead_hit"] += 1
 
         device = self.model.device
+        if profile is not None:
+            profile["lookahead_tokens_after"] = len(lookahead)
+            profile["proposal_wall_time_s"] = time.perf_counter() - profile_start
+            state.metadata["last_profile"] = profile
+
         return torch.tensor(
             lookahead[:proposed_token_num],
             dtype=torch.long,
             device=device,
         )
+
+    @staticmethod
+    def _new_profile() -> dict[str, Any]:
+        return {
+            "proposal_wall_time_s": 0.0,
+            "forward_time_s": 0.0,
+            "sampling_time_s": 0.0,
+            "forward_calls": 0,
+            "prefix_forward_calls": 0,
+            "block_commit_forward_calls": 0,
+            "refine_full_block_forward_calls": 0,
+            "block_cache_refresh_forward_calls": 0,
+            "block_cache_reuse_forward_calls": 0,
+            "sampling_calls": 0,
+            "blocks_started": 0,
+            "small_blocks_visited": 0,
+            "draft_model_invocations": 0,
+            "lookahead_hit": 0,
+            "lookahead_tokens_before": 0,
+            "lookahead_tokens_after": 0,
+            "lookahead_generated_tokens": 0,
+        }
+
+    def _profiled_forward(
+        self,
+        profile: Optional[dict[str, Any]],
+        phase: str,
+        **kwargs,
+    ) -> Any:
+        if profile is None:
+            return self.model.forward(**kwargs)
+
+        start = time.perf_counter()
+        output = self.model.forward(**kwargs)
+        elapsed = time.perf_counter() - start
+        phase_calls_key = f"{phase}_forward_calls"
+        phase_time_key = f"{phase}_forward_time_s"
+        profile["forward_calls"] += 1
+        profile["forward_time_s"] += elapsed
+        profile[phase_calls_key] = profile.get(phase_calls_key, 0) + 1
+        profile[phase_time_key] = profile.get(phase_time_key, 0.0) + elapsed
+        return output
+
+    def _profiled_sample_with_top_p(
+        self,
+        profile: Optional[dict[str, Any]],
+        logits: torch.Tensor,
+        *,
+        top_p: float,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if profile is None:
+            return self.model.sample_with_top_p(
+                logits,
+                top_p=top_p,
+                temperature=temperature,
+            )
+
+        start = time.perf_counter()
+        output = self.model.sample_with_top_p(
+            logits,
+            top_p=top_p,
+            temperature=temperature,
+        )
+        profile["sampling_calls"] += 1
+        profile["sampling_time_s"] += time.perf_counter() - start
+        return output
+
+    @staticmethod
+    def _aggregate_profiles(profiles: list[Optional[dict[str, Any]]]) -> dict[str, Any]:
+        totals: dict[str, Any] = {}
+        for profile in profiles:
+            if not profile:
+                continue
+            for key, value in profile.items():
+                if isinstance(value, (int, float)):
+                    totals[key] = totals.get(key, 0) + value
+        if not totals:
+            return {}
+
+        totals["requests_profiled"] = sum(1 for profile in profiles if profile)
+        if totals.get("draft_model_invocations"):
+            totals["forward_calls_per_invocation"] = (
+                totals.get("forward_calls", 0) / totals["draft_model_invocations"]
+            )
+            totals["proposal_wall_time_per_invocation_s"] = (
+                totals.get("proposal_wall_time_s", 0.0)
+                / totals["draft_model_invocations"]
+            )
+        return totals
 
     @staticmethod
     def _initialize_proposal_block(
@@ -794,6 +917,7 @@ class TransformersFastDllmV2Runtime:
         self,
         config: FastDllmV2RunnerConfig,
         input_ids: list[int],
+        profile: Optional[dict[str, Any]] = None,
     ) -> torch.Tensor:
         """Run Fast_dLLM_v2 sampling only until the next proposal block is ready.
 
@@ -835,11 +959,15 @@ class TransformersFastDllmV2Runtime:
         input_tensor = prompt
         seq_len = torch.tensor([original_prompt_len], device=device, dtype=torch.long)
         min_len = int(seq_len.min().item())
-        num_blocks = max_new_tokens // block_size + int(seq_len.max().item()) // block_size
+        num_blocks = (
+            max_new_tokens // block_size + int(seq_len.max().item()) // block_size
+        )
 
         if min_len > block_size:
             prefix_len = min_len // block_size * block_size
-            output = self.model.forward(
+            output = self._profiled_forward(
+                profile,
+                "prefix",
                 input_ids=input_tensor[:, :prefix_len],
                 use_cache=True,
                 update_past_key_values=True,
@@ -868,6 +996,8 @@ class TransformersFastDllmV2Runtime:
         num_small_blocks = block_size // small_block_size
 
         for block_idx in range(start_block_idx, num_blocks):
+            if profile is not None:
+                profile["blocks_started"] += 1
             x_init, input_tensor = self._initialize_proposal_block(
                 input_tensor,
                 seq_block_idx,
@@ -891,7 +1021,9 @@ class TransformersFastDllmV2Runtime:
 
                 mask_idx = x_t[:, -block_size:] == mask_id
                 if mask_idx.sum() == 0:
-                    output = self.model.forward(
+                    output = self._profiled_forward(
+                        profile,
+                        "block_commit",
                         input_ids=x_t[:, -block_size:],
                         use_cache=True,
                         past_key_values=past_key_values,
@@ -904,6 +1036,8 @@ class TransformersFastDllmV2Runtime:
                     break
 
                 for small_block_idx in range(num_small_blocks):
+                    if profile is not None:
+                        profile["small_blocks_visited"] += 1
                     small_block_start_idx = small_block_idx * small_block_size
                     small_block_end_idx = small_block_start_idx + small_block_size
                     start = -block_size + small_block_start_idx
@@ -933,7 +1067,9 @@ class TransformersFastDllmV2Runtime:
                                 block_past_key_values is None
                                 or (x_t[:, block_start] == mask_id).any()
                             ):
-                                output = self.model.forward(
+                                output = self._profiled_forward(
+                                    profile,
+                                    "block_cache_refresh",
                                     input_ids=x_t[:, -block_size:],
                                     use_cache=True,
                                     past_key_values=past_key_values,
@@ -942,10 +1078,14 @@ class TransformersFastDllmV2Runtime:
                                 )
                                 logits = output.logits
                                 block_past_key_values = output.block_past_key_values
-                                logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                logits = torch.cat(
+                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                )
                                 logits = logits[:, start:end]
                             else:
-                                logits = self.model.forward(
+                                logits = self._profiled_forward(
+                                    profile,
+                                    "block_cache_reuse",
                                     input_ids=x_t[:, start:end],
                                     use_cache=True,
                                     past_key_values=past_key_values,
@@ -954,18 +1094,25 @@ class TransformersFastDllmV2Runtime:
                                     block_past_key_values=block_past_key_values,
                                     replace_position=small_block_start_idx,
                                 ).logits
-                                logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                logits = torch.cat(
+                                    [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                                )
                         else:
-                            logits = self.model.forward(
+                            logits = self._profiled_forward(
+                                profile,
+                                "refine_full_block",
                                 input_ids=x_t[:, -block_size:],
                                 use_cache=True,
                                 past_key_values=past_key_values,
                                 update_past_key_values=False,
                             ).logits
-                            logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                            logits = torch.cat(
+                                [logits[:, :1, :], logits[:, :-1, :]], dim=1
+                            )
                             logits = logits[:, start:end]
 
-                        x_1, p_1t = self.model.sample_with_top_p(
+                        x_1, p_1t = self._profiled_sample_with_top_p(
+                            profile,
                             logits,
                             top_p=top_p,
                             temperature=temperature,

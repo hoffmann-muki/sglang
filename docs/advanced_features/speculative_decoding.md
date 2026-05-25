@@ -437,7 +437,14 @@ device_map: auto
 trust_remote_code: true
 proposal_kwargs:
   use_block_cache: false
+  profile: false
+  profile_log_interval: 1
 ```
+
+Set `proposal_kwargs.profile: true` during performance investigations to log
+draft-rank proposal counters such as model forward calls, phase-specific forward
+time, sampling time, lookahead reuse, and block-cache path usage. Leave it off
+for normal serving.
 
 Fast_dLLM_v2 decodes by iteratively filling masked diffusion blocks. The SGLang
 proposal loop computes the minimal block-aligned budget needed for the next

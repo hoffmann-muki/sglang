@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import traceback
 from dataclasses import dataclass
@@ -92,6 +93,7 @@ class FastDllmV2Worker:
             else None
         )
         self._logged_first_verify = False
+        self._proposal_profile_log_count = 0
         if self.tp_rank == 0:
             logger.info(
                 "Initialized FAST_DLLM_V2 standalone speculator. "
@@ -148,10 +150,26 @@ class FastDllmV2Worker:
             proposed_token_num=self.proposed_token_num,
         )
         tokens = self.runner.propose(request)
+        self._maybe_log_proposal_profile(tokens.metadata)
         return build_linear_draft_block(
             current_token_ids=tokens.current_token_ids,
             proposed_token_ids=tokens.proposed_token_ids,
             prefix_lens=tokens.prefix_lens,
+        )
+
+    def _maybe_log_proposal_profile(self, metadata: dict) -> None:
+        profile = metadata.get("profile_total")
+        if not profile:
+            return
+
+        interval = max(1, int(metadata.get("profile_log_interval", 1)))
+        self._proposal_profile_log_count += 1
+        if self._proposal_profile_log_count % interval:
+            return
+
+        logger.info(
+            "FAST_DLLM_V2 proposal profile: %s",
+            json.dumps(profile, sort_keys=True),
         )
 
     def _serialize_linear_block(self, block: LinearDraftBlock) -> dict:

@@ -523,7 +523,7 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         self.assertTrue(torch.equal(first, torch.tensor([12, 13, 14, 15])))
         self.assertTrue(torch.equal(second, torch.tensor([12, 13, 14, 15])))
         self.assertEqual(state.draft_lookahead, [12, 13, 14, 15, 16, 17])
-        runtime._propose_one.assert_called_once_with(config, [10, 11, 12, 13])
+        runtime._propose_one.assert_called_once_with(config, [10, 11, 12, 13], None)
 
     def test_transformers_runtime_metadata_reports_block_cache_setting(self):
         import torch
@@ -552,6 +552,52 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
         )
 
         self.assertFalse(tokens.metadata["use_block_cache"])
+
+    def test_transformers_runtime_reports_profile_metadata(self):
+        import torch
+
+        runtime = TransformersFastDllmV2Runtime()
+        runtime._ensure_loaded = lambda _config: None
+        runtime.model = SimpleNamespace(device=torch.device("cpu"))
+
+        def _fake_propose_one(_config, _input_ids, profile):
+            profile["forward_calls"] += 3
+            profile["refine_full_block_forward_calls"] += 3
+            profile["sampling_calls"] += 2
+            profile["forward_time_s"] += 0.03
+            profile["sampling_time_s"] += 0.01
+            return torch.tensor([11, 12])
+
+        runtime._propose_one = _fake_propose_one
+        state = FastDllmV2RequestState(input_ids=[10])
+        config = FastDllmV2RunnerConfig(
+            model_path="fast-dllm",
+            tokenizer_path="fast-dllm",
+            proposed_token_num=2,
+            proposal_kwargs={"profile": True, "profile_log_interval": 5},
+        )
+
+        tokens = runtime.propose(
+            config,
+            IndependentDllmDraftRequest(
+                request_ids=["r0"],
+                input_ids=[[10]],
+                current_token_ids=torch.tensor([10]),
+                prefix_lens=torch.tensor([1]),
+                proposed_token_num=2,
+            ),
+            {"r0": state},
+        )
+
+        profile = tokens.metadata["profile_total"]
+        self.assertTrue(tokens.metadata["profile_enabled"])
+        self.assertEqual(tokens.metadata["profile_log_interval"], 5)
+        self.assertEqual(profile["requests_profiled"], 1)
+        self.assertEqual(profile["forward_calls"], 3)
+        self.assertEqual(profile["refine_full_block_forward_calls"], 3)
+        self.assertEqual(profile["sampling_calls"], 2)
+        self.assertEqual(profile["draft_model_invocations"], 1)
+        self.assertEqual(profile["forward_calls_per_invocation"], 3)
 
     def test_runner_tracks_state_and_delegates_to_runtime(self):
         import torch
