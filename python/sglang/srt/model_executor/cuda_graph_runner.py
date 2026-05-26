@@ -844,6 +844,15 @@ class CudaGraphRunner:
                     == forward_batch.batch_size * self.dllm_logit_positions_size
                 )
 
+        # TLI target verification uses a dynamic tree attention mask. FlashInfer
+        # replay has proven fragile for this path when request state is compacted
+        # across decode iterations, so keep verify eager while preserving normal
+        # decode CUDA graphs.
+        is_tli_target_verify_supported = not (
+            self.model_runner.spec_algorithm.is_tli()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
@@ -851,6 +860,7 @@ class CudaGraphRunner:
             and capture_hidden_mode_matches
             and is_ngram_supported
             and is_dllm_logit_positions_supported
+            and is_tli_target_verify_supported
         )
 
     def _init_profile_context_and_memory_record(self):
