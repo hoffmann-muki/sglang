@@ -698,12 +698,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
+                # CUDA graph capture uses synthetic zero-prefix dLLM batches.
+                # The ragged+prefix path asks FlashInfer to plan an empty
+                # paged-KV prefix with a full query block, which is invalid.
+                # Use the paged full-sequence path for graph replay; eager dLLM
+                # forwards can still use ragged metadata.
+                use_ragged=False,
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -762,7 +767,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=True,
+                use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
