@@ -122,6 +122,119 @@ class TestBuildEagleTree(unittest.TestCase):
             )
         )
 
+    def test_filter_batch_handles_flattened_post_verify_state(self):
+        draft_input = EagleDraftInput(
+            hidden_states=torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [5.0, 6.0],
+                    [7.0, 8.0],
+                    [9.0, 10.0],
+                    [11.0, 12.0],
+                ],
+                device=get_device(),
+                dtype=torch.float32,
+            ),
+            verified_id=torch.tensor(
+                [101, 102, 103, 104, 105, 106],
+                device=get_device(),
+                dtype=torch.int32,
+            ),
+            topk_p=torch.tensor(
+                [
+                    [0.1, 0.9],
+                    [0.2, 0.8],
+                    [0.3, 0.7],
+                    [0.4, 0.6],
+                    [0.5, 0.5],
+                    [0.6, 0.4],
+                ],
+                device=get_device(),
+                dtype=torch.float32,
+            ),
+            topk_index=torch.tensor(
+                [
+                    [21, 22],
+                    [23, 24],
+                    [25, 26],
+                    [27, 28],
+                    [29, 30],
+                    [31, 32],
+                ],
+                device=get_device(),
+                dtype=torch.int64,
+            ),
+            accept_length=torch.tensor(
+                [0, 2, 1], device=get_device(), dtype=torch.int32
+            ),
+            accept_length_cpu=[0, 2, 1],
+            seq_lens_for_draft_extend=torch.tensor(
+                [10, 20, 30], device=get_device(), dtype=torch.int32
+            ),
+            seq_lens_for_draft_extend_cpu=torch.tensor(
+                [10, 20, 30], dtype=torch.int32
+            ),
+            req_pool_indices_for_draft_extend=torch.tensor(
+                [7, 8, 9], device=get_device(), dtype=torch.int64
+            ),
+        )
+
+        draft_input.filter_batch(
+            torch.tensor([0, 2], device=get_device(), dtype=torch.int64),
+            has_been_filtered=True,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                draft_input.hidden_states.cpu(),
+                torch.tensor([[1.0, 2.0], [9.0, 10.0], [11.0, 12.0]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.verified_id.cpu(),
+                torch.tensor([101, 105, 106], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.topk_p.cpu(),
+                torch.tensor([[0.1, 0.9], [0.5, 0.5], [0.6, 0.4]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.topk_index.cpu(),
+                torch.tensor([[21, 22], [29, 30], [31, 32]], dtype=torch.int64),
+            )
+        )
+        self.assertEqual(draft_input.accept_length_cpu, [0, 1])
+        self.assertTrue(
+            torch.equal(
+                draft_input.accept_length.cpu(),
+                torch.tensor([0, 1], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.seq_lens_for_draft_extend.cpu(),
+                torch.tensor([10, 30], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.seq_lens_for_draft_extend_cpu,
+                torch.tensor([10, 30], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.req_pool_indices_for_draft_extend.cpu(),
+                torch.tensor([7, 9], dtype=torch.int64),
+            )
+        )
+
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
         verified_id = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)

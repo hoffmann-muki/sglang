@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -850,6 +849,39 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
+    def _select_flattened_request_indices(
+        self, request_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if self.accept_length is None or self.accept_length.numel() == 0:
+            return None
+
+        request_indices = request_indices.to(dtype=torch.long)
+        accept_length = self.accept_length.to(device=request_indices.device, dtype=torch.long)
+        token_counts = accept_length + 1
+        token_starts = torch.cumsum(
+            torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.long, device=request_indices.device),
+                    token_counts[:-1],
+                )
+            ),
+            dim=0,
+        )
+        selected_starts = token_starts[request_indices]
+        selected_counts = token_counts[request_indices]
+        if selected_counts.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=request_indices.device)
+
+        segment_starts = torch.repeat_interleave(
+            torch.cumsum(selected_counts, dim=0) - selected_counts,
+            selected_counts,
+        )
+        total_tokens = int(selected_counts.sum().item())
+        return torch.repeat_interleave(selected_starts, selected_counts) + (
+            torch.arange(total_tokens, dtype=torch.long, device=request_indices.device)
+            - segment_starts
+        )
+
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
@@ -884,36 +916,85 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 f"available batch size ({len(new_indices)} > {spec_bs})."
             )
 
-        use_indexing = len(new_indices) != spec_bs
-
-        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
-        if has_been_filtered:
-            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            if has_topk_state and not use_indexing:
-                error_msg = (
-                    f"length of new_indices: {len(new_indices)} != length of "
-                    f"topk_p: {len(self.topk_p)}, this should not happen"
+        request_indices = new_indices.to(dtype=torch.long)
+        request_indices_cpu = request_indices.detach().cpu().tolist()
+        request_bs = self.accept_length.numel() if self.accept_length is not None else None
+        token_indices = request_indices
+        token_counts = None
+        flattened_state = False
+        if request_bs is not None and request_bs > 0:
+            token_counts = self.accept_length.to(
+                device=request_indices.device, dtype=torch.long
+            ) + 1
+            flattened_token_bs = int(token_counts.sum().item())
+            if spec_bs == flattened_token_bs and spec_bs != request_bs:
+                flattened_state = True
+                token_indices = self._select_flattened_request_indices(request_indices)
+                if token_indices is None:
+                    token_indices = request_indices
+            elif spec_bs != request_bs:
+                raise ValueError(
+                    "EagleDraftInput.filter_batch cannot reconcile the payload "
+                    f"shape ({spec_bs}) with request count ({request_bs}) and "
+                    f"flattened token count ({flattened_token_bs})."
                 )
-                if strict_check and len(new_indices) != len(self.topk_p):
-                    raise ValueError(error_msg)
-                if len(new_indices) != len(self.topk_p):
-                    logger.warning(error_msg)
 
-                self.topk_p = self.topk_p[: len(new_indices)]
-                self.topk_index = self.topk_index[: len(new_indices)]
-            elif has_topk_state and use_indexing:
-                self.topk_p = self.topk_p[new_indices]
-                self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.verified_id = self.verified_id[: len(new_indices)]
+        if has_been_filtered:
+            # In verify, the scheduler keeps requests by request index, while
+            # the speculative payload may still be flattened across requests.
+            # Preserve the request-level fields directly and map flattened token
+            # state back to the surviving requests when needed.
+            if flattened_state:
+                if has_topk_state:
+                    self.topk_p = self.topk_p[token_indices]
+                    self.topk_index = self.topk_index[token_indices]
+                self.hidden_states = self.hidden_states[token_indices]
+                self.verified_id = self.verified_id[token_indices]
+            else:
+                if has_topk_state:
+                    self.topk_p = self.topk_p[request_indices]
+                    self.topk_index = self.topk_index[request_indices]
+                self.hidden_states = self.hidden_states[request_indices]
+                self.verified_id = self.verified_id[request_indices]
         else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
+            # In draft-extend paths, the request indices already match the
+            # current speculative payload layout.
             if has_topk_state:
-                self.topk_p = self.topk_p[new_indices]
-                self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
-            self.verified_id = self.verified_id[new_indices]
+                self.topk_p = self.topk_p[request_indices]
+                self.topk_index = self.topk_index[request_indices]
+            self.hidden_states = self.hidden_states[request_indices]
+            self.verified_id = self.verified_id[request_indices]
+
+        if self.accept_length is not None:
+            self.accept_length = self.accept_length[request_indices]
+        if self.accept_length_cpu is not None:
+            self.accept_length_cpu = [
+                self.accept_length_cpu[i] for i in request_indices_cpu
+            ]
+        if self.seq_lens_for_draft_extend is not None:
+            self.seq_lens_for_draft_extend = self.seq_lens_for_draft_extend[
+                request_indices
+            ]
+        if self.seq_lens_for_draft_extend_cpu is not None:
+            if torch.is_tensor(self.seq_lens_for_draft_extend_cpu):
+                self.seq_lens_for_draft_extend_cpu = self.seq_lens_for_draft_extend_cpu[
+                    torch.tensor(
+                        request_indices_cpu,
+                        dtype=torch.long,
+                        device=self.seq_lens_for_draft_extend_cpu.device,
+                    )
+                ]
+            else:
+                self.seq_lens_for_draft_extend_cpu = [
+                    self.seq_lens_for_draft_extend_cpu[i]
+                    for i in request_indices_cpu
+                ]
+        if self.req_pool_indices_for_draft_extend is not None:
+            self.req_pool_indices_for_draft_extend = (
+                self.req_pool_indices_for_draft_extend[request_indices]
+            )
+        if self.new_seq_lens is not None:
+            self.new_seq_lens = self.new_seq_lens[request_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
