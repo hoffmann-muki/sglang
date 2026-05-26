@@ -3129,6 +3129,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )
+        if can_run_graph and forward_batch.forward_mode.is_target_verify():
+            # Speculative target-verify batches can carry dynamic request-level
+            # masks and compacted draft state that are fragile to replay across
+            # CUDA-graph captures. Keep verify eager so correctness does not
+            # depend on a backend-specific graph heuristic.
+            can_run_graph = False
 
         if (
             self.hisparse_coordinator is not None
