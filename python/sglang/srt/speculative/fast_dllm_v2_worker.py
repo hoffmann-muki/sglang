@@ -193,7 +193,13 @@ class FastDllmV2Worker:
         draft_args.context_length = self.runner_config.context_length
         draft_args.speculative_algorithm = None
         draft_args.dllm_algorithm = self.runner_config.native_dllm_algorithm
-        draft_args.dllm_algorithm_config = None
+        # Keep the native draft ModelRunner's DllmConfig in lockstep with the
+        # Fast_dLLM_v2 proposal config. CUDA graph capture sizes DLLM input
+        # buffers from DllmConfig.block_size, while the proposal loop sizes
+        # ForwardBatch input_ids from runner_config.block_size.
+        draft_args.dllm_algorithm_config = (
+            server_args.speculative_fast_dllm_v2_algorithm_config
+        )
         draft_args.disable_overlap_schedule = True
         draft_args.disable_cuda_graph = self.runner_config.native_disable_cuda_graph
         draft_args.disable_piecewise_cuda_graph = (
