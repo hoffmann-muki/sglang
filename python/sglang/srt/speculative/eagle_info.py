@@ -862,23 +862,49 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 "must either both exist or both be absent."
             )
 
+        spec_bs = None
+        for tensor in (self.hidden_states, self.verified_id, self.topk_p, self.topk_index):
+            if tensor is None:
+                continue
+            tensor_bs = len(tensor)
+            if spec_bs is None:
+                spec_bs = tensor_bs
+            elif spec_bs != tensor_bs:
+                raise ValueError(
+                    "EagleDraftInput batch tensors must share the same leading "
+                    f"dimension, got {spec_bs} and {tensor_bs}."
+                )
+
+        if spec_bs is None:
+            return
+
+        if len(new_indices) > spec_bs:
+            raise ValueError(
+                "EagleDraftInput.filter_batch received more indices than the "
+                f"available batch size ({len(new_indices)} > {spec_bs})."
+            )
+
+        use_indexing = len(new_indices) != spec_bs
+
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
-            if has_topk_state:
+            if has_topk_state and not use_indexing:
                 error_msg = (
                     f"length of new_indices: {len(new_indices)} != length of "
                     f"topk_p: {len(self.topk_p)}, this should not happen"
                 )
+                if strict_check and len(new_indices) != len(self.topk_p):
+                    raise ValueError(error_msg)
                 if len(new_indices) != len(self.topk_p):
-                    if strict_check:
-                        raise ValueError(error_msg)
-                    else:
-                        logger.warning(error_msg)
+                    logger.warning(error_msg)
 
                 self.topk_p = self.topk_p[: len(new_indices)]
                 self.topk_index = self.topk_index[: len(new_indices)]
+            elif has_topk_state and use_indexing:
+                self.topk_p = self.topk_p[new_indices]
+                self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
         else:

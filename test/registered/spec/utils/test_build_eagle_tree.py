@@ -70,6 +70,58 @@ class TestBuildEagleTree(unittest.TestCase):
         self.assertIsNone(draft_input.topk_p)
         self.assertIsNone(draft_input.topk_index)
 
+    def test_filter_batch_indexes_stale_topk_state(self):
+        draft_input = EagleDraftInput(
+            hidden_states=torch.tensor(
+                [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+                device=get_device(),
+                dtype=torch.float32,
+            ),
+            verified_id=torch.tensor(
+                [11, 12, 13, 14], device=get_device(), dtype=torch.int32
+            ),
+            topk_p=torch.tensor(
+                [[0.1, 0.9], [0.2, 0.8], [0.3, 0.7], [0.4, 0.6]],
+                device=get_device(),
+                dtype=torch.float32,
+            ),
+            topk_index=torch.tensor(
+                [[21, 22], [23, 24], [25, 26], [27, 28]],
+                device=get_device(),
+                dtype=torch.int64,
+            ),
+        )
+
+        draft_input.filter_batch(
+            torch.tensor([0, 2], device=get_device(), dtype=torch.int64),
+            has_been_filtered=True,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                draft_input.hidden_states.cpu(),
+                torch.tensor([[1.0, 2.0], [5.0, 6.0]], dtype=torch.float32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.verified_id.cpu(),
+                torch.tensor([11, 13], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.topk_p.cpu(),
+                torch.tensor([[0.1, 0.9], [0.3, 0.7]], dtype=torch.float32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.topk_index.cpu(),
+                torch.tensor([[21, 22], [25, 26]], dtype=torch.int64),
+            )
+        )
+
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
         verified_id = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
