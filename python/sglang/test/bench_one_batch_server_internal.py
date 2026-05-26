@@ -497,6 +497,7 @@ def run_one_case(
     lora_name: Optional[List[str]] = None,
     lora_request_distribution: str = BenchArgs.lora_request_distribution,
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
+    enable_metrics: bool = True,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -648,7 +649,7 @@ def run_one_case(
         )
 
     # Get metrics before the request (for cache hit rate calculation)
-    metrics_before = get_cache_tokens_from_metrics(url)
+    metrics_before = get_cache_tokens_from_metrics(url) if enable_metrics else None
 
     # Run the request
     tic = time.perf_counter()
@@ -716,7 +717,7 @@ def run_one_case(
         acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
 
     # Calculate cache hit rate from before/after metrics delta
-    metrics_after = get_cache_tokens_from_metrics(url)
+    metrics_after = get_cache_tokens_from_metrics(url) if enable_metrics else None
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
 
     # Print results
@@ -980,6 +981,7 @@ def run_benchmark_internal(
         gsp_question_len=bench_args.gsp_question_len,
         gsp_output_len=bench_args.gsp_output_len,
     )
+    enable_metrics = bool(server_info.get("enable_metrics", False))
 
     # Warmup
     if not bench_args.skip_warmup:
@@ -1008,6 +1010,7 @@ def run_benchmark_internal(
                 lora_name=bench_args.lora_name,
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                enable_metrics=enable_metrics,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1051,6 +1054,7 @@ def run_benchmark_internal(
                     lora_name=bench_args.lora_name,
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                    enable_metrics=enable_metrics,
                     **gsp_kwargs,
                 )
             )
@@ -1105,6 +1109,7 @@ def run_benchmark_internal(
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                            enable_metrics=enable_metrics,
                             **gsp_kwargs,
                         )
                     )

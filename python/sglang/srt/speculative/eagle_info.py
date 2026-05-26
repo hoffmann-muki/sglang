@@ -857,6 +857,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
         request_indices = request_indices.to(dtype=torch.long)
         accept_length = self.accept_length.to(device=request_indices.device, dtype=torch.long)
+        if request_indices.numel() > 0:
+            min_index = int(request_indices.min().item())
+            max_index = int(request_indices.max().item())
+            if min_index < 0 or max_index >= accept_length.numel():
+                raise ValueError(
+                    "EagleDraftInput received request indices outside the "
+                    f"available compacted request state: min={min_index}, "
+                    f"max={max_index}, size={accept_length.numel()}."
+                )
         token_counts = accept_length + 1
         token_starts = torch.cumsum(
             torch.cat(
@@ -917,21 +926,38 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
 
         request_indices = new_indices.to(dtype=torch.long)
-        request_indices_cpu = request_indices.detach().cpu().tolist()
         request_bs = self.accept_length.numel() if self.accept_length is not None else None
-        token_indices = request_indices
+        state_indices = request_indices
+        if has_been_filtered and request_bs is not None and request_bs > 0:
+            max_request_index = (
+                int(request_indices.max().item()) if request_indices.numel() > 0 else -1
+            )
+            if max_request_index >= request_bs:
+                if len(request_indices) > request_bs:
+                    raise ValueError(
+                        "EagleDraftInput.filter_batch received compacted state "
+                        f"with fewer rows than kept requests ({request_bs} < "
+                        f"{len(request_indices)})."
+                    )
+                state_indices = torch.arange(
+                    len(request_indices),
+                    dtype=torch.long,
+                    device=request_indices.device,
+                )
+        state_indices_cpu = state_indices.detach().cpu().tolist()
+        token_indices = state_indices
         token_counts = None
         flattened_state = False
         if request_bs is not None and request_bs > 0:
             token_counts = self.accept_length.to(
-                device=request_indices.device, dtype=torch.long
+                device=state_indices.device, dtype=torch.long
             ) + 1
             flattened_token_bs = int(token_counts.sum().item())
             if spec_bs == flattened_token_bs and spec_bs != request_bs:
                 flattened_state = True
-                token_indices = self._select_flattened_request_indices(request_indices)
+                token_indices = self._select_flattened_request_indices(state_indices)
                 if token_indices is None:
-                    token_indices = request_indices
+                    token_indices = state_indices
             elif spec_bs != request_bs:
                 raise ValueError(
                     "EagleDraftInput.filter_batch cannot reconcile the payload "
@@ -952,34 +978,34 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.verified_id = self.verified_id[token_indices]
             else:
                 if has_topk_state:
-                    self.topk_p = self.topk_p[request_indices]
-                    self.topk_index = self.topk_index[request_indices]
-                self.hidden_states = self.hidden_states[request_indices]
-                self.verified_id = self.verified_id[request_indices]
+                    self.topk_p = self.topk_p[state_indices]
+                    self.topk_index = self.topk_index[state_indices]
+                self.hidden_states = self.hidden_states[state_indices]
+                self.verified_id = self.verified_id[state_indices]
         else:
             # In draft-extend paths, the request indices already match the
             # current speculative payload layout.
             if has_topk_state:
-                self.topk_p = self.topk_p[request_indices]
-                self.topk_index = self.topk_index[request_indices]
-            self.hidden_states = self.hidden_states[request_indices]
-            self.verified_id = self.verified_id[request_indices]
+                self.topk_p = self.topk_p[state_indices]
+                self.topk_index = self.topk_index[state_indices]
+            self.hidden_states = self.hidden_states[state_indices]
+            self.verified_id = self.verified_id[state_indices]
 
         if self.accept_length is not None:
-            self.accept_length = self.accept_length[request_indices]
+            self.accept_length = self.accept_length[state_indices]
         if self.accept_length_cpu is not None:
             self.accept_length_cpu = [
-                self.accept_length_cpu[i] for i in request_indices_cpu
+                self.accept_length_cpu[i] for i in state_indices_cpu
             ]
         if self.seq_lens_for_draft_extend is not None:
             self.seq_lens_for_draft_extend = self.seq_lens_for_draft_extend[
-                request_indices
+                state_indices
             ]
         if self.seq_lens_for_draft_extend_cpu is not None:
             if torch.is_tensor(self.seq_lens_for_draft_extend_cpu):
                 self.seq_lens_for_draft_extend_cpu = self.seq_lens_for_draft_extend_cpu[
                     torch.tensor(
-                        request_indices_cpu,
+                        state_indices_cpu,
                         dtype=torch.long,
                         device=self.seq_lens_for_draft_extend_cpu.device,
                     )
@@ -987,14 +1013,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             else:
                 self.seq_lens_for_draft_extend_cpu = [
                     self.seq_lens_for_draft_extend_cpu[i]
-                    for i in request_indices_cpu
+                    for i in state_indices_cpu
                 ]
         if self.req_pool_indices_for_draft_extend is not None:
             self.req_pool_indices_for_draft_extend = (
-                self.req_pool_indices_for_draft_extend[request_indices]
+                self.req_pool_indices_for_draft_extend[state_indices]
             )
         if self.new_seq_lens is not None:
-            self.new_seq_lens = self.new_seq_lens[request_indices]
+            self.new_seq_lens = self.new_seq_lens[state_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
