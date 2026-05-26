@@ -111,6 +111,21 @@ global_workspace_buffer = None
 global_override_indptr_cpu = None
 
 
+def _normalize_custom_mask_for_flashinfer(
+    custom_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if custom_mask is None:
+        return None
+
+    # FlashInfer's CUDA graph path allocates custom_mask_buf as uint8. Keep the
+    # eager path on the same convention so the planner never sees a bool mask
+    # with a different element type/layout from the graph-backed path.
+    if custom_mask.dtype != torch.uint8:
+        custom_mask = custom_mask.to(torch.uint8)
+
+    return custom_mask.contiguous()
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -1477,7 +1492,7 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr = multi_item_params.max_item_len_ptr
         else:
             # No multi-item scoring - use standard parameters
-            use_custom_mask = custom_mask
+            use_custom_mask = _normalize_custom_mask_for_flashinfer(custom_mask)
             prefix_len_ptr = None
             token_pos_in_items_ptr = None
             token_pos_in_items_len = 0
