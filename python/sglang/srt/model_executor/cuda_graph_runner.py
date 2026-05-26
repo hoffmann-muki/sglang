@@ -1007,10 +1007,12 @@ class CudaGraphRunner:
         positions = buffers.positions[:num_tokens]
         if self.dllm_logit_positions_size is None:
             dllm_logit_positions = None
+            num_logits = num_tokens
         else:
             dllm_logit_positions = buffers.dllm_logit_positions[
                 : bs * self.dllm_logit_positions_size
             ]
+            num_logits = int(dllm_logit_positions.numel())
             dllm_logit_positions.copy_(
                 torch.arange(
                     self.dllm_logit_positions_size,
@@ -1029,7 +1031,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_logits]
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
