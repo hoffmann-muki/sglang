@@ -933,6 +933,8 @@ class SGLangNativeFastDllmV2Runtime:
         self.model_runner = model_runner
         self._active_native_caches: list[_SGLangNativeCacheState] = []
         self._active_native_block_caches: list[_SGLangNativeBlockCacheState] = []
+        self._forward_cuda_graph_replay_calls = 0
+        self._forward_eager_calls = 0
         self._trace: Optional[_FastDllmV2NativeTraceRecorder] = None
         self._trace_path: Optional[str] = None
 
@@ -1082,6 +1084,8 @@ class SGLangNativeFastDllmV2Runtime:
 
         if profile is not None:
             start = time.perf_counter()
+            graph_calls_before = self._forward_cuda_graph_replay_calls
+            eager_calls_before = self._forward_eager_calls
         block_cache_state = None
         if kwargs.get("use_block_cache"):
             block_cache_state = self._forward_with_block_cache(
@@ -1114,6 +1118,12 @@ class SGLangNativeFastDllmV2Runtime:
             if kwargs.get("logit_positions") is not None:
                 profile["selective_logits_forward_calls"] += 1
                 profile["selective_logits_rows"] += int(logits.shape[0])
+            profile["cuda_graph_replay_forward_calls"] += (
+                self._forward_cuda_graph_replay_calls - graph_calls_before
+            )
+            profile["eager_forward_calls"] += (
+                self._forward_eager_calls - eager_calls_before
+            )
         logit_len = int(logits.shape[0]) if logits.ndim == 2 else input_ids.shape[1]
         return types.SimpleNamespace(
             logits=logits.view(1, logit_len, logits.shape[-1]),
@@ -1517,7 +1527,12 @@ class SGLangNativeFastDllmV2Runtime:
             },
         )
         with torch.inference_mode():
-            logits_output = self.model_runner.forward(forward_batch).logits_output
+            runner_output = self.model_runner.forward(forward_batch)
+            logits_output = runner_output.logits_output
+        if getattr(runner_output, "can_run_graph", False):
+            self._forward_cuda_graph_replay_calls += 1
+        else:
+            self._forward_eager_calls += 1
         full_logits = getattr(logits_output, "full_logits", None)
         self._trace_record(
             "model_runner.forward",
@@ -1880,6 +1895,8 @@ class FastDllmV2BlockProposalEngine:
             "forward_time_s": 0.0,
             "sampling_time_s": 0.0,
             "forward_calls": 0,
+            "cuda_graph_replay_forward_calls": 0,
+            "eager_forward_calls": 0,
             "prefix_forward_calls": 0,
             "block_commit_forward_calls": 0,
             "refine_full_block_forward_calls": 0,
@@ -1895,6 +1912,7 @@ class FastDllmV2BlockProposalEngine:
             "lookahead_tokens_before": 0,
             "lookahead_tokens_after": 0,
             "lookahead_generated_tokens": 0,
+            "proposal_non_model_time_s": 0.0,
         }
 
     @staticmethod
@@ -2287,6 +2305,12 @@ def _fast_dllm_v2_propose_from_state(
     if profile is not None:
         profile["lookahead_tokens_after"] = len(lookahead)
         profile["proposal_wall_time_s"] = time.perf_counter() - profile_start
+        profile["proposal_non_model_time_s"] = max(
+            0.0,
+            profile["proposal_wall_time_s"]
+            - profile.get("forward_time_s", 0.0)
+            - profile.get("sampling_time_s", 0.0),
+        )
         state.metadata["last_profile"] = profile
 
     return torch.tensor(

@@ -474,9 +474,10 @@ proposal_kwargs:
 ```
 
 Set `proposal_kwargs.profile: true` during performance investigations to log
-draft-rank proposal counters such as model forward calls, phase-specific forward
-time, sampling time, lookahead reuse, and block-cache path usage. Leave it off
-for normal serving. Set `proposal_kwargs.trace_path` only when debugging the
+draft-rank proposal counters such as model forward calls, CUDA graph replay
+versus eager forwards, phase-specific forward time, sampling time, non-model
+proposal overhead, lookahead reuse, and block-cache path usage. Leave it off for
+normal serving. Set `proposal_kwargs.trace_path` only when debugging the
 experimental `runtime: sglang_native` path; it writes both `.pt` and `.json`
 native forward traces, including prefix/block-cache forward metadata and
 first-layer module hooks. Full tracing is intrusive: even tensor summaries can
