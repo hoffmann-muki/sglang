@@ -872,6 +872,20 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
             )
         )
 
+    def test_repeated_last_block_logit_positions_match_graph_shape(self):
+        import torch
+
+        self.assertTrue(
+            torch.equal(
+                FastDllmV2BlockProposalEngine.repeated_last_block_logit_positions(
+                    32,
+                    8,
+                    device=torch.device("cpu"),
+                ),
+                torch.tensor([31, 31, 31, 31, 31, 31, 31, 31]),
+            )
+        )
+
     def test_native_trace_recorder_writes_pt_and_json_summaries(self):
         import json
         import tempfile

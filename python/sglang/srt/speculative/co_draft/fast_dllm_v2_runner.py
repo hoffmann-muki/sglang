@@ -1971,6 +1971,25 @@ class FastDllmV2BlockProposalEngine:
         positions = torch.arange(start, end, dtype=torch.long, device=device)
         return torch.clamp(positions - 1, min=0)
 
+    @staticmethod
+    def repeated_last_block_logit_positions(
+        block_size: int,
+        row_count: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if block_size <= 0 or row_count <= 0:
+            raise ValueError(
+                "Fast_dLLM_v2 final-row logit selection requires positive "
+                "block_size and row_count."
+            )
+        return torch.full(
+            (row_count,),
+            block_size - 1,
+            dtype=torch.long,
+            device=device,
+        )
+
     @torch.no_grad()
     def propose_one(
         self,
@@ -2004,6 +2023,15 @@ class FastDllmV2BlockProposalEngine:
         use_selective_logits = bool(
             kwargs.get("selective_logits", True)
         ) and bool(getattr(self.backend, "supports_selective_logits", lambda: False)())
+        last_block_logit_positions = (
+            self.repeated_last_block_logit_positions(
+                block_size,
+                small_block_size,
+                device=device,
+            )
+            if use_selective_logits
+            else None
+        )
 
         max_new_tokens = _fast_dllm_v2_internal_generation_budget(
             original_prompt_len,
@@ -2027,6 +2055,7 @@ class FastDllmV2BlockProposalEngine:
                 use_cache=True,
                 update_past_key_values=True,
                 block_size=block_size,
+                logit_positions=last_block_logit_positions,
             )
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
@@ -2084,6 +2113,7 @@ class FastDllmV2BlockProposalEngine:
                         past_key_values=past_key_values,
                         update_past_key_values=True,
                         block_size=block_size,
+                        logit_positions=last_block_logit_positions,
                     )
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
