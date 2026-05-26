@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -228,6 +229,37 @@ class TestTliServerArgs(unittest.TestCase):
         self.assertEqual(
             server_args.draft_forward_grpc_max_message_bytes,
             256 * 1024 * 1024,
+        )
+
+    @patch(
+        "sglang.srt.model_executor.model_runner.get_global_server_args",
+        return_value=SimpleNamespace(
+            prefill_attention_backend=None, decode_attention_backend=None
+        ),
+    )
+    def test_tli_keeps_flashinfer_prefill_when_not_overridden(self, _mock_global):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        fake_runner = SimpleNamespace(
+            is_draft_worker=False,
+            server_args=SimpleNamespace(
+                speculative_draft_attention_backend=None,
+                attention_backend="flashinfer",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                get_attention_backends=lambda: ("flashinfer", "flashinfer"),
+            ),
+            spec_algorithm=SpeculativeAlgorithm.TLI,
+            _get_attention_backend_from_str=MagicMock(
+                return_value="flashinfer-backend"
+            ),
+        )
+
+        attn_backend = ModelRunner._get_attention_backend(fake_runner)
+
+        self.assertEqual(attn_backend, "flashinfer-backend")
+        fake_runner._get_attention_backend_from_str.assert_called_once_with(
+            "flashinfer", init_new_workspace=False
         )
 
     @patch(

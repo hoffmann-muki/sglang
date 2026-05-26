@@ -2232,22 +2232,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.decode_attention_backend_str,
         ) = self.server_args.get_attention_backends()
 
-        if (
-            self.spec_algorithm.is_tli()
-            and self.server_args.prefill_attention_backend is None
-            and self.prefill_attention_backend_str == "flashinfer"
-        ):
-            # TLI target verify still exercises the extend/prefill attention
-            # path, and FlashInfer's custom-mask handling has been fragile for
-            # this workload. Default the prefill side of TLI to triton unless
-            # the user explicitly asked for another prefill backend.
-            self.prefill_attention_backend_str = "triton"
-            self.server_args.prefill_attention_backend = "triton"
-            logger.info(
-                "Using triton as the default prefill backend for TLI to keep "
-                "target verify on the safer eager path."
-            )
-
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
