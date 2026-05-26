@@ -552,9 +552,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 verified_id=verified_id,
                 accept_length=accept_length,
                 accept_length_cpu=accept_length_list,
+                topk_p=torch.zeros(
+                    (len(accept_index), self.topk),
+                    dtype=torch.float32,
+                    device=batch.device,
+                ),
+                topk_index=torch.zeros(
+                    (len(accept_index), self.topk),
+                    dtype=torch.int64,
+                    device=batch.device,
+                ),
                 seq_lens_for_draft_extend=batch.seq_lens,
                 seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
             return EagleVerifyOutput(
@@ -615,11 +626,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     verified_id=predict[unfinished_accept_index],
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
+                    topk_p=torch.zeros(
+                        (len(unfinished_accept_index), self.topk),
+                        dtype=torch.float32,
+                        device=batch.device,
+                    ),
+                    topk_index=torch.zeros(
+                        (len(unfinished_accept_index), self.topk),
+                        dtype=torch.int64,
+                        device=batch.device,
+                    ),
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
                     seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices_for_draft_extend=batch.req_pool_indices[
                         unfinished_index_device
                     ],
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             else:
                 draft_input = EagleDraftInput.create_idle_input(
@@ -833,25 +855,37 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        has_topk_state = self.topk_p is not None and self.topk_index is not None
+        if self.topk_p is not None or self.topk_index is not None:
+            assert has_topk_state, (
+                "EagleDraftInput has partial topk state; topk_p and topk_index "
+                "must either both exist or both be absent."
+            )
+
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
-            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-            if len(new_indices) != len(self.topk_p):
-                if strict_check:
-                    raise ValueError(error_msg)
-                else:
-                    logger.warning(error_msg)
+            if has_topk_state:
+                error_msg = (
+                    f"length of new_indices: {len(new_indices)} != length of "
+                    f"topk_p: {len(self.topk_p)}, this should not happen"
+                )
+                if len(new_indices) != len(self.topk_p):
+                    if strict_check:
+                        raise ValueError(error_msg)
+                    else:
+                        logger.warning(error_msg)
 
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
+                self.topk_p = self.topk_p[: len(new_indices)]
+                self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
+            if has_topk_state:
+                self.topk_p = self.topk_p[new_indices]
+                self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
 

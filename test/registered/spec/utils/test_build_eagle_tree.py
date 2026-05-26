@@ -38,6 +38,38 @@ class TestBuildEagleTree(unittest.TestCase):
             )
         )
 
+    def test_filter_batch_handles_missing_topk_state(self):
+        draft_input = EagleDraftInput(
+            hidden_states=torch.tensor(
+                [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                device=get_device(),
+                dtype=torch.float32,
+            ),
+            verified_id=torch.tensor(
+                [11, 12, 13], device=get_device(), dtype=torch.int32
+            ),
+        )
+
+        draft_input.filter_batch(
+            torch.tensor([0, 2], device=get_device(), dtype=torch.int64),
+            has_been_filtered=False,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                draft_input.hidden_states.cpu(),
+                torch.tensor([[1.0, 2.0], [5.0, 6.0]], dtype=torch.float32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                draft_input.verified_id.cpu(),
+                torch.tensor([11, 13], dtype=torch.int32),
+            )
+        )
+        self.assertIsNone(draft_input.topk_p)
+        self.assertIsNone(draft_input.topk_index)
+
     def test_build_tree_kernel_efficient(self):
         """Test the build_tree_kernel_efficient function with known inputs and expected outputs."""
         verified_id = torch.tensor([29974, 13], device=get_device(), dtype=torch.int32)
