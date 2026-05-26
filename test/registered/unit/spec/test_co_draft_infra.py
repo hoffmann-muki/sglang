@@ -25,6 +25,7 @@ from sglang.srt.speculative.co_draft.fast_dllm_v2_runner import (
     _SGLangNativeBlockCacheState,
     _SGLangNativeCacheState,
     _disable_transformers_hub_kernels_for_fast_dllm_v2,
+    _fast_dllm_v2_argmax_with_top_p_probs,
     _fast_dllm_v2_internal_generation_budget,
     _ensure_fast_dllm_v2_tied_embeddings,
     _ensure_transformers_default_rope_support,
@@ -885,6 +886,50 @@ class TestFastDllmV2ProposalRunner(unittest.TestCase):
                 torch.tensor([31, 31, 31, 31, 31, 31, 31, 31]),
             )
         )
+
+    def test_argmax_with_top_p_probs_matches_full_distribution_gather(self):
+        import torch
+
+        logits = torch.tensor(
+            [
+                [[4.0, 1.0, 0.0, -1.0], [0.0, 3.0, 2.0, -4.0]],
+                [[1.0, 5.0, 0.0, -2.0], [2.0, 1.0, 4.0, -3.0]],
+            ],
+            dtype=torch.float32,
+        )
+        top_p = 0.85
+
+        token_ids, token_probs = _fast_dllm_v2_argmax_with_top_p_probs(
+            logits,
+            top_p=top_p,
+            temperature=0.0,
+        )
+
+        probs = torch.softmax(logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_remove = cumulative_probs > top_p
+        sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+        sorted_remove[..., 0] = False
+        filtered_sorted_probs = sorted_probs.masked_fill(sorted_remove, 0.0)
+        filtered_probs = torch.zeros_like(probs).scatter(
+            -1,
+            sorted_indices,
+            filtered_sorted_probs,
+        )
+        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+        expected_token_ids = filtered_probs.argmax(dim=-1)
+        expected_token_probs = torch.squeeze(
+            torch.gather(
+                filtered_probs,
+                dim=-1,
+                index=torch.unsqueeze(expected_token_ids, -1),
+            ),
+            -1,
+        )
+
+        self.assertTrue(torch.equal(token_ids, expected_token_ids))
+        self.assertTrue(torch.allclose(token_probs, expected_token_probs))
 
     def test_native_trace_recorder_writes_pt_and_json_summaries(self):
         import json

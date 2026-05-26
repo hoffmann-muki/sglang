@@ -945,29 +945,30 @@ class SGLangNativeFastDllmV2Runtime:
         states: dict[str, FastDllmV2RequestState],
     ) -> IndependentDllmDraftTokens:
         self._configure_trace(config)
-        self._trace_record(
-            "proposal",
-            "input",
-            {
-                "request_ids": list(request.request_ids),
-                "prefix_lens": request.prefix_lens,
-                "current_token_ids": request.current_token_ids,
-                "proposed_token_num": request.proposed_token_num,
-                "input_lens": [len(input_ids) for input_ids in request.input_ids],
-                "input_ids": [
-                    torch.tensor(input_ids, dtype=torch.long)
-                    for input_ids in request.input_ids
-                ],
-                "config": {
-                    "block_size": config.block_size,
-                    "small_block_size": config.small_block_size,
-                    "threshold": config.threshold,
-                    "use_block_cache": bool(
-                        config.proposal_kwargs.get("use_block_cache", False)
-                    ),
+        if self._trace is not None:
+            self._trace_record(
+                "proposal",
+                "input",
+                {
+                    "request_ids": list(request.request_ids),
+                    "prefix_lens": request.prefix_lens,
+                    "current_token_ids": request.current_token_ids,
+                    "proposed_token_num": request.proposed_token_num,
+                    "input_lens": [len(input_ids) for input_ids in request.input_ids],
+                    "input_ids": [
+                        torch.tensor(input_ids, dtype=torch.long)
+                        for input_ids in request.input_ids
+                    ],
+                    "config": {
+                        "block_size": config.block_size,
+                        "small_block_size": config.small_block_size,
+                        "threshold": config.threshold,
+                        "use_block_cache": bool(
+                            config.proposal_kwargs.get("use_block_cache", False)
+                        ),
+                    },
                 },
-            },
-        )
+            )
         proposed = []
         proposal_batch_size = _effective_proposal_batch_size(
             config, len(request.request_ids)
@@ -1005,15 +1006,16 @@ class SGLangNativeFastDllmV2Runtime:
             )
 
         proposed_token_ids = torch.stack(proposed).to(request.current_token_ids.device)
-        self._trace_record(
-            "proposal",
-            "output",
-            {
-                "request_ids": list(request.request_ids),
-                "proposed_token_ids": proposed_token_ids,
-                "metadata": metadata,
-            },
-        )
+        if self._trace is not None:
+            self._trace_record(
+                "proposal",
+                "output",
+                {
+                    "request_ids": list(request.request_ids),
+                    "proposed_token_ids": proposed_token_ids,
+                    "metadata": metadata,
+                },
+            )
         return IndependentDllmDraftTokens(
             request_ids=list(request.request_ids),
             current_token_ids=request.current_token_ids,
@@ -1508,24 +1510,25 @@ class SGLangNativeFastDllmV2Runtime:
         req_pool_idx: int,
         logit_positions: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        self._trace_set_phase(phase)
-        self._trace_record(
-            "model_runner.forward",
-            "input",
-            {
-                "phase": phase,
-                "input_ids": input_ids,
-                "prefix_len": prefix_len,
-                "block_size": block_size,
-                "req_pool_idx": req_pool_idx,
-                "seq_lens": forward_batch.seq_lens,
-                "positions": forward_batch.positions,
-                "out_cache_loc": out_cache_loc,
-                "extend_prefix_lens": forward_batch.extend_prefix_lens,
-                "extend_seq_lens": forward_batch.extend_seq_lens,
-                "logit_positions": logit_positions,
-            },
-        )
+        if self._trace is not None:
+            self._trace_set_phase(phase)
+            self._trace_record(
+                "model_runner.forward",
+                "input",
+                {
+                    "phase": phase,
+                    "input_ids": input_ids,
+                    "prefix_len": prefix_len,
+                    "block_size": block_size,
+                    "req_pool_idx": req_pool_idx,
+                    "seq_lens": forward_batch.seq_lens,
+                    "positions": forward_batch.positions,
+                    "out_cache_loc": out_cache_loc,
+                    "extend_prefix_lens": forward_batch.extend_prefix_lens,
+                    "extend_seq_lens": forward_batch.extend_seq_lens,
+                    "logit_positions": logit_positions,
+                },
+            )
         with torch.inference_mode():
             runner_output = self.model_runner.forward(forward_batch)
             logits_output = runner_output.logits_output
@@ -1772,18 +1775,18 @@ class SGLangNativeFastDllmV2Runtime:
         top_p: float,
         temperature: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return selected token ids and their post-top-p probabilities."""
         if profile is not None:
             start = time.perf_counter()
-        probs = _fast_dllm_v2_sample_probs(
+        token_ids, token_probs = _fast_dllm_v2_argmax_with_top_p_probs(
             logits,
             top_p=top_p,
             temperature=temperature,
         )
-        token_ids = probs.argmax(dim=-1)
         if profile is not None:
             profile["sampling_calls"] += 1
             profile["sampling_time_s"] += time.perf_counter() - start
-        return token_ids, probs
+        return token_ids, token_probs
 
     def proposal_pad_token_id(self) -> int:
         model_config = getattr(self.model_runner, "model_config", None)
@@ -2211,15 +2214,11 @@ class FastDllmV2BlockProposalEngine:
                                 )
                                 logits = logits[:, start:end]
 
-                        x_1, p_1t = self.backend.sample_with_top_p(
+                        x_1, x1_p = self.backend.sample_with_top_p(
                             profile,
                             logits,
                             top_p=top_p,
                             temperature=temperature,
-                        )
-                        x1_p = torch.squeeze(
-                            torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)),
-                            -1,
                         )
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
 
@@ -2350,31 +2349,35 @@ def _fast_dllm_v2_propose_from_state(
     )
 
 
-def _fast_dllm_v2_sample_probs(
+def _fast_dllm_v2_argmax_with_top_p_probs(
     logits: torch.Tensor,
     *,
     top_p: float,
     temperature: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return greedy tokens and their probabilities after top-p renormalization."""
+
     if temperature > 0:
         logits = logits / temperature
     probs = torch.softmax(logits, dim=-1)
+    token_probs, token_ids = probs.max(dim=-1)
     if top_p >= 1.0:
-        return probs
+        return token_ids, token_probs
 
     sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
     sorted_remove = cumulative_probs > top_p
     sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
     sorted_remove[..., 0] = False
-    filtered_sorted_probs = sorted_probs.masked_fill(sorted_remove, 0.0)
-    filtered_probs = torch.zeros_like(probs).scatter(
-        -1,
-        sorted_indices,
-        filtered_sorted_probs,
+    kept_mass = sorted_probs.masked_fill(sorted_remove, 0.0).sum(dim=-1)
+    top_probs = sorted_probs[..., 0]
+    top_ids = sorted_indices[..., 0]
+    normalized_top_probs = torch.where(
+        kept_mass > 0,
+        top_probs / kept_mass,
+        token_probs,
     )
-    normalizer = filtered_probs.sum(dim=-1, keepdim=True)
-    return torch.where(normalizer > 0, filtered_probs / normalizer, probs)
+    return top_ids, normalized_top_probs
 
 
 class TransformersFastDllmV2Runtime:
@@ -2651,21 +2654,30 @@ class TransformersFastDllmV2Runtime:
         temperature: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if profile is None:
-            return self.model.sample_with_top_p(
+            token_ids, probs = self.model.sample_with_top_p(
                 logits,
                 top_p=top_p,
                 temperature=temperature,
             )
+            token_probs = torch.squeeze(
+                torch.gather(probs, dim=-1, index=torch.unsqueeze(token_ids, -1)),
+                -1,
+            )
+            return token_ids, token_probs
 
         start = time.perf_counter()
-        output = self.model.sample_with_top_p(
+        token_ids, probs = self.model.sample_with_top_p(
             logits,
             top_p=top_p,
             temperature=temperature,
         )
+        token_probs = torch.squeeze(
+            torch.gather(probs, dim=-1, index=torch.unsqueeze(token_ids, -1)),
+            -1,
+        )
         profile["sampling_calls"] += 1
         profile["sampling_time_s"] += time.perf_counter() - start
-        return output
+        return token_ids, token_probs
 
     @staticmethod
     def _aggregate_profiles(profiles: list[Optional[dict[str, Any]]]) -> dict[str, Any]:
