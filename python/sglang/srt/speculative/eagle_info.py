@@ -184,8 +184,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         paged_kernel_lens = paged_kernel_lens + self.draft_token_num
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Derive the flattened KV size from the cumulative tensor we just built
+        # so the allocator cannot drift from the actual per-request lengths.
+        total_kv_tokens = int(cum_kv_seq_len[-1].item())
+
         kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * batch_size,
+            total_kv_tokens,
             dtype=torch.int32,
             device=device,
         )
@@ -198,10 +202,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
-        mask_numel = (
-            paged_kernel_lens_sum * self.draft_token_num
-            + (self.draft_token_num**2) * batch_size
-        )
+        mask_numel = total_kv_tokens * self.draft_token_num
         custom_mask = self.custom_mask
         if custom_mask.numel() < mask_numel:
             # FIXME(attn): temporary fix for custom mask padding with cuda graph
@@ -217,7 +218,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ],
                 dim=0,
             )
-            self.custom_mask = custom_mask
         elif custom_mask.numel() > mask_numel:
             custom_mask = custom_mask[:mask_numel]
 
