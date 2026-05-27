@@ -125,37 +125,6 @@ def _normalize_custom_mask_for_flashinfer(
     return custom_mask.contiguous()
 
 
-def _safe_tensor_debug_summary(name: str, tensor: Optional[torch.Tensor]) -> str:
-    if tensor is None:
-        return f"{name}=None"
-
-    try:
-        flat = tensor.detach().flatten()
-        summary = [
-            f"{name}.shape={tuple(tensor.shape)}",
-            f"{name}.dtype={tensor.dtype}",
-            f"{name}.device={tensor.device}",
-            f"{name}.numel={flat.numel()}",
-        ]
-        if flat.numel() > 0:
-            summary.append(f"{name}.head={flat[:8].cpu().tolist()}")
-            if flat.numel() > 8:
-                summary.append(f"{name}.tail={flat[-8:].cpu().tolist()}")
-            if tensor.dtype == torch.bool:
-                true_count = int(flat.sum().item())
-                summary.append(f"{name}.true={true_count}")
-                summary.append(f"{name}.false={flat.numel() - true_count}")
-            elif tensor.dtype.is_floating_point or tensor.is_complex():
-                summary.append(f"{name}.min={flat.min().item()}")
-                summary.append(f"{name}.max={flat.max().item()}")
-            else:
-                summary.append(f"{name}.min={int(flat.min().item())}")
-                summary.append(f"{name}.max={int(flat.max().item())}")
-        return ", ".join(summary)
-    except Exception as exc:
-        return f"{name}=<debug-summary-failed: {exc!r}>"
-
-
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -856,91 +825,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            debug_info = getattr(self, "_last_prefill_debug_info", None)
-            first_layer_id = getattr(
-                forward_batch.token_to_kv_pool, "start_layer", 0
-            )
-            is_stream_capturing = (
-                torch.cuda.is_available()
-                and torch.cuda.is_current_stream_capturing()
-            )
-            if (
-                debug_info is not None
-                and layer.layer_id == first_layer_id
-                and not is_stream_capturing
-            ):
-                kv_pool_size = kv_buffer[0].shape[0]
-                kv_indices_min = debug_info["kv_indices_min"]
-                kv_indices_max = debug_info["kv_indices_max"]
-                cache_loc_min = (
-                    int(cache_loc.min().item())
-                    if cache_loc is not None and cache_loc.numel() > 0
-                    else None
-                )
-                cache_loc_max = (
-                    int(cache_loc.max().item())
-                    if cache_loc is not None and cache_loc.numel() > 0
-                    else None
-                )
-                invalid_reasons = []
-                if not debug_info["mask_numel_matches"]:
-                    invalid_reasons.append(
-                        "custom_mask.numel does not match sum(q_len * kv_len)"
-                    )
-                if debug_info["q_total"] != q.shape[0]:
-                    invalid_reasons.append("qo_indptr total does not match q tokens")
-                if not debug_info["qo_indptr_non_decreasing"]:
-                    invalid_reasons.append("qo_indptr is not non-decreasing")
-                if not debug_info["kv_indptr_non_decreasing"]:
-                    invalid_reasons.append("kv_indptr is not non-decreasing")
-                if not debug_info["kv_index_end_within_storage"]:
-                    invalid_reasons.append("kv_indptr[-1] exceeds kv_indices storage")
-                if kv_indices_min is not None and kv_indices_min < 0:
-                    invalid_reasons.append("kv_indices contains a negative index")
-                if kv_indices_max is not None and kv_indices_max >= kv_pool_size:
-                    invalid_reasons.append("kv_indices exceeds KV pool size")
-                if cache_loc_min is not None and cache_loc_min < 0:
-                    invalid_reasons.append("cache_loc contains a negative index")
-                if cache_loc_max is not None and cache_loc_max >= kv_pool_size:
-                    invalid_reasons.append("cache_loc exceeds KV pool size")
-                if debug_info["kv_last_page_len_min"] is not None and (
-                    debug_info["kv_last_page_len_min"] < 1
-                    or debug_info["kv_last_page_len_max"] > debug_info["page_size"]
-                ):
-                    invalid_reasons.append(
-                        "kv_last_page_len is outside [1, page_size]"
-                    )
-
-                logger.warning(
-                    "FLASHINFER_TLI_PREFILL_RUN_DIAG "
-                    "layer_id=%s forward_mode=%s q_shape=%s k_shape=%s v_shape=%s "
-                    "kv_buffer_shape=%s kv_buffer_dtype=%s kv_pool_size=%s "
-                    "cache_loc_shape=%s cache_loc_min=%s cache_loc_max=%s "
-                    "debug_info=%s invalid_reasons=%s",
-                    layer.layer_id,
-                    forward_batch.forward_mode,
-                    tuple(q.shape),
-                    tuple(k.shape) if k is not None else None,
-                    tuple(v.shape) if v is not None else None,
-                    tuple(kv_buffer[0].shape),
-                    kv_buffer[0].dtype,
-                    kv_pool_size,
-                    tuple(cache_loc.shape) if cache_loc is not None else None,
-                    cache_loc_min,
-                    cache_loc_max,
-                    debug_info,
-                    invalid_reasons,
-                )
-                if invalid_reasons:
-                    raise RuntimeError(
-                        "Invalid FlashInfer TLI prefill metadata before kernel "
-                        f"launch: {invalid_reasons}; {debug_info=}; "
-                        f"{kv_pool_size=}"
-                    )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                kv_buffer,
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -1355,7 +1242,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
         self.page_size = model_runner.page_size
         self._plan_tensors: List[torch.Tensor] = []
-        self.attn_backend._last_prefill_debug_info = None
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1624,122 +1510,6 @@ class FlashInferIndicesUpdaterPrefill:
             for tensor in (qo_indptr, kv_indptr, kv_indices, use_custom_mask)
             if tensor is not None
         )
-        # Spec target-verify uses a per-request tree mask whose flattened
-        # layout is tied to the unsplit KV range. Do not let FlashInfer split
-        # the KV work for this path; the paged split-K run can otherwise consume
-        # mask offsets that do not correspond to the split segment layout.
-        has_custom_mask = use_custom_mask is not None
-        expected_mask_numel = None
-        kv_index_end = None
-        kv_indices_min = None
-        kv_indices_max = None
-        if has_custom_mask:
-            kv_last_page_len = self.kv_last_page_len[:bs]
-            q_lens = qo_indptr[1:] - qo_indptr[:-1]
-            kv_lens = kv_indptr[1:] - kv_indptr[:-1]
-            expected_mask_numel = int(
-                (q_lens.to(torch.int64) * kv_lens.to(torch.int64)).sum().item()
-            )
-            kv_index_end = int(kv_indptr[-1].item())
-            kv_index_end_within_storage = kv_index_end <= kv_indices.numel()
-            live_kv_indices = kv_indices[:kv_index_end]
-            if live_kv_indices.numel() > 0:
-                kv_indices_min = int(live_kv_indices.min().item())
-                kv_indices_max = int(live_kv_indices.max().item())
-            kv_last_page_len_min = (
-                int(kv_last_page_len.min().item())
-                if kv_last_page_len.numel() > 0
-                else None
-            )
-            kv_last_page_len_max = (
-                int(kv_last_page_len.max().item())
-                if kv_last_page_len.numel() > 0
-                else None
-            )
-            qo_indptr_non_decreasing = bool(
-                torch.all(qo_indptr[1:] >= qo_indptr[:-1]).item()
-            )
-            kv_indptr_non_decreasing = bool(
-                torch.all(kv_indptr[1:] >= kv_indptr[:-1]).item()
-            )
-            self.attn_backend._last_prefill_debug_info = {
-                "bs": bs,
-                "expected_mask_numel": expected_mask_numel,
-                "actual_mask_numel": use_custom_mask.numel(),
-                "mask_numel_matches": expected_mask_numel == use_custom_mask.numel(),
-                "kv_index_end": kv_index_end,
-                "kv_indices_numel": kv_indices.numel(),
-                "kv_index_end_within_storage": kv_index_end_within_storage,
-                "kv_indices_min": kv_indices_min,
-                "kv_indices_max": kv_indices_max,
-                "qo_indptr_non_decreasing": qo_indptr_non_decreasing,
-                "kv_indptr_non_decreasing": kv_indptr_non_decreasing,
-                "kv_last_page_len_min": kv_last_page_len_min,
-                "kv_last_page_len_max": kv_last_page_len_max,
-                "page_size": self.page_size,
-                "q_total": int(qo_indptr[-1].item()),
-                "kv_total": int(kv_indptr[-1].item()),
-                "spec_info_type": type(spec_info).__name__
-                if spec_info is not None
-                else None,
-                "use_ragged": use_ragged,
-                "fixed_split_size": fixed_split_size,
-            }
-            logger.warning(
-                "FLASHINFER_TLI_PREFILL_PLAN_DIAG "
-                "bs=%s expected_mask_numel=%s actual_mask_numel=%s "
-                "mask_numel_matches=%s kv_index_end=%s kv_indices_min=%s "
-                "kv_indices_max=%s kv_index_end_within_storage=%s "
-                "qo_indptr_non_decreasing=%s kv_indptr_non_decreasing=%s "
-                "kv_last_page_len_min=%s kv_last_page_len_max=%s page_size=%s "
-                "%s %s %s %s %s %s %s %s",
-                bs,
-                expected_mask_numel,
-                use_custom_mask.numel(),
-                expected_mask_numel == use_custom_mask.numel(),
-                kv_index_end,
-                kv_indices_min,
-                kv_indices_max,
-                kv_index_end_within_storage,
-                qo_indptr_non_decreasing,
-                kv_indptr_non_decreasing,
-                kv_last_page_len_min,
-                kv_last_page_len_max,
-                self.page_size,
-                _safe_tensor_debug_summary("req_pool_indices", req_pool_indices),
-                _safe_tensor_debug_summary("seq_lens", seq_lens),
-                _safe_tensor_debug_summary("paged_kernel_lens", paged_kernel_lens),
-                _safe_tensor_debug_summary("qo_indptr", qo_indptr),
-                _safe_tensor_debug_summary("kv_indptr", kv_indptr),
-                _safe_tensor_debug_summary("kv_indices", live_kv_indices),
-                _safe_tensor_debug_summary("kv_last_page_len", kv_last_page_len),
-                _safe_tensor_debug_summary("custom_mask", use_custom_mask),
-            )
-            invalid_plan_reasons = []
-            if expected_mask_numel != use_custom_mask.numel():
-                invalid_plan_reasons.append(
-                    "custom_mask.numel does not match sum(q_len * kv_len)"
-                )
-            if not kv_index_end_within_storage:
-                invalid_plan_reasons.append("kv_indptr[-1] exceeds kv_indices storage")
-            if not qo_indptr_non_decreasing:
-                invalid_plan_reasons.append("qo_indptr is not non-decreasing")
-            if not kv_indptr_non_decreasing:
-                invalid_plan_reasons.append("kv_indptr is not non-decreasing")
-            if kv_last_page_len_min is not None and (
-                kv_last_page_len_min < 1 or kv_last_page_len_max > self.page_size
-            ):
-                invalid_plan_reasons.append(
-                    "kv_last_page_len is outside [1, page_size]"
-                )
-            if invalid_plan_reasons:
-                raise RuntimeError(
-                    "Invalid FlashInfer TLI prefill plan metadata before "
-                    f"begin_forward: {invalid_plan_reasons}; "
-                    f"debug_info={self.attn_backend._last_prefill_debug_info}"
-                )
-        else:
-            self.attn_backend._last_prefill_debug_info = None
 
         wrapper_paged.begin_forward(
             qo_indptr,
