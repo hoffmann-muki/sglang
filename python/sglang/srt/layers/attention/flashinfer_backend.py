@@ -861,7 +861,15 @@ class FlashInferAttnBackend(AttentionBackend):
             first_layer_id = getattr(
                 forward_batch.token_to_kv_pool, "start_layer", 0
             )
-            if debug_info is not None and layer.layer_id == first_layer_id:
+            is_stream_capturing = (
+                torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if (
+                debug_info is not None
+                and layer.layer_id == first_layer_id
+                and not is_stream_capturing
+            ):
                 kv_pool_size = kv_buffer[0].shape[0]
                 kv_indices_min = debug_info["kv_indices_min"]
                 kv_indices_max = debug_info["kv_indices_max"]
