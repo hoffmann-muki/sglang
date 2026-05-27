@@ -1501,14 +1501,19 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
-        # begin_forward is called with non_blocking=True below. Keep the input
-        # tensors alive until the next metadata update so FlashInfer's async
-        # planner cannot outlive temporary tensors allocated in this function.
+        # Keep the input tensors alive until the next metadata update so
+        # FlashInfer's planner cannot outlive temporary tensors allocated in
+        # this function.
         self._plan_tensors.extend(
             tensor
             for tensor in (qo_indptr, kv_indptr, kv_indices, use_custom_mask)
             if tensor is not None
         )
+        # Spec target-verify uses a freshly generated tree mask. Let FlashInfer
+        # finish packing/planning it before the following paged run consumes the
+        # metadata; otherwise passive TLI ranks can race into the kernel with
+        # incomplete auxiliary state.
+        plan_non_blocking = use_custom_mask is None
 
         wrapper_paged.begin_forward(
             qo_indptr,
@@ -1522,7 +1527,7 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
-            non_blocking=True,
+            non_blocking=plan_non_blocking,
             fixed_split_size=fixed_split_size,
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
