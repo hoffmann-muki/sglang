@@ -1509,11 +1509,11 @@ class FlashInferIndicesUpdaterPrefill:
             for tensor in (qo_indptr, kv_indptr, kv_indices, use_custom_mask)
             if tensor is not None
         )
-        # Spec target-verify uses a freshly generated tree mask. Let FlashInfer
-        # finish packing/planning it before the following paged run consumes the
-        # metadata; otherwise passive TLI ranks can race into the kernel with
-        # incomplete auxiliary state.
-        plan_non_blocking = use_custom_mask is None
+        # Spec target-verify uses a per-request tree mask whose flattened
+        # layout is tied to the unsplit KV range. Do not let FlashInfer split
+        # the KV work for this path; the paged split-K run can otherwise consume
+        # mask offsets that do not correspond to the split segment layout.
+        has_custom_mask = use_custom_mask is not None
 
         wrapper_paged.begin_forward(
             qo_indptr,
@@ -1527,8 +1527,9 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
-            non_blocking=plan_non_blocking,
+            non_blocking=not has_custom_mask,
             fixed_split_size=fixed_split_size,
+            disable_split_kv=has_custom_mask,
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
