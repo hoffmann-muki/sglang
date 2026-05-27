@@ -1325,9 +1325,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
-        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
-        self._plan_tensors = []
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
@@ -1523,9 +1521,9 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
-            non_blocking=not has_custom_mask,
+            non_blocking=use_custom_mask is None,
             fixed_split_size=fixed_split_size,
-            disable_split_kv=has_custom_mask,
+            disable_split_kv=use_custom_mask is not None,
             prefix_len_ptr=prefix_len_ptr,
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
