@@ -1240,7 +1240,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
-        self._custom_masks_for_plan: List[torch.Tensor] = []
+        self._plan_tensors: List[torch.Tensor] = []
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1293,7 +1293,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
 
-        self._custom_masks_for_plan = []
+        self._plan_tensors = []
         self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrappers[0],
@@ -1326,7 +1326,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
-        self._custom_masks_for_plan = []
+        self._plan_tensors = []
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
@@ -1377,7 +1377,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
-        self._custom_masks_for_plan = []
+        self._plan_tensors = []
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # normal attention
@@ -1496,12 +1496,19 @@ class FlashInferIndicesUpdaterPrefill:
         else:
             # No multi-item scoring - use standard parameters
             use_custom_mask = _normalize_custom_mask_for_flashinfer(custom_mask)
-            if use_custom_mask is not None:
-                self._custom_masks_for_plan.append(use_custom_mask)
             prefix_len_ptr = None
             token_pos_in_items_ptr = None
             token_pos_in_items_len = 0
             max_item_len_ptr = None
+
+        # begin_forward is called with non_blocking=True below. Keep the input
+        # tensors alive until the next metadata update so FlashInfer's async
+        # planner cannot outlive temporary tensors allocated in this function.
+        self._plan_tensors.extend(
+            tensor
+            for tensor in (qo_indptr, kv_indptr, kv_indices, use_custom_mask)
+            if tensor is not None
+        )
 
         wrapper_paged.begin_forward(
             qo_indptr,
