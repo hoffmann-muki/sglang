@@ -967,6 +967,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.return_hidden_states_before_norm = True
             worker_batch = model_worker_batch.get_model_worker_batch()
             batch_output = self.target_worker.forward_batch_generation(
                 worker_batch
@@ -974,6 +975,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            model_worker_batch.return_hidden_states_before_norm = True
             worker_batch = model_worker_batch.get_model_worker_batch()
             with self.draft_worker.draft_context():
                 batch_output.next_draft_input = (
