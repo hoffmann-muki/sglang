@@ -63,6 +63,7 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
         llama_config_dict.setdefault(key, value)
 
     llama_config_dict.setdefault("model_type", "llama")
+    llama_config_dict["num_hidden_layers"] = 1
     llama_config_dict["architectures"] = ["LlamaForCausalLMEagle3"]
 
     config = LlamaConfig.from_dict(llama_config_dict)

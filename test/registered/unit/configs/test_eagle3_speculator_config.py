@@ -30,7 +30,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
                 "hidden_size": 16,
                 "intermediate_size": 64,
                 "num_attention_heads": 4,
-                "num_hidden_layers": 1,
+                "num_hidden_layers": 8,
                 "num_key_value_heads": 2,
                 "rms_norm_eps": 1e-06,
                 "tie_word_embeddings": False,
@@ -56,6 +56,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
         self.assertIsInstance(config, LlamaConfig)
         self.assertEqual(config.architectures, ["LlamaForCausalLMEagle3"])
         self.assertEqual(config.model_type, "llama")
+        self.assertEqual(config.num_hidden_layers, 1)
         self.assertEqual(config.draft_vocab_size, 1234)
         self.assertEqual(config.target_hidden_size, 32)
         self.assertTrue(config.norm_before_residual)
