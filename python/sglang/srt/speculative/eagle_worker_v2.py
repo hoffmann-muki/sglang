@@ -967,16 +967,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            worker_batch = model_worker_batch.get_model_worker_batch()
             batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch.get_model_worker_batch()
+                worker_batch
             )
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            worker_batch = model_worker_batch.get_model_worker_batch()
             with self.draft_worker.draft_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
-                        model_worker_batch,
+                        worker_batch,
                         batch_output.logits_output.hidden_states,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
