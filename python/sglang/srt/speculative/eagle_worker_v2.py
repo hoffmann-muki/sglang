@@ -759,7 +759,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             pt = 0
-            for i, extend_len in enumerate(batch.extend_seq_lens):
+            for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 batch.input_ids[pt : pt + extend_len] = torch.cat(
                     (input_ids[1:], next_token_ids[i].reshape(1))
