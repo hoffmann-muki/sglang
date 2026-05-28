@@ -309,12 +309,15 @@ class TpModelWorker(BaseTpWorker):
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        if self.world_group.world_size == 1:
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
