@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from examples.frontend_language.quick_start.azure_openai_example_chat import batch
 import torch
 import torch.nn.functional as F
 import triton
@@ -170,7 +169,7 @@ class EagleDraftInputV2Mixin:
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
         draft_model_runner: ModelRunner,
         topk: int,
