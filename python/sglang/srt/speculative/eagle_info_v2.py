@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import logging
 from typing import TYPE_CHECKING, Any
 
-from python.sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 import torch
 import torch.nn.functional as F
 import triton
@@ -362,6 +361,38 @@ class EagleVerifyInputV2Mixin:
         batch.spec_info = self
 
         forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        logger.warning(
+            "[EAGLE3 VERIFY FB AFTER INIT] "
+            "fb.mode=%s fb.input_ids.numel=%s fb.input_ids.shape=%s "
+            "fb.extend_num_tokens=%s fb.extend_seq_lens=%s fb.extend_prefix_lens=%s "
+            "fb.seq_lens=%s fb.seq_lens_cpu=%s fb.seq_lens_sum=%s "
+            "fb.positions.shape=%s fb.capture_hidden_mode=%s "
+            "fb.return_hidden_states_before_norm=%s",
+            forward_batch.forward_mode,
+            forward_batch.input_ids.numel()
+            if forward_batch.input_ids is not None
+            else None,
+            tuple(forward_batch.input_ids.shape)
+            if forward_batch.input_ids is not None
+            else None,
+            forward_batch.extend_num_tokens,
+            forward_batch.extend_seq_lens.detach().cpu().tolist()
+            if forward_batch.extend_seq_lens is not None
+            else None,
+            forward_batch.extend_prefix_lens.detach().cpu().tolist()
+            if forward_batch.extend_prefix_lens is not None
+            else None,
+            forward_batch.seq_lens.detach().cpu().tolist(),
+            forward_batch.seq_lens_cpu.tolist()
+            if hasattr(forward_batch.seq_lens_cpu, "tolist")
+            else forward_batch.seq_lens_cpu,
+            forward_batch.seq_lens_sum,
+            tuple(forward_batch.positions.shape)
+            if forward_batch.positions is not None
+            else None,
+            forward_batch.capture_hidden_mode,
+            forward_batch.return_hidden_states_before_norm,
+        )
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(

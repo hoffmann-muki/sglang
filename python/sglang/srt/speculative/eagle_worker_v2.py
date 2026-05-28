@@ -1107,13 +1107,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        # Run target verify batch in the main compute stream (GPU compute)
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
         logger.warning(
             "[EAGLE3 VERIFY BEFORE TARGET FORWARD] "
             "can_run_cuda_graph=%s skip_attn_backend_init=True "
@@ -1130,6 +1123,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             type(self.target_worker.model_runner.attn_backend.forward_metadata).__name__
             if self.target_worker.model_runner.attn_backend.forward_metadata is not None
             else None,
+        )
+        # Run target verify batch in the main compute stream (GPU compute)
+        forward_batch_output = self.target_worker.forward_batch_generation(
+            model_worker_batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 
