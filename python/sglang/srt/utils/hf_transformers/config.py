@@ -16,7 +16,7 @@
 from pathlib import Path
 from typing import Optional
 
-from transformers import PretrainedConfig
+from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.connector import create_remote_connector
@@ -40,6 +40,37 @@ from .mistral_utils import is_mistral_model, load_mistral_config
 
 def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
+
+
+def _is_eagle3_speculator_model(config_dict: dict) -> bool:
+    architectures = config_dict.get("architectures") or []
+    return bool(architectures) and architectures[0] == "Eagle3Speculator"
+
+
+def _load_eagle3_speculator_model(model: str, config_dict: dict):
+    spec_config = config_dict.get("speculators_config") or {}
+    if hasattr(spec_config, "to_dict"):
+        spec_config = spec_config.to_dict()
+    if not isinstance(spec_config, dict):
+        raise RuntimeError(
+            f"Expected dict-valued speculators_config for {model}, got {type(spec_config)!r}."
+        )
+
+    llama_config_dict = dict(spec_config)
+    for key, value in config_dict.items():
+        if key in {"architectures", "auto_map", "speculators_config"}:
+            continue
+        llama_config_dict.setdefault(key, value)
+
+    llama_config_dict.setdefault("model_type", "llama")
+    llama_config_dict["architectures"] = ["LlamaForCausalLMEagle3"]
+
+    config = LlamaConfig.from_dict(llama_config_dict)
+    config._name_or_path = model
+    config.architectures = ["LlamaForCausalLMEagle3"]
+    config.model_type = "llama"
+    config.speculators_config = spec_config
+    return config
 
 
 def _apply_deepseek_ocr_overrides(config, model):
@@ -87,27 +118,30 @@ def get_config(
                     revision=revision,
                     **kwargs,
                 )
-            elif isinstance(e, ValueError):
-                raise
             else:
-                logger.warning(
-                    "AutoConfig.from_pretrained raised KeyError for %s: %s. "
-                    "Falling back to config registry lookup.",
-                    model,
-                    e,
-                )
                 config_dict, _ = PretrainedConfig.get_config_dict(
                     model,
                     trust_remote_code=trust_remote_code,
                     revision=revision,
                     **kwargs,
                 )
-                model_type = config_dict.get("model_type")
-                if model_type in _CONFIG_REGISTRY:
-                    config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
-                    config._name_or_path = model
-                else:
+                if _is_eagle3_speculator_model(config_dict):
+                    config = _load_eagle3_speculator_model(model, config_dict)
+                elif isinstance(e, ValueError):
                     raise
+                else:
+                    logger.warning(
+                        "AutoConfig.from_pretrained raised KeyError for %s: %s. "
+                        "Falling back to config registry lookup.",
+                        model,
+                        e,
+                    )
+                    model_type = config_dict.get("model_type")
+                    if model_type in _CONFIG_REGISTRY:
+                        config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
+                        config._name_or_path = model
+                    else:
+                        raise
 
     if (
         config.architectures is not None
