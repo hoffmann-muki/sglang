@@ -56,8 +56,16 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
             f"Expected dict-valued speculators_config for {model}, got {type(spec_config)!r}."
         )
 
-    llama_config_dict = dict(spec_config)
-    target_vocab_size = spec_config.get("vocab_size")
+    layer_config = config_dict.get("transformer_layer_config") or {}
+    if hasattr(layer_config, "to_dict"):
+        layer_config = layer_config.to_dict()
+    if not isinstance(layer_config, dict):
+        raise RuntimeError(
+            f"Expected dict-valued transformer_layer_config for {model}, got {type(layer_config)!r}."
+        )
+
+    llama_config_dict = dict(layer_config)
+    target_vocab_size = llama_config_dict.get("vocab_size")
     draft_vocab_size = config_dict.get("draft_vocab_size")
     if target_vocab_size is None:
         target_vocab_size = draft_vocab_size
@@ -93,6 +101,7 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
     config.architectures = ["LlamaForCausalLMEagle3"]
     config.model_type = "llama"
     config.speculators_config = spec_config
+    config.transformer_layer_config = layer_config
     return config
 
 

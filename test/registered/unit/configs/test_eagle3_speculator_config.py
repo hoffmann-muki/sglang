@@ -24,25 +24,51 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
                 "AutoModel": "remote.Eagle3SpeculatorForCausalLM",
             },
             "draft_vocab_size": 32000,
-            "has_no_defaults_at_init": True,
+            "has_no_defaults_at_init": False,
             "norm_before_residual": True,
             "speculators_config": {
-                "hidden_size": 16,
-                "intermediate_size": 64,
-                "num_attention_heads": 4,
-                "num_hidden_layers": 8,
-                "num_key_value_heads": 2,
-                "rms_norm_eps": 1e-06,
-                "tie_word_embeddings": False,
-                "target_hidden_size": None,
-                "vocab_size": 151936,
+                "algorithm": "eagle3",
+                "default_proposal_method": "greedy",
+                "proposal_methods": [
+                    {
+                        "accept_tolerance": 0.0,
+                        "proposal_type": "greedy",
+                        "speculative_tokens": 3,
+                        "verifier_accept_k": 1,
+                    }
+                ],
+                "verifier": {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "name_or_path": "Qwen/Qwen3-32B",
+                },
             },
             "speculators_model_type": "qwen3",
             "speculators_version": "1",
-            "target_hidden_size": 32,
+            "target_hidden_size": None,
             "torch_dtype": "bfloat16",
-            "transformer_layer_config": {"dummy": 1},
-            "transformers_version": "4.0.0",
+            "transformer_layer_config": {
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "head_dim": 128,
+                "hidden_act": "silu",
+                "hidden_size": 5120,
+                "initializer_range": 0.02,
+                "intermediate_size": 25600,
+                "max_position_embeddings": 40960,
+                "mlp_bias": False,
+                "model_type": "llama",
+                "num_attention_heads": 64,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 8,
+                "pretraining_tp": 1,
+                "rms_norm_eps": 1e-06,
+                "rope_scaling": None,
+                "rope_theta": 1000000,
+                "torch_dtype": "bfloat16",
+                "use_cache": True,
+                "vocab_size": 151936,
+            },
+            "transformers_version": "4.53.2",
         }
         (config_dir / "config.json").write_text(json.dumps(config_json))
         return str(config_dir)
@@ -60,10 +86,10 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
         self.assertEqual(config.num_hidden_layers, 1)
         self.assertEqual(config.vocab_size, 151936)
         self.assertEqual(config.draft_vocab_size, 32000)
-        self.assertEqual(config.target_hidden_size, 32)
+        self.assertFalse(hasattr(config, "target_hidden_size"))
         self.assertTrue(config.norm_before_residual)
-        self.assertEqual(config.speculators_config["hidden_size"], 16)
-        self.assertEqual(config.speculators_config["num_hidden_layers"], 1)
+        self.assertEqual(config.speculators_config["algorithm"], "eagle3")
+        self.assertEqual(config.transformer_layer_config["vocab_size"], 151936)
 
     @patch("sglang.srt.utils.hf_transformers.config.AutoConfig.from_pretrained")
     def test_non_eagle3_value_error_still_raises(self, mock_from_pretrained):

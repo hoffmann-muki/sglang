@@ -65,7 +65,7 @@ class EAGLEDraftExtendCudaGraphRunner:
     ):
         # Parse args
         self.eagle_worker = eagle_worker
-        if not hasattr(eagle_worker, "model_runner"):
+        if getattr(eagle_worker, "is_v2_draft_worker", False):
             # V2: EagleDraftWorker
             self.model_runner = model_runner = eagle_worker.draft_runner
             self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
