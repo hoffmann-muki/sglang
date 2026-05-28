@@ -444,11 +444,41 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     rids: Optional[List[str]] = None
 
     @classmethod
-    def init_new(
-        cls,
-        batch: ModelWorkerBatch,
-        model_runner: ModelRunner,
-    ):
+    def init_new(cls, batch, model_runner: ModelRunner):
+        if hasattr(batch, "get_model_worker_batch") and not hasattr(batch, "lora_ids"):
+            schedule_batch = batch
+            capture_hidden_mode = getattr(schedule_batch, "capture_hidden_mode", None)
+            schedule_batch.capture_hidden_mode = None
+
+            return_hidden_states_before_norm = getattr(
+                schedule_batch, "return_hidden_states_before_norm", False
+            )
+            schedule_batch.return_hidden_states_before_norm = False
+
+            seq_lens_cpu_cache = getattr(schedule_batch, "seq_lens_cpu_cache", None)
+            if hasattr(schedule_batch, "seq_lens_cpu_cache"):
+                schedule_batch.seq_lens_cpu_cache = None
+
+            # Existing branch API.
+            batch = schedule_batch.get_model_worker_batch(seq_lens_cpu_cache)
+
+            if capture_hidden_mode is None:
+                if getattr(schedule_batch, "return_hidden_states", False):
+                    capture_hidden_mode = CaptureHiddenMode.FULL
+                elif getattr(schedule_batch, "spec_info", None) is not None:
+                    capture_hidden_mode = getattr(
+                        schedule_batch.spec_info,
+                        "capture_hidden_mode",
+                        CaptureHiddenMode.NULL,
+                    )
+                    if capture_hidden_mode is None:
+                        capture_hidden_mode = CaptureHiddenMode.NULL
+                else:
+                    capture_hidden_mode = CaptureHiddenMode.NULL
+
+            batch.capture_hidden_mode = capture_hidden_mode
+            batch.return_hidden_states_before_norm = return_hidden_states_before_norm
+
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),

@@ -198,8 +198,14 @@ class EagleDraftInputV2Mixin:
         # Get a forward batch
         self.num_tokens_per_req = topk
         self.num_tokens_for_logprob_per_req = topk
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+
+        is_standalone = draft_model_runner.spec_algorithm.is_standalone()
+        batch.capture_hidden_mode = (
+            CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.LAST
+        )
+        batch.return_hidden_states_before_norm = not is_standalone
+
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
@@ -223,13 +229,20 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        is_standalone = draft_model_runner.spec_algorithm.is_standalone()
+        batch.capture_hidden_mode = (
+            CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.FULL
+        )
+        batch.return_hidden_states_before_norm = not is_standalone
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
+
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -284,23 +297,24 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        batch.spec_info = self
+
+        forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
         # Run attention backend plan and cuda graph preparation
         can_run_cuda_graph = bool(
             target_worker.model_runner.graph_runner
-            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+            and target_worker.model_runner.graph_runner.can_run(forward_batch)
         )
         if can_run_cuda_graph:
-            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+            target_worker.model_runner.graph_runner.replay_prepare(forward_batch)
         else:
             if not batch.forward_mode.is_idle():
                 target_worker.model_runner.attn_backend.init_forward_metadata(
-                    verify_forward_batch
+                    forward_batch
                 )
 
-        return verify_forward_batch, can_run_cuda_graph
+        return forward_batch, can_run_cuda_graph
 
     def sample(
         self: EagleVerifyInput,

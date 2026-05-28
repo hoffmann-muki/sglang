@@ -447,7 +447,7 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        model_worker_batch,
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,

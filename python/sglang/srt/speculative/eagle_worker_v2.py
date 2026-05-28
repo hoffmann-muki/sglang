@@ -31,7 +31,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
@@ -307,13 +307,13 @@ class EagleDraftWorker(BaseDraftWorker):
             src=world_group.first_rank,
         )[0]
 
-    def _draft_single_rank(self, model_worker_batch: ModelWorkerBatch):
+    def _draft_single_rank(self, batch: ScheduleBatch):
         if self._is_root_draft_rank:
             try:
-                draft_input: EagleDraftInput = model_worker_batch.spec_info
+                draft_input: EagleDraftInput = batch.spec_info
                 forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
                     self.req_to_token_pool,
-                    model_worker_batch,
+                    batch,
                     self.cuda_graph_runner,
                     self.draft_runner,
                     self.topk,
@@ -330,11 +330,12 @@ class EagleDraftWorker(BaseDraftWorker):
                         and self.speculative_num_steps > 1
                     ):
                         self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        
                     parent_list, top_scores_index, draft_tokens = self.draft_forward(
                         forward_batch
                     )
 
-                if model_worker_batch.forward_mode.is_idle():
+                if batch.forward_mode.is_idle():
                     spec_info = EagleVerifyInput.create_idle_input(
                         self.topk,
                         self.speculative_num_steps,
@@ -560,14 +561,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def draft(self, model_worker_batch: ModelWorkerBatch):
+    def draft(self, batch: ScheduleBatch):
         if self._single_rank_draft_mode:
-            return self._draft_single_rank(model_worker_batch)
+            return self._draft_single_rank(batch)
 
-        draft_input: EagleDraftInput = model_worker_batch.spec_info
+        draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
-            model_worker_batch,
+            batch,
             self.cuda_graph_runner,
             self.draft_runner,
             self.topk,
@@ -616,8 +617,8 @@ class EagleDraftWorker(BaseDraftWorker):
             parent_list,
             top_scores_index,
             draft_tokens,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
+            batch.seq_lens,
+            batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -740,7 +741,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def _draft_extend_for_prefill(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
@@ -777,24 +778,31 @@ class EagleDraftWorker(BaseDraftWorker):
 
         batch.spec_info = next_draft_input
 
-        # Run forward
+        is_standalone = self.speculative_algorithm.is_standalone()
+        batch.capture_hidden_mode = (
+            CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.LAST
+        )
+        batch.return_hidden_states_before_norm = not is_standalone
+
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
+
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
+
         logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
-        # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+
         return next_draft_input
 
     def _draft_extend_for_decode(
-        self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         if self._single_rank_draft_mode and not self._is_root_draft_rank:
             return
@@ -960,62 +968,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def _make_worker_batch(
-        self,
-        batch,
-        capture_hidden_mode=None,
-        return_hidden_states_before_norm=None,
-    ):
-        worker_batch = (
-            batch.get_model_worker_batch()
-            if hasattr(batch, "get_model_worker_batch")
-            else batch
-        )
-
-        if capture_hidden_mode is not None:
-            worker_batch.capture_hidden_mode = capture_hidden_mode
-
-        if return_hidden_states_before_norm is not None:
-            worker_batch.return_hidden_states_before_norm = (
-                return_hidden_states_before_norm
-            )
-
-        return worker_batch
-
-    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
-        batch = model_worker_batch  # keep the scheduler batch canonical
+    def forward_batch_generation(self, batch: ScheduleBatch):
+        # EAGLE v2 keeps ScheduleBatch as the canonical mutable scheduler state.
+        # ForwardBatch.init_new is responsible for materializing ModelWorkerBatch
+        # when the lower-level runner needs it.
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
-            target_batch = self._make_worker_batch(
-                batch,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                return_hidden_states_before_norm=True,
+            # Target prefill: EAGLE3 needs full target hidden states.
+            target_capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.FULL
             )
-
-            batch_output = self.target_worker.forward_batch_generation(target_batch)
+            batch.capture_hidden_mode = target_capture_mode
+            batch.return_hidden_states_before_norm = (
+                target_capture_mode != CaptureHiddenMode.NULL
+            )
+            
+            batch_output = self.target_worker.forward_batch_generation(batch)
 
             target_hidden_states = getattr(batch_output.logits_output, "hidden_states", None)
-            if target_hidden_states is None:
+            if target_capture_mode != CaptureHiddenMode.NULL and target_hidden_states is None:
                 raise RuntimeError(
                     "EAGLE3 target prefill did not return hidden_states. "
-                    f"capture_hidden_mode={target_batch.capture_hidden_mode}, "
-                    f"return_hidden_states_before_norm="
-                    f"{target_batch.return_hidden_states_before_norm}, "
+                    f"capture_hidden_mode={target_capture_mode}, "
                     f"logits_output_type={type(batch_output.logits_output)}"
-                )
-
-            # Draft prefill
-            draft_prefill_batch = self._make_worker_batch(
-                batch,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-                return_hidden_states_before_norm=True,
             )
 
+            # Draft prefill
             with self.draft_worker.draft_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
-                        draft_prefill_batch,
+                        batch,
                         target_hidden_states,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
@@ -1026,39 +1010,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         
         else:
             if batch.spec_info is None:
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.LAST
+                )
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=self.target_worker.model_config.spec_hidden_size,
                     dtype=self.target_worker.model_config.dtype,
                     topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=capture_mode,
                 )
 
-            # Draft decode gets a clean worker batch.
-            draft_batch = self._make_worker_batch(batch)
-
             with self.draft_worker.draft_context():
-                verify_input: EagleVerifyInput = self.draft_worker.draft(draft_batch)
+                verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
 
             assert verify_input.is_verify_input()
 
-            # Verify gets a separate clean worker batch.
-            verify_batch = self._make_worker_batch(batch)
-            verify_batch.spec_info = verify_input
+            if self.plan_stream:
+                self._draft_done_event = torch.get_device_module(self.device).Event()
+                self._draft_done_event.record()
 
-            batch_output = self.verify(verify_batch)
+            batch.spec_info = verify_input
 
-            # Draft KV-cache fill should continue from the verify batch because
-            # verify preparation mutates input_ids/out_cache_loc/forward_mode.
+            batch_output = self.verify(batch)
+
             with self.draft_worker.draft_context():
-                self.draft_worker._draft_extend_for_decode(
-                    verify_batch,
-                    batch_output,
-                )
+                self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
 
-    def verify(self, batch: ModelWorkerBatch):
+    def verify(self, batch: ScheduleBatch):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -1070,6 +1053,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput = batch.spec_info
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
+
+        target_capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = target_capture_mode
+        batch.return_hidden_states_before_norm = (
+            target_capture_mode != CaptureHiddenMode.NULL
+        )
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
