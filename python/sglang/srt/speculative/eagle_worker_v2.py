@@ -1,6 +1,9 @@
+import copy
 import contextlib
 import logging
 import time
+import traceback
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -49,11 +52,13 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    SingleRankDraftGroup,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
+    single_rank_draft_context,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
@@ -66,6 +71,7 @@ from sglang.srt.utils.common import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
@@ -73,6 +79,14 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _BroadcastedEagleDraftResult:
+    ok: bool
+    payload: Optional[dict] = None
+    draft_proposal_time: float = 0.0
+    error: Optional[str] = None
 
 
 def _get_plan_stream(
@@ -118,6 +132,15 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self._single_rank_draft_mode = (
+            server_args.speculative_draft_tp_size == 1 and server_args.tp_size > 1
+        )
+        self._is_root_draft_rank = tp_rank == 0
+        self._local_draft_tp_group = (
+            SingleRankDraftGroup(target_worker.world_group)
+            if self._single_rank_draft_mode
+            else None
+        )
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
@@ -130,35 +153,72 @@ class EagleDraftWorker(BaseDraftWorker):
             target_worker.get_memory_pool()
         )
 
-        # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
+        if self._single_rank_draft_mode:
+            draft_args = copy.copy(server_args)
+            draft_args.tp_size = 1
+            draft_args.ep_size = 1
+            draft_args.enable_dp_attention = False
+            draft_args.speculative_draft_tp_size = 1
+            draft_args.context_length = target_worker.model_runner.model_config.context_len
+            draft_args.disable_cuda_graph = True
+            if self._is_root_draft_rank:
+                with (
+                    single_rank_draft_context(self._local_draft_tp_group),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    self.draft_worker = TpModelWorker(
+                        server_args=draft_args,
+                        gpu_id=gpu_id,
+                        tp_rank=0,
+                        pp_rank=0,  # FIXME
+                        dp_rank=dp_rank,
+                        moe_ep_rank=moe_ep_rank,
+                        attn_cp_rank=attn_cp_rank,
+                        moe_dp_rank=moe_dp_rank,
+                        nccl_port=nccl_port,
+                        is_draft_worker=True,
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        memory_pool_config=target_worker.model_runner.memory_pool_config,
+                    )
+                self.draft_runner = self.draft_worker.model_runner
+            else:
+                self.draft_worker = None
+                self.draft_runner = None
         else:
-            ctx = empty_context()
-        with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             # Init draft worker
-            self.draft_worker = TpModelWorker(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
-                nccl_port=nccl_port,
-                is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
-            )
+            if (
+                server_args.enable_dp_attention
+                and self.speculative_algorithm.is_eagle3()
+            ):
+                ctx = draft_tp_context(get_attention_tp_group())
+            else:
+                ctx = empty_context()
+            with (
+                ctx
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                # Init draft worker
+                self.draft_worker = TpModelWorker(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    pp_rank=0,  # FIXME
+                    dp_rank=dp_rank,
+                    moe_ep_rank=moe_ep_rank,
+                    attn_cp_rank=attn_cp_rank,
+                    moe_dp_rank=moe_dp_rank,
+                    nccl_port=nccl_port,
+                    is_draft_worker=True,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    memory_pool_config=target_worker.model_runner.memory_pool_config,
+                )
 
-        # Alias for better readability
-        self.draft_runner = self.draft_worker.model_runner
+            # Alias for better readability
+            self.draft_runner = self.draft_worker.model_runner
         self.eagle_use_aux_hidden_state = False
-        if self.speculative_algorithm.is_eagle3():
+        if self.draft_runner is not None and self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
                 self.draft_runner.model_config.hf_config, "eagle_config", {}
             )
@@ -169,19 +229,187 @@ class EagleDraftWorker(BaseDraftWorker):
         self.init_lm_head()
 
         # Init attention backend and cuda graphs
-        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
+        if self.draft_runner is not None:
+            self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            empty_context
+            if self._single_rank_draft_mode
+            else (draft_tp_context if server_args.enable_dp_attention else empty_context)
         )
-        with self.draft_tp_context(
-            self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with self.draft_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @contextmanager
+    def draft_context(self):
+        if self.draft_worker is None or self._single_rank_draft_mode:
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                yield
+            return
+
+        with self.draft_tp_context(
+            self.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            yield
+
+    def _serialize_verify_input(self, spec_info: EagleVerifyInput) -> dict:
+        return {
+            "draft_token": spec_info.draft_token.detach().cpu(),
+            "custom_mask": spec_info.custom_mask.detach().cpu(),
+            "positions": spec_info.positions.detach().cpu(),
+            "retrieve_index": spec_info.retrieve_index.detach().cpu(),
+            "retrieve_next_token": spec_info.retrieve_next_token.detach().cpu(),
+            "retrieve_next_sibling": spec_info.retrieve_next_sibling.detach().cpu(),
+            "retrieve_cum_len": (
+                None if spec_info.retrieve_cum_len is None else spec_info.retrieve_cum_len.detach().cpu()
+            ),
+            "spec_steps": spec_info.spec_steps,
+            "topk": spec_info.topk,
+            "draft_token_num": spec_info.draft_token_num,
+            "capture_hidden_mode": spec_info.capture_hidden_mode,
+            "seq_lens_sum": spec_info.seq_lens_sum,
+            "seq_lens_cpu": (
+                None if spec_info.seq_lens_cpu is None else spec_info.seq_lens_cpu.detach().cpu()
+            ),
+        }
+
+    def _deserialize_verify_input(self, payload: dict) -> EagleVerifyInput:
+        def to_device(tensor: Optional[torch.Tensor]):
+            return None if tensor is None else tensor.to(self.device)
+
+        return EagleVerifyInput(
+            draft_token=to_device(payload["draft_token"]),
+            custom_mask=to_device(payload["custom_mask"]),
+            positions=to_device(payload["positions"]),
+            retrieve_index=to_device(payload["retrieve_index"]),
+            retrieve_next_token=to_device(payload["retrieve_next_token"]),
+            retrieve_next_sibling=to_device(payload["retrieve_next_sibling"]),
+            retrieve_cum_len=to_device(payload["retrieve_cum_len"]),
+            spec_steps=payload["spec_steps"],
+            topk=payload["topk"],
+            draft_token_num=payload["draft_token_num"],
+            capture_hidden_mode=payload["capture_hidden_mode"],
+            seq_lens_sum=payload["seq_lens_sum"],
+            seq_lens_cpu=to_device(payload["seq_lens_cpu"]),
+        )
+
+    def _broadcast_draft_result(self, payload: list[_BroadcastedEagleDraftResult]) -> _BroadcastedEagleDraftResult:
+        world_group = self.target_worker.world_group
+        return broadcast_pyobj(
+            payload,
+            world_group.rank,
+            world_group.cpu_group,
+            src=world_group.first_rank,
+        )[0]
+
+    def _draft_single_rank(self, model_worker_batch: ModelWorkerBatch):
+        if self._is_root_draft_rank:
+            try:
+                draft_input: EagleDraftInput = model_worker_batch.spec_info
+                forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+                    self.req_to_token_pool,
+                    model_worker_batch,
+                    self.cuda_graph_runner,
+                    self.draft_runner,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+
+                if can_cuda_graph:
+                    parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
+                        forward_batch,
+                    )
+                else:
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and self.speculative_num_steps > 1
+                    ):
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                    parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                        forward_batch
+                    )
+
+                if model_worker_batch.forward_mode.is_idle():
+                    spec_info = EagleVerifyInput.create_idle_input(
+                        self.topk,
+                        self.speculative_num_steps,
+                        self.speculative_num_draft_tokens,
+                    )
+                else:
+                    tree_mask_buf, position_buf = (
+                        self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+                    )
+                    (
+                        tree_mask,
+                        position,
+                        retrieve_index,
+                        retrieve_next_token,
+                        retrieve_next_sibling,
+                        draft_tokens,
+                    ) = build_tree_kernel_efficient(
+                        draft_input.verified_id,
+                        parent_list,
+                        top_scores_index,
+                        draft_tokens,
+                        model_worker_batch.seq_lens,
+                        model_worker_batch.seq_lens_sum,
+                        self.topk,
+                        self.speculative_num_steps,
+                        self.speculative_num_draft_tokens,
+                        self.tree_mask_mode,
+                        tree_mask_buf,
+                        position_buf,
+                    )
+                    spec_info = EagleVerifyInput(
+                        draft_token=draft_tokens,
+                        custom_mask=tree_mask,
+                        positions=position,
+                        retrieve_index=retrieve_index,
+                        retrieve_next_token=retrieve_next_token,
+                        retrieve_next_sibling=retrieve_next_sibling,
+                        retrieve_cum_len=None,
+                        spec_steps=self.speculative_num_steps,
+                        topk=self.topk,
+                        draft_token_num=self.speculative_num_draft_tokens,
+                        capture_hidden_mode=None,
+                        seq_lens_sum=None,
+                        seq_lens_cpu=None,
+                    )
+
+                payload = [
+                    _BroadcastedEagleDraftResult(
+                        ok=True,
+                        payload=self._serialize_verify_input(spec_info),
+                    )
+                ]
+            except Exception:
+                logger.exception("EAGLE3 single-rank draft failed on root rank.")
+                payload = [
+                    _BroadcastedEagleDraftResult(
+                        ok=False,
+                        error=traceback.format_exc(),
+                    )
+                ]
+
+            broadcasted = self._broadcast_draft_result(payload)
+            if not broadcasted.ok:
+                raise RuntimeError(
+                    "EAGLE3 single-rank draft failed on root rank:\n"
+                    f"{broadcasted.error}"
+                )
+            return self._deserialize_verify_input(broadcasted.payload)
+
+        broadcasted = self._broadcast_draft_result([])
+        if not broadcasted.ok:
+            raise RuntimeError(
+                "EAGLE3 single-rank draft failed on root rank:\n"
+                f"{broadcasted.error}"
+            )
+        return self._deserialize_verify_input(broadcasted.payload)
 
     def init_token_map(self):
         # Load hot token ids
@@ -200,6 +428,9 @@ class EagleDraftWorker(BaseDraftWorker):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        if self.draft_worker is None:
+            return
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
@@ -228,6 +459,11 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_runner.model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
+        if self.draft_worker is None:
+            self.draft_attn_backend = None
+            self.draft_extend_attn_backend = None
+            return
+
         # Create multi-step attn backends and cuda graph runners
 
         self.has_prefill_wrapper_verify = False
@@ -255,6 +491,9 @@ class EagleDraftWorker(BaseDraftWorker):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
+
+        if self.draft_worker is None:
+            return
 
         if self.server_args.disable_cuda_graph:
             return
@@ -321,6 +560,9 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        if self._single_rank_draft_mode:
+            return self._draft_single_rank(model_worker_batch)
+
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -510,6 +752,8 @@ class EagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        if self._single_rank_draft_mode and not self._is_root_draft_rank:
+            return None
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             pt = 0
@@ -551,6 +795,9 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
+        if self._single_rank_draft_mode and not self._is_root_draft_rank:
+            return
+
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -655,6 +902,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self._single_rank_draft_mode = (
+            server_args.speculative_draft_tp_size == 1 and server_args.tp_size > 1
+        )
+        self._is_root_draft_rank = tp_rank == 0
+        self._local_draft_tp_group = (
+            SingleRankDraftGroup(target_worker.world_group)
+            if self._single_rank_draft_mode
+            else None
+        )
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -704,9 +960,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with self.draft_worker.draft_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -725,9 +979,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with self.draft_worker.draft_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
@@ -741,9 +993,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with self.draft_worker.draft_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )

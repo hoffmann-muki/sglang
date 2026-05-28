@@ -3784,12 +3784,12 @@ class ServerArgs:
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
         elif (
-            self.speculative_algorithm != "FAST_DLLM_V2"
+            self.speculative_algorithm not in ("FAST_DLLM_V2", "EAGLE3")
             and self.speculative_draft_tp_size is not None
         ):
             raise ValueError(
                 "--speculative-draft-tp-size is currently only supported for "
-                "TLI, CO_DRAFT, and FAST_DLLM_V2 speculative decoding."
+                "TLI, CO_DRAFT, FAST_DLLM_V2, and EAGLE3 speculative decoding."
             )
 
         if self.speculative_adaptive:

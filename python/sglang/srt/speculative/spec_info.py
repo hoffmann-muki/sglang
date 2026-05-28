@@ -101,6 +101,15 @@ class SpeculativeAlgorithm(Enum):
 
             return FastDllmV2Worker
 
+        if (
+            self.is_eagle3()
+            and server_args.speculative_draft_tp_size == 1
+            and server_args.tp_size > 1
+        ):
+            from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+
+            return EAGLEWorkerV2
+
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker
             if enable_overlap:
