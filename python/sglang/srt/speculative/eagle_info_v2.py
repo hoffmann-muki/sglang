@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Any
 
+from python.sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 import torch
 import torch.nn.functional as F
 import triton
@@ -55,6 +57,7 @@ if is_cuda():
         tree_speculative_sampling_target_only,
     )
 
+logger = logging.getLogger(__name__)
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -280,6 +283,30 @@ class EagleVerifyInputV2Mixin:
             batch.prefix_lens = batch.seq_lens_cpu.tolist()
             batch.extend_num_tokens = bs * verify_num_tokens
 
+            logger.warning(
+                "[EAGLE3 VERIFY SB BEFORE FB] "
+                "mode=%s bs=%s draft_token_num=%s "
+                "input_ids.numel=%s input_ids.shape=%s "
+                "extend_lens=%s prefix_lens=%s extend_num_tokens=%s "
+                "seq_lens=%s seq_lens_cpu=%s seq_lens_sum=%s "
+                "out_cache_loc.shape=%s spec_positions.shape=%s",
+                batch.forward_mode,
+                bs,
+                self.draft_token_num,
+                batch.input_ids.numel() if batch.input_ids is not None else None,
+                tuple(batch.input_ids.shape) if batch.input_ids is not None else None,
+                batch.extend_lens,
+                batch.prefix_lens,
+                batch.extend_num_tokens,
+                batch.seq_lens.detach().cpu().tolist(),
+                batch.seq_lens_cpu.tolist()
+                if hasattr(batch.seq_lens_cpu, "tolist")
+                else batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+                tuple(batch.out_cache_loc.shape) if batch.out_cache_loc is not None else None,
+                tuple(self.positions.shape) if self.positions is not None else None,
+            )
+
             if batch.input_ids.numel() != batch.extend_num_tokens:
                 raise RuntimeError(
                     "EAGLE3 target verify metadata mismatch: "
@@ -341,9 +368,25 @@ class EagleVerifyInputV2Mixin:
             target_worker.model_runner.graph_runner
             and target_worker.model_runner.graph_runner.can_run(forward_batch)
         )
+        logger.warning(
+            "[EAGLE3 VERIFY PLAN DECISION] "
+            "can_run_cuda_graph=%s graph_runner=%s "
+            "fb.mode=%s fb.batch_size=%s fb.input_tokens=%s",
+            can_run_cuda_graph,
+            type(target_worker.model_runner.graph_runner).__name__
+            if target_worker.model_runner.graph_runner is not None
+            else None,
+            forward_batch.forward_mode,
+            forward_batch.batch_size,
+            forward_batch.input_ids.numel()
+            if forward_batch.input_ids is not None
+            else None,
+        )
         if can_run_cuda_graph:
+            logger.warning("[EAGLE3 VERIFY PLAN] using graph_runner.replay_prepare")
             target_worker.model_runner.graph_runner.replay_prepare(forward_batch)
         else:
+            logger.warning("[EAGLE3 VERIFY PLAN] using attn_backend.init_forward_metadata")
             if not batch.forward_mode.is_idle():
                 target_worker.model_runner.attn_backend.init_forward_metadata(
                     forward_batch

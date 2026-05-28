@@ -1114,6 +1114,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        logger.warning(
+            "[EAGLE3 VERIFY BEFORE TARGET FORWARD] "
+            "can_run_cuda_graph=%s skip_attn_backend_init=True "
+            "fb.mode=%s fb.input_tokens=%s fb.positions.shape=%s "
+            "attn_metadata_type=%s",
+            can_run_cuda_graph,
+            verify_forward_batch.forward_mode,
+            verify_forward_batch.input_ids.numel()
+            if verify_forward_batch.input_ids is not None
+            else None,
+            tuple(verify_forward_batch.positions.shape)
+            if verify_forward_batch.positions is not None
+            else None,
+            type(self.target_worker.model_runner.attn_backend.forward_metadata).__name__
+            if self.target_worker.model_runner.attn_backend.forward_metadata is not None
+            else None,
+        )
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
