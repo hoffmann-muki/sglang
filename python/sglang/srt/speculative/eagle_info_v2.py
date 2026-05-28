@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from examples.frontend_language.quick_start.azure_openai_example_chat import batch
 import torch
 import torch.nn.functional as F
 import triton
@@ -212,7 +213,7 @@ class EagleDraftInputV2Mixin:
 
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
         draft_model_runner: Any,
@@ -223,18 +224,25 @@ class EagleDraftInputV2Mixin:
 
         batch.spec_info = self
         batch.input_ids = predict
-        batch.seq_lens = batch.seq_lens + num_draft_tokens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+
+        batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
+
+        if batch.input_ids.numel() != batch.extend_num_tokens:
+            raise RuntimeError(
+                "EAGLE3 draft extend metadata mismatch: "
+                f"input_ids.numel()={batch.input_ids.numel()}, "
+                f"extend_num_tokens={batch.extend_num_tokens}, "
+                f"extend_lens={batch.extend_lens}"
+        )
 
         is_standalone = draft_model_runner.spec_algorithm.is_standalone()
         batch.capture_hidden_mode = (
             CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.FULL
         )
         batch.return_hidden_states_before_norm = not is_standalone
+
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
@@ -243,9 +251,14 @@ class EagleDraftInputV2Mixin:
 
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
 
+        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
+        forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        
         return forward_batch
 
 
@@ -254,13 +267,28 @@ class EagleVerifyInputV2Mixin:
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         target_worker: TpModelWorker,
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
             bs = len(batch.req_pool_indices)
+
             batch.input_ids = self.draft_token
+
+            verify_num_tokens = self.draft_token_num
+            batch.extend_lens = [verify_num_tokens for _ in range(bs)]
+            batch.prefix_lens = batch.seq_lens_cpu.tolist()
+            batch.extend_num_tokens = bs * verify_num_tokens
+
+            if batch.input_ids.numel() != batch.extend_num_tokens:
+                raise RuntimeError(
+                    "EAGLE3 target verify metadata mismatch: "
+                    f"input_ids.numel()={batch.input_ids.numel()}, "
+                    f"extend_num_tokens={batch.extend_num_tokens}, "
+                    f"extend_lens={batch.extend_lens}"
+            )
+
             device = batch.input_ids.device
             batch.out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
@@ -297,6 +325,14 @@ class EagleVerifyInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if target_worker.model_runner.spec_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        batch.capture_hidden_mode = capture_mode
+        batch.return_hidden_states_before_norm = not capture_mode == CaptureHiddenMode.NULL
         batch.spec_info = self
 
         forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
