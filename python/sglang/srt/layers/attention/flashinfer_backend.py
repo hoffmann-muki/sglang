@@ -873,34 +873,34 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            try:
+                qo_last = int(self.qo_indptr[0][forward_batch.batch_size].item())
+            except Exception:
+                qo_last = None
+
+            logger.warning(
+                "[FLASHINFER FORWARD_EXTEND BEFORE RAGGED] "
+                "mode=%s input_tokens=%s metadata=%s use_ragged=%s qo_indptr_last=%s "
+                "extend_num_tokens=%s extend_seq_lens=%s",
+                forward_batch.forward_mode,
+                forward_batch.input_ids.numel()
+                if forward_batch.input_ids is not None
+                else None,
+                type(self.forward_metadata).__name__
+                if self.forward_metadata is not None
+                else None,
+                getattr(self.forward_metadata, "use_ragged", None),
+                qo_last,
+                forward_batch.extend_num_tokens,
+                forward_batch.extend_seq_lens.detach().cpu().tolist()
+                if forward_batch.extend_seq_lens is not None
+                else None,
+            )
+            
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
-                # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                try:
-                    qo_last = int(self.qo_indptr[0][forward_batch.batch_size].item())
-                except Exception:
-                    qo_last = None
-
-                logger.warning(
-                    "[FLASHINFER FORWARD_EXTEND BEFORE RAGGED] "
-                    "mode=%s input_tokens=%s metadata=%s use_ragged=%s qo_indptr_last=%s "
-                    "extend_num_tokens=%s extend_seq_lens=%s",
-                    forward_batch.forward_mode,
-                    forward_batch.input_ids.numel()
-                    if forward_batch.input_ids is not None
-                    else None,
-                    type(self.forward_metadata).__name__
-                    if self.forward_metadata is not None
-                    else None,
-                    getattr(self.forward_metadata, "use_ragged", None),
-                    qo_last,
-                    forward_batch.extend_num_tokens,
-                    forward_batch.extend_seq_lens.detach().cpu().tolist()
-                    if forward_batch.extend_seq_lens is not None
-                    else None,
-                )
-
+                # https://github.com/flashinfer-ai/flashinfer/issues/1048                
                 o = self.prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
