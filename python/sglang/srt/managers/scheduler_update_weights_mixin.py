@@ -214,9 +214,8 @@ class SchedulerUpdateWeightsMixin:
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
             draft_runner = getattr(self.draft_worker, "draft_runner", None)
-            if draft_runner is None:
-                draft_runner = self.draft_worker.model_runner
-            draft_runner.save_remote_model(draft_url)
+            if draft_runner is not None:
+                draft_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self: Scheduler, params):
         self.tp_worker.model_runner.save_sharded_model(
