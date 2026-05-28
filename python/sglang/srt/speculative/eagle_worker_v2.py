@@ -357,8 +357,8 @@ class EagleDraftWorker(BaseDraftWorker):
                         parent_list,
                         top_scores_index,
                         draft_tokens,
-                        model_worker_batch.seq_lens,
-                        model_worker_batch.seq_lens_sum,
+                        batch.seq_lens,
+                        batch.seq_lens_sum,
                         self.topk,
                         self.speculative_num_steps,
                         self.speculative_num_draft_tokens,
@@ -592,7 +592,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
 
-        if model_worker_batch.forward_mode.is_idle():
+        if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
