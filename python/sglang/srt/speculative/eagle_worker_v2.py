@@ -961,46 +961,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        if hasattr(model_worker_batch, "get_model_worker_batch"):
+            model_worker_batch = model_worker_batch.get_model_worker_batch()
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
         ):
             # Target prefill
-            worker_batch = (
-                model_worker_batch.get_model_worker_batch()
-                if hasattr(model_worker_batch, "get_model_worker_batch")
-                else model_worker_batch
-            )
-            worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            worker_batch.return_hidden_states_before_norm = True
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.return_hidden_states_before_norm = True
 
             batch_output = self.target_worker.forward_batch_generation(
-                worker_batch
+                model_worker_batch
             )
 
             target_hidden_states = getattr(batch_output.logits_output, "hidden_states", None)
             if target_hidden_states is None:
                 raise RuntimeError(
                     "EAGLE3 target prefill did not return hidden_states. "
-                    f"capture_hidden_mode={worker_batch.capture_hidden_mode}, "
+                    f"capture_hidden_mode={model_worker_batch.capture_hidden_mode}, "
                     f"return_hidden_states_before_norm="
-                    f"{worker_batch.return_hidden_states_before_norm}, "
+                    f"{model_worker_batch.return_hidden_states_before_norm}, "
                     f"logits_output_type={type(batch_output.logits_output)}"
-                )
+            )
 
             # Draft prefill
-            worker_batch = (
-                model_worker_batch.get_model_worker_batch()
-                if hasattr(model_worker_batch, "get_model_worker_batch")
-                else model_worker_batch
-            )
-            worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            worker_batch.return_hidden_states_before_norm = True
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            model_worker_batch.return_hidden_states_before_norm = True
 
             with self.draft_worker.draft_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
-                        worker_batch,
+                        model_worker_batch,
                         target_hidden_states,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
