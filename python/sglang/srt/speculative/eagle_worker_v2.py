@@ -944,6 +944,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    @property
+    def draft_runner(self):
+        return self._draft_worker.draft_runner
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass

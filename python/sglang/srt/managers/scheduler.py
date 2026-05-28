@@ -1106,8 +1106,11 @@ class Scheduler(
             model_config = draft_runner.model_config
         else:
             # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-            draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
-            model_config = self.draft_worker.model_config
+            draft_runner = getattr(self.draft_worker, "draft_runner", None)
+            if draft_runner is None:
+                draft_runner = self.draft_worker.model_runner
+            draft_token_to_kv_pool = draft_runner.token_to_kv_pool
+            model_config = draft_runner.model_config
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
