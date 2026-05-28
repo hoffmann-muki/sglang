@@ -35,7 +35,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
                 "rms_norm_eps": 1e-06,
                 "tie_word_embeddings": False,
                 "target_hidden_size": None,
-                "vocab_size": 1234,
+                "vocab_size": 32000,
             },
             "speculators_model_type": "qwen3",
             "speculators_version": "1",
@@ -58,7 +58,8 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
         self.assertEqual(config.architectures, ["LlamaForCausalLMEagle3"])
         self.assertEqual(config.model_type, "llama")
         self.assertEqual(config.num_hidden_layers, 1)
-        self.assertEqual(config.draft_vocab_size, 1234)
+        self.assertEqual(config.vocab_size, 1234)
+        self.assertEqual(config.draft_vocab_size, 32000)
         self.assertEqual(config.target_hidden_size, 32)
         self.assertTrue(config.norm_before_residual)
         self.assertEqual(config.speculators_config["hidden_size"], 16)

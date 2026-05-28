@@ -57,8 +57,13 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
         )
 
     llama_config_dict = dict(spec_config)
+    target_vocab_size = config_dict.get("draft_vocab_size")
+    draft_vocab_size = spec_config.get("vocab_size")
+    if target_vocab_size is None:
+        target_vocab_size = draft_vocab_size
+    if draft_vocab_size is None:
+        draft_vocab_size = target_vocab_size
     for key in (
-        "draft_vocab_size",
         "has_no_defaults_at_init",
         "norm_before_residual",
         "speculators_model_type",
@@ -73,6 +78,11 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
 
     if config_dict.get("target_hidden_size") is None:
         llama_config_dict.pop("target_hidden_size", None)
+
+    if target_vocab_size is not None:
+        llama_config_dict["vocab_size"] = target_vocab_size
+    if draft_vocab_size is not None:
+        llama_config_dict["draft_vocab_size"] = draft_vocab_size
 
     llama_config_dict.setdefault("model_type", "llama")
     llama_config_dict["num_hidden_layers"] = 1
