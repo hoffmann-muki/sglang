@@ -973,6 +973,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 worker_batch
             )
 
+            target_hidden_states = getattr(batch_output.logits_output, "hidden_states", None)
+            if target_hidden_states is None:
+                raise RuntimeError(
+                    "EAGLE3 target prefill did not return hidden_states. "
+                    f"capture_hidden_mode={worker_batch.capture_hidden_mode}, "
+                    f"return_hidden_states_before_norm="
+                    f"{worker_batch.return_hidden_states_before_norm}, "
+                    f"logits_output_type={type(batch_output.logits_output)}"
+                )
+
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             model_worker_batch.return_hidden_states_before_norm = True
@@ -981,7 +991,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         worker_batch,
-                        batch_output.logits_output.hidden_states,
+                        target_hidden_states,
                         batch_output.next_token_ids,
                         batch_output.logits_output.mm_input_embeds,
                     )
