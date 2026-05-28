@@ -57,8 +57,8 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
         )
 
     llama_config_dict = dict(spec_config)
-    target_vocab_size = config_dict.get("draft_vocab_size")
-    draft_vocab_size = spec_config.get("vocab_size")
+    target_vocab_size = spec_config.get("vocab_size")
+    draft_vocab_size = config_dict.get("draft_vocab_size")
     if target_vocab_size is None:
         target_vocab_size = draft_vocab_size
     if draft_vocab_size is None:

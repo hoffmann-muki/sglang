@@ -23,7 +23,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
                 "AutoConfig": "remote.Eagle3SpeculatorConfig",
                 "AutoModel": "remote.Eagle3SpeculatorForCausalLM",
             },
-            "draft_vocab_size": 1234,
+            "draft_vocab_size": 32000,
             "has_no_defaults_at_init": True,
             "norm_before_residual": True,
             "speculators_config": {
@@ -35,7 +35,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
                 "rms_norm_eps": 1e-06,
                 "tie_word_embeddings": False,
                 "target_hidden_size": None,
-                "vocab_size": 32000,
+                "vocab_size": 151936,
             },
             "speculators_model_type": "qwen3",
             "speculators_version": "1",
@@ -58,7 +58,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
         self.assertEqual(config.architectures, ["LlamaForCausalLMEagle3"])
         self.assertEqual(config.model_type, "llama")
         self.assertEqual(config.num_hidden_layers, 1)
-        self.assertEqual(config.vocab_size, 1234)
+        self.assertEqual(config.vocab_size, 151936)
         self.assertEqual(config.draft_vocab_size, 32000)
         self.assertEqual(config.target_hidden_size, 32)
         self.assertTrue(config.norm_before_residual)
