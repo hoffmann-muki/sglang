@@ -34,6 +34,7 @@ class TestEagle3SpeculatorConfigLoading(CustomTestCase):
                 "num_key_value_heads": 2,
                 "rms_norm_eps": 1e-06,
                 "tie_word_embeddings": False,
+                "target_hidden_size": None,
                 "vocab_size": 1234,
             },
             "speculators_model_type": "qwen3",

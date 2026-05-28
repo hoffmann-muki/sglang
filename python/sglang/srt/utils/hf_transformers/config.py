@@ -57,10 +57,22 @@ def _load_eagle3_speculator_model(model: str, config_dict: dict):
         )
 
     llama_config_dict = dict(spec_config)
-    for key, value in config_dict.items():
-        if key in {"architectures", "auto_map", "speculators_config"}:
-            continue
-        llama_config_dict.setdefault(key, value)
+    for key in (
+        "draft_vocab_size",
+        "has_no_defaults_at_init",
+        "norm_before_residual",
+        "speculators_model_type",
+        "speculators_version",
+        "target_hidden_size",
+        "torch_dtype",
+        "transformer_layer_config",
+    ):
+        value = config_dict.get(key)
+        if value is not None:
+            llama_config_dict[key] = value
+
+    if config_dict.get("target_hidden_size") is None:
+        llama_config_dict.pop("target_hidden_size", None)
 
     llama_config_dict.setdefault("model_type", "llama")
     llama_config_dict["num_hidden_layers"] = 1
