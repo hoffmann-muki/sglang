@@ -805,9 +805,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         next_draft_input = batch_result.next_draft_input
-        batch.spec_info = next_draft_input
 
         if self._single_rank_draft_mode and not self._is_root_draft_rank:
+            batch.spec_info = next_draft_input
             return
 
         # Batch 2: Draft extend
@@ -881,6 +881,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        batch.spec_info = next_draft_input
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
