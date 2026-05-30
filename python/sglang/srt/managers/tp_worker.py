@@ -453,21 +453,6 @@ class TpModelWorker(BaseTpWorker):
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
-        logger.warning(
-            "[TP FORWARD_BATCH_GENERATION] "
-            "model_worker_batch_is_none=%s is_verify=%s skip_attn_backend_init=%s "
-            "fb.mode=%s fb.input_tokens=%s attn_metadata_type=%s",
-            model_worker_batch is None,
-            is_verify,
-            skip_attn_backend_init,
-            forward_batch.forward_mode if forward_batch is not None else None,
-            forward_batch.input_ids.numel()
-            if forward_batch is not None and forward_batch.input_ids is not None
-            else None,
-            type(self.model_runner.attn_backend.forward_metadata).__name__
-            if self.model_runner.attn_backend.forward_metadata is not None
-            else None,
-        )
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 

@@ -257,6 +257,74 @@ class EagleDraftWorker(BaseDraftWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             yield
 
+    def _get_draft_embedding_vocab_size(self) -> Optional[int]:
+        if self.draft_runner is None:
+            return None
+
+        model = self.draft_runner.model
+        embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
+        if embed_tokens is None:
+            embed_tokens = getattr(model, "embed_tokens", None)
+        return getattr(embed_tokens, "num_embeddings", None)
+
+    def _validate_draft_prefill_token_ids(
+        self,
+        batch: ScheduleBatch,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        if next_token_ids.numel() != len(batch.extend_lens):
+            raise RuntimeError(
+                "EAGLE3 draft prefill received inconsistent next-token metadata. "
+                f"next_token_ids.numel()={next_token_ids.numel()}, "
+                f"batch_size={len(batch.extend_lens)}, "
+                f"extend_lens={batch.extend_lens}"
+            )
+
+        if batch.input_ids is None or batch.input_ids.numel() == 0:
+            return
+
+        if target_hidden_states.shape[0] != batch.input_ids.numel():
+            raise RuntimeError(
+                "EAGLE3 draft prefill hidden-state row count does not match "
+                "the draft input token count. "
+                f"hidden_states.shape={tuple(target_hidden_states.shape)}, "
+                f"input_ids.shape={tuple(batch.input_ids.shape)}, "
+                f"extend_lens={batch.extend_lens}, "
+                f"seq_lens={batch.seq_lens_cpu.tolist() if hasattr(batch.seq_lens_cpu, 'tolist') else batch.seq_lens_cpu}"
+            )
+
+        draft_embedding_vocab_size = self._get_draft_embedding_vocab_size()
+        if draft_embedding_vocab_size is None:
+            return
+
+        ids_min = int(batch.input_ids.min().item())
+        ids_max = int(batch.input_ids.max().item())
+        next_min = int(next_token_ids.min().item()) if next_token_ids.numel() else None
+        next_max = int(next_token_ids.max().item()) if next_token_ids.numel() else None
+
+        if ids_min < 0 or ids_max >= draft_embedding_vocab_size:
+            draft_config = self.draft_runner.model_config
+            draft_hf_config = draft_config.hf_config
+            target_config = self.target_worker.model_runner.model_config
+            raise RuntimeError(
+                "EAGLE3 draft prefill received token ids outside the draft "
+                "embedding vocabulary. This usually means the draft speculator "
+                "config/tokenizer vocabulary does not match the target tokenizer, "
+                "or target token ids need to be translated before the draft "
+                "prefill forward. "
+                f"input_ids_range=[{ids_min}, {ids_max}], "
+                f"next_token_ids_range=[{next_min}, {next_max}], "
+                f"draft_embedding_vocab_size={draft_embedding_vocab_size}, "
+                f"target_model_vocab_size={target_config.vocab_size}, "
+                f"draft_model_config_vocab_size={draft_config.vocab_size}, "
+                f"draft_hf_vocab_size={getattr(draft_hf_config, 'vocab_size', None)}, "
+                f"draft_hf_draft_vocab_size={getattr(draft_hf_config, 'draft_vocab_size', None)}, "
+                f"batch_size={len(batch.extend_lens)}, "
+                f"extend_lens={batch.extend_lens}, "
+                f"seq_lens={batch.seq_lens_cpu.tolist() if hasattr(batch.seq_lens_cpu, 'tolist') else batch.seq_lens_cpu}"
+            )
+
     def _serialize_verify_input(self, spec_info: EagleVerifyInput) -> dict:
         return {
             "draft_token": spec_info.draft_token.detach().cpu(),
@@ -813,6 +881,10 @@ class EagleDraftWorker(BaseDraftWorker):
 
             if mm_input_embeds is not None:
                 forward_batch.mm_input_embeds = mm_input_embeds
+
+            self._validate_draft_prefill_token_ids(
+                batch, target_hidden_states, next_token_ids
+            )
 
             logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(
