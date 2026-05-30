@@ -756,6 +756,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
+            self.forward_metadata = DecodeMetadata(self.decode_cuda_graph_metadata[bs])
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -767,6 +768,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_cuda_graph_metadata[bs], False, False
             )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
@@ -780,6 +784,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_cuda_graph_metadata[bs], False, False
+            )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -792,11 +799,36 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_cuda_graph_metadata[bs], False, False
+            )
         else:
             raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        """
+        Return graph-owned buffers that EAGLE fills after the draft pass.
+
+        FlashInfer's CUDA graph prefill wrapper stores custom-mask data in the
+        `custom_mask_buf` passed at wrapper construction. Giving the tree builder
+        this buffer keeps the dynamic EAGLE verify mask synchronized with the
+        graph metadata prepared before replay.
+        """
+        if not hasattr(self, "cuda_graph_custom_mask"):
+            return [None, None]
+        return [self.cuda_graph_custom_mask, None]
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # FlashInfer replay metadata is fully rebuilt in
+        # init_forward_metadata_replay_cuda_graph using spec_info.custom_mask.
+        # If get_verify_buffers_to_fill_after_draft returned graph-owned buffers,
+        # the tree builder has already written the dynamic mask into them.
+        return
 
     @debug_kernel_api
     def forward_extend(
