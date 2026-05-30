@@ -257,7 +257,7 @@ class EagleDraftWorker(BaseDraftWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             yield
 
-    def _get_draft_embedding_vocab_size(self) -> Optional[int]:
+    def _get_draft_embedding_capacity(self) -> Optional[int]:
         if self.draft_runner is None:
             return None
 
@@ -265,6 +265,9 @@ class EagleDraftWorker(BaseDraftWorker):
         embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
         if embed_tokens is None:
             embed_tokens = getattr(model, "embed_tokens", None)
+        weight = getattr(embed_tokens, "weight", None)
+        if weight is not None:
+            return weight.shape[0]
         return getattr(embed_tokens, "num_embeddings", None)
 
     def _validate_draft_prefill_token_ids(
@@ -294,8 +297,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"seq_lens={batch.seq_lens_cpu.tolist() if hasattr(batch.seq_lens_cpu, 'tolist') else batch.seq_lens_cpu}"
             )
 
-        draft_embedding_vocab_size = self._get_draft_embedding_vocab_size()
-        if draft_embedding_vocab_size is None:
+        draft_embedding_capacity = self._get_draft_embedding_capacity()
+        if draft_embedding_capacity is None:
             return
 
         ids_min = int(batch.input_ids.min().item())
@@ -303,7 +306,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_min = int(next_token_ids.min().item()) if next_token_ids.numel() else None
         next_max = int(next_token_ids.max().item()) if next_token_ids.numel() else None
 
-        if ids_min < 0 or ids_max >= draft_embedding_vocab_size:
+        if ids_min < 0 or ids_max >= draft_embedding_capacity:
             draft_config = self.draft_runner.model_config
             draft_hf_config = draft_config.hf_config
             target_config = self.target_worker.model_runner.model_config
@@ -315,7 +318,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 "prefill forward. "
                 f"input_ids_range=[{ids_min}, {ids_max}], "
                 f"next_token_ids_range=[{next_min}, {next_max}], "
-                f"draft_embedding_vocab_size={draft_embedding_vocab_size}, "
+                f"draft_embedding_capacity={draft_embedding_capacity}, "
                 f"target_model_vocab_size={target_config.vocab_size}, "
                 f"draft_model_config_vocab_size={draft_config.vocab_size}, "
                 f"draft_hf_vocab_size={getattr(draft_hf_config, 'vocab_size', None)}, "
@@ -519,11 +522,46 @@ class EagleDraftWorker(BaseDraftWorker):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        if self.draft_worker is None:
-            return
-
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+
         if self.speculative_algorithm.is_eagle3():
+            if self._single_rank_draft_mode:
+                tp_group = self.target_worker.model_runner.tp_group
+                embed = tp_group.all_gather(embed, dim=0)
+
+                needs_target_head = False
+                if self._is_root_draft_rank and self.draft_runner is not None:
+                    needs_target_head = (
+                        hasattr(self.draft_runner.model, "load_lm_head_from_target")
+                        and self.draft_runner.model.load_lm_head_from_target
+                    )
+                needs_target_head = broadcast_pyobj(
+                    [needs_target_head] if self._is_root_draft_rank else [],
+                    self.target_worker.world_group.rank,
+                    self.target_worker.world_group.cpu_group,
+                    src=self.target_worker.world_group.first_rank,
+                )[0]
+                if needs_target_head:
+                    head = tp_group.all_gather(head, dim=0)
+
+                if self.draft_worker is None:
+                    return
+
+                if needs_target_head:
+                    self.draft_runner.model.set_embed_and_head(embed, head)
+                else:
+                    self.draft_runner.model.set_embed(embed)
+
+                # grab hot token ids
+                if self.draft_runner.model.hot_token_id is not None:
+                    self.hot_token_id = self.draft_runner.model.hot_token_id.to(
+                        embed.device
+                    )
+                return
+
+            if self.draft_worker is None:
+                return
+
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
             if (
@@ -541,6 +579,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
 
         else:
+            if self.draft_worker is None:
+                return
+
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
