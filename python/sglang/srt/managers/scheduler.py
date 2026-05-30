@@ -1480,6 +1480,19 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            processed_last_result_before_schedule = False
+            if (
+                self._needs_single_rank_eagle3_schedule_sync()
+                and self.last_batch
+                and self.result_queue
+            ):
+                # Root-only draft work makes TP ranks vulnerable to choosing
+                # different next decode batch shapes if scheduling overlaps
+                # previous-result processing.
+                pop_and_process()
+                processed_last_result_before_schedule = True
+                barrier(group=self.tp_cpu_group)
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1487,7 +1500,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not processed_last_result_before_schedule:
                 pop_and_process()
 
             # Launch the current batch
@@ -1500,7 +1513,10 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not processed_last_result_before_schedule
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1515,6 +1531,14 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+    def _needs_single_rank_eagle3_schedule_sync(self) -> bool:
+        return (
+            self.enable_overlap
+            and self.spec_algorithm.is_eagle3()
+            and self.server_args.speculative_draft_tp_size == 1
+            and self.tp_size > 1
+        )
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
