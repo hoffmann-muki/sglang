@@ -846,6 +846,17 @@ class EagleDraftWorker(BaseDraftWorker):
             self._sync_single_rank_draft_extend("decode")
             return
 
+        original_forward_mode = batch.forward_mode
+        original_input_ids = batch.input_ids
+        original_out_cache_loc = batch.out_cache_loc
+        original_extend_lens = batch.extend_lens
+        original_prefix_lens = batch.prefix_lens
+        original_extend_num_tokens = batch.extend_num_tokens
+        original_capture_hidden_mode = batch.capture_hidden_mode
+        original_return_hidden_states_before_norm = (
+            batch.return_hidden_states_before_norm
+        )
+
         try:
             # Batch 2: Draft extend
             draft_input = EagleDraftInput(
@@ -925,6 +936,20 @@ class EagleDraftWorker(BaseDraftWorker):
                     "decode", traceback.format_exc(), raise_on_error=False
                 )
             raise
+        finally:
+            # The draft-extend forward temporarily repurposes the scheduler batch
+            # as DRAFT_EXTEND_V2. Restore scheduler-visible decode metadata so TP
+            # ranks that did not run the single-rank draft path stay identical.
+            batch.forward_mode = original_forward_mode
+            batch.input_ids = original_input_ids
+            batch.out_cache_loc = original_out_cache_loc
+            batch.extend_lens = original_extend_lens
+            batch.prefix_lens = original_prefix_lens
+            batch.extend_num_tokens = original_extend_num_tokens
+            batch.capture_hidden_mode = original_capture_hidden_mode
+            batch.return_hidden_states_before_norm = (
+                original_return_hidden_states_before_norm
+            )
 
         if self._single_rank_draft_mode and self._is_root_draft_rank:
             self._sync_single_rank_draft_extend("decode")
