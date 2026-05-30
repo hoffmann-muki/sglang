@@ -910,25 +910,6 @@ class FlashInferAttnBackend(AttentionBackend):
             except Exception:
                 qo_last = None
 
-            logger.warning(
-                "[FLASHINFER FORWARD_EXTEND BEFORE RAGGED] "
-                "mode=%s input_tokens=%s metadata=%s use_ragged=%s qo_indptr_last=%s "
-                "extend_num_tokens=%s extend_seq_lens=%s",
-                forward_batch.forward_mode,
-                forward_batch.input_ids.numel()
-                if forward_batch.input_ids is not None
-                else None,
-                type(self.forward_metadata).__name__
-                if self.forward_metadata is not None
-                else None,
-                getattr(self.forward_metadata, "use_ragged", None),
-                qo_last,
-                forward_batch.extend_num_tokens,
-                forward_batch.extend_seq_lens.detach().cpu().tolist()
-                if forward_batch.extend_seq_lens is not None
-                else None,
-            )
-            
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
@@ -1687,28 +1668,6 @@ class FlashInferMultiStepDraftBackend:
         global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        logger.warning(
-            "[FLASHINFER INIT_METADATA ENTER] "
-            "mode=%s input_tokens=%s seq_lens=%s seq_lens_sum=%s "
-            "extend_num_tokens=%s extend_seq_lens=%s extend_prefix_lens=%s "
-            "spec_info=%s",
-            forward_batch.forward_mode,
-            forward_batch.input_ids.numel()
-            if forward_batch.input_ids is not None
-            else None,
-            forward_batch.seq_lens.detach().cpu().tolist(),
-            forward_batch.seq_lens_sum,
-            forward_batch.extend_num_tokens,
-            forward_batch.extend_seq_lens.detach().cpu().tolist()
-            if forward_batch.extend_seq_lens is not None
-            else None,
-            forward_batch.extend_prefix_lens.detach().cpu().tolist()
-            if forward_batch.extend_prefix_lens is not None
-            else None,
-            type(forward_batch.spec_info).__name__
-            if forward_batch.spec_info is not None
-            else None,
-        )
         kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
