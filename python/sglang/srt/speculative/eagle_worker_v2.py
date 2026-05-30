@@ -804,6 +804,9 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        next_draft_input = batch_result.next_draft_input
+        batch.spec_info = next_draft_input
+
         if self._single_rank_draft_mode and not self._is_root_draft_rank:
             return
 
@@ -869,7 +872,6 @@ class EagleDraftWorker(BaseDraftWorker):
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
-        next_draft_input = batch_result.next_draft_input
         (
             next_draft_input.topk_p,
             next_draft_input.topk_index,

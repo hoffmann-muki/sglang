@@ -572,6 +572,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         batch_result.next_token_ids = next_token_ids_backup
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
+        batch.spec_info = next_draft_input
         (
             next_draft_input.topk_p,
             next_draft_input.topk_index,
