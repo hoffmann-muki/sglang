@@ -307,6 +307,27 @@ class EagleDraftWorker(BaseDraftWorker):
             src=world_group.first_rank,
         )[0]
 
+    def _sync_single_rank_draft_extend(
+        self,
+        phase: str,
+        error: Optional[str] = None,
+        raise_on_error: bool = True,
+    ):
+        if not self._single_rank_draft_mode:
+            return
+
+        payload = (
+            [_BroadcastedEagleDraftResult(ok=error is None, error=error)]
+            if self._is_root_draft_rank
+            else []
+        )
+        broadcasted = self._broadcast_draft_result(payload)
+        if raise_on_error and not broadcasted.ok:
+            raise RuntimeError(
+                f"EAGLE3 single-rank draft {phase} failed on root rank:\n"
+                f"{broadcasted.error}"
+            )
+
     def _draft_single_rank(self, batch: ScheduleBatch):
         if self._is_root_draft_rank:
             try:
@@ -755,49 +776,63 @@ class EagleDraftWorker(BaseDraftWorker):
             next_token_ids: Next token ids generated from the target forward.
         """
         if self._single_rank_draft_mode and not self._is_root_draft_rank:
+            self._sync_single_rank_draft_extend("prefill")
             return None
-        # Construct input_ids
-        if not batch.forward_mode.is_idle():
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], next_token_ids[i].reshape(1))
+
+        try:
+            # Construct input_ids
+            if not batch.forward_mode.is_idle():
+                pt = 0
+                for i, extend_len in enumerate(batch.extend_lens):
+                    input_ids = batch.input_ids[pt : pt + extend_len]
+                    batch.input_ids[pt : pt + extend_len] = torch.cat(
+                        (input_ids[1:], next_token_ids[i].reshape(1))
+                    )
+                    pt += extend_len
+
+            # Construct spec_info
+            next_draft_input = EagleDraftInput(
+                hidden_states=target_hidden_states,
+                verified_id=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+                # draft mode is same with decode mode, only 1 token per req
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+
+            batch.spec_info = next_draft_input
+
+            is_standalone = self.speculative_algorithm.is_standalone()
+            batch.capture_hidden_mode = (
+                CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.LAST
+            )
+            batch.return_hidden_states_before_norm = not is_standalone
+
+            forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+            forward_batch.return_logprob = False
+
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
+
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
+            maybe_detect_nan(
+                logits_output.next_token_logits, "draft_extend_for_prefill"
+            )
+
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
+                probs, self.topk, dim=-1
+            )
+            next_draft_input.hidden_states = logits_output.hidden_states
+        except Exception:
+            if self._single_rank_draft_mode and self._is_root_draft_rank:
+                self._sync_single_rank_draft_extend(
+                    "prefill", traceback.format_exc(), raise_on_error=False
                 )
-                pt += extend_len
+            raise
 
-        # Construct spec_info
-        next_draft_input = EagleDraftInput(
-            hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
-            new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 token per req
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-        )
-
-        batch.spec_info = next_draft_input
-
-        is_standalone = self.speculative_algorithm.is_standalone()
-        batch.capture_hidden_mode = (
-            CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.LAST
-        )
-        batch.return_hidden_states_before_norm = not is_standalone
-
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-        forward_batch.return_logprob = False
-
-        if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
-
-        logits_output = self.draft_runner.forward(forward_batch).logits_output
-        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
-
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
-            probs, self.topk, dim=-1
-        )
-        next_draft_input.hidden_states = logits_output.hidden_states
+        if self._single_rank_draft_mode and self._is_root_draft_rank:
+            self._sync_single_rank_draft_extend("prefill")
 
         return next_draft_input
 
@@ -808,80 +843,91 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if self._single_rank_draft_mode and not self._is_root_draft_rank:
             batch.spec_info = next_draft_input
+            self._sync_single_rank_draft_extend("decode")
             return
 
-        # Batch 2: Draft extend
-        draft_input = EagleDraftInput(
-            hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
-        )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
-
-        # Prepare for draft extend in a separate stream
-        with self.plan_stream_ctx:
-            forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
-                batch,
-                batch_result.next_token_ids,
-                self.speculative_num_draft_tokens,
-                self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
+        try:
+            # Batch 2: Draft extend
+            draft_input = EagleDraftInput(
+                hidden_states=batch_result.logits_output.hidden_states,
+                num_tokens_per_req=self.speculative_num_steps + 1,
+                num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+            )
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
             )
 
-        if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+            # Prepare for draft extend in a separate stream
+            with self.plan_stream_ctx:
+                forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
+                    batch,
+                    batch_result.next_token_ids,
+                    self.speculative_num_draft_tokens,
+                    self.draft_runner,
+                    self.cuda_graph_runner_for_draft_extend,
+                )
+
+            if self.plan_stream:
+                torch.get_device_module(self.device).current_stream().wait_stream(
+                    self.plan_stream
+                )
+
+            if forward_batch.spec_info.accept_length is None:
+                forward_batch.spec_info.accept_length = batch_result.accept_lens
+
+            # Run draft extend batch in the main compute stream
+            can_cuda_graph = (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            )
+            if can_cuda_graph:
+                draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                    forward_batch
+                )
+            else:
+                draft_logits_output = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+
+            maybe_detect_nan(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
             )
 
-        if forward_batch.spec_info.accept_length is None:
-            forward_batch.spec_info.accept_length = batch_result.accept_lens
-
-        # Run draft extend batch in the main compute stream
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
-        )
-        if can_cuda_graph:
-            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
+            # Reorganize the spec info for the next batch
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
             )
-        else:
-            draft_logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                select_index
+            ]
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret_hidden_states = draft_logits_output.hidden_states
 
-        maybe_detect_nan(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
-        )
+            # Construct the return values
+            (
+                next_draft_input.topk_p,
+                next_draft_input.topk_index,
+                next_draft_input.hidden_states,
+            ) = (
+                ret_topk_p,
+                ret_topk_index,
+                ret_hidden_states,
+            )
+            batch.spec_info = next_draft_input
+        except Exception:
+            if self._single_rank_draft_mode and self._is_root_draft_rank:
+                self._sync_single_rank_draft_extend(
+                    "decode", traceback.format_exc(), raise_on_error=False
+                )
+            raise
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-        ret_hidden_states = draft_logits_output.hidden_states
-
-        # Construct the return values
-        (
-            next_draft_input.topk_p,
-            next_draft_input.topk_index,
-            next_draft_input.hidden_states,
-        ) = (
-            ret_topk_p,
-            ret_topk_index,
-            ret_hidden_states,
-        )
-        batch.spec_info = next_draft_input
+        if self._single_rank_draft_mode and self._is_root_draft_rank:
+            self._sync_single_rank_draft_extend("decode")
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
