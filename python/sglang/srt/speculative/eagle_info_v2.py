@@ -420,6 +420,68 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    def _trim_v2_verify_scheduler_batch(
+        self: EagleVerifyInput, batch: ScheduleBatch, real_bs: int
+    ) -> None:
+        keep_indices = list(range(real_bs))
+        keep_indices_device = torch.arange(
+            real_bs, dtype=torch.int64, device=batch.device
+        )
+
+        if len(batch.reqs) < real_bs:
+            raise RuntimeError(
+                "EAGLE3 target verify scheduler request count is smaller than "
+                f"draft tokens: len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
+            )
+
+        if len(batch.reqs) > real_bs:
+            logger.warning(
+                "EAGLE3 target verify received padded scheduler requests; trimming "
+                "tail rows before metadata init. "
+                f"len(reqs)={len(batch.reqs)}, real_bs={real_bs}, "
+                f"forward_mode={batch.forward_mode}."
+            )
+            batch.reqs = batch.reqs[:real_bs]
+            if getattr(batch, "decoding_reqs", None) is not None:
+                batch.decoding_reqs = batch.decoding_reqs[:real_bs]
+            if batch.multimodal_inputs is not None:
+                batch.multimodal_inputs = batch.multimodal_inputs[:real_bs]
+
+            batch.has_stream = any(req.stream for req in batch.reqs)
+            batch.has_grammar = any(req.grammar for req in batch.reqs)
+            batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+            if batch.return_logprob:
+                if batch.top_logprobs_nums is not None:
+                    batch.top_logprobs_nums = [
+                        batch.top_logprobs_nums[i] for i in keep_indices
+                    ]
+                if batch.token_ids_logprobs is not None:
+                    batch.token_ids_logprobs = [
+                        batch.token_ids_logprobs[i] for i in keep_indices
+                    ]
+            else:
+                batch.top_logprobs_nums = None
+                batch.token_ids_logprobs = None
+
+        sampling_info = batch.sampling_info
+        sampling_bs = (
+            sampling_info.temperatures.shape[0]
+            if sampling_info is not None and sampling_info.temperatures is not None
+            else real_bs
+        )
+        if sampling_bs < real_bs:
+            raise RuntimeError(
+                "EAGLE3 target verify sampling metadata is smaller than draft "
+                f"tokens: sampling_bs={sampling_bs}, real_bs={real_bs}."
+            )
+        if sampling_bs > real_bs:
+            logger.warning(
+                "EAGLE3 target verify received padded sampling metadata; trimming "
+                f"tail rows before sampling. sampling_bs={sampling_bs}, "
+                f"real_bs={real_bs}."
+            )
+            sampling_info.filter_batch(keep_indices, keep_indices_device)
+
     def _normalize_v2_verify_batch(self: EagleVerifyInput, batch: ScheduleBatch) -> int:
         if self.draft_token_num <= 0:
             raise RuntimeError(
@@ -434,11 +496,7 @@ class EagleVerifyInputV2Mixin:
             )
 
         real_bs = self.draft_token.numel() // self.draft_token_num
-        if len(batch.reqs) != real_bs:
-            raise RuntimeError(
-                "EAGLE3 target verify scheduler request count does not match "
-                f"draft tokens: len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
-            )
+        self._trim_v2_verify_scheduler_batch(batch, real_bs)
 
         if len(batch.seq_lens) < real_bs:
             raise RuntimeError(

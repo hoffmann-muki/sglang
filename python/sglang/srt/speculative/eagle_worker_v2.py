@@ -413,9 +413,30 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}"
             )
             logical_bs = capacity_bs
+            keep_indices = list(range(logical_bs))
+            keep_indices_device = torch.arange(
+                logical_bs, dtype=torch.int64, device=batch.device
+            )
             batch.reqs = batch.reqs[:logical_bs]
             if getattr(batch, "decoding_reqs", None) is not None:
                 batch.decoding_reqs = batch.decoding_reqs[:logical_bs]
+            batch.has_stream = any(req.stream for req in batch.reqs)
+            batch.has_grammar = any(req.grammar for req in batch.reqs)
+            batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+            if batch.return_logprob:
+                if batch.top_logprobs_nums is not None:
+                    batch.top_logprobs_nums = [
+                        batch.top_logprobs_nums[i] for i in keep_indices
+                    ]
+                if batch.token_ids_logprobs is not None:
+                    batch.token_ids_logprobs = [
+                        batch.token_ids_logprobs[i] for i in keep_indices
+                    ]
+            else:
+                batch.top_logprobs_nums = None
+                batch.token_ids_logprobs = None
+            if batch.sampling_info is not None:
+                batch.sampling_info.filter_batch(keep_indices, keep_indices_device)
             if batch.seq_lens is not None and batch.seq_lens.shape[0] >= logical_bs:
                 batch.seq_lens = batch.seq_lens[:logical_bs]
             if batch.seq_lens_cpu is not None and len(batch.seq_lens_cpu) >= logical_bs:
