@@ -1606,6 +1606,12 @@ class FlashInferMultiStepDraftBackend:
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
+        self.draft_step_offsets = torch.arange(
+            1,
+            self.speculative_num_steps + 1,
+            dtype=torch.int32,
+            device=model_runner.device,
+        ).unsqueeze(1)
         self.attn_backends: List[FlashInferAttnBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
@@ -1649,6 +1655,12 @@ class FlashInferMultiStepDraftBackend:
             next_power_of_2(bs),
             self.page_size,
         )
+        draft_kv_lens = (
+            forward_batch.positions[:bs].to(dtype=torch.int32).unsqueeze(0)
+            + self.draft_step_offsets
+        )
+        self.kv_indptr[:, 0] = 0
+        self.kv_indptr[:, 1 : bs + 1] = torch.cumsum(draft_kv_lens, dim=1)
 
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()

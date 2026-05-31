@@ -177,8 +177,26 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
+        real_bs = batch.batch_size()
+        if len(batch.seq_lens) != real_bs:
+            if len(batch.seq_lens) < real_bs:
+                raise RuntimeError(
+                    "EAGLE3 draft metadata has fewer seq_lens than requests: "
+                    f"len(seq_lens)={len(batch.seq_lens)}, batch_size={real_bs}."
+                )
+
+            batch.seq_lens = batch.seq_lens[:real_bs]
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu = batch.seq_lens_cpu[:real_bs]
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+            else:
+                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+            batch.req_pool_indices = batch.req_pool_indices[:real_bs]
+            if batch.input_ids is not None and batch.input_ids.shape[0] > real_bs:
+                batch.input_ids = batch.input_ids[:real_bs]
+
         if not batch.forward_mode.is_idle():
-            bs = len(batch.seq_lens)
+            bs = real_bs
 
             # Assign cache locations
             batch.out_cache_loc = torch.empty(
