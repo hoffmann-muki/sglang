@@ -89,43 +89,35 @@ def assign_draft_cache_locs_page_size_1(
 class EagleDraftInputV2Mixin:
     def _infer_v2_draft_batch_size(self: EagleDraftInput, batch: ScheduleBatch) -> int:
         """Return the real, unpadded request count for EAGLE3 draft decode."""
-        authoritative_candidates = []
-        for name in ("new_seq_lens", "accept_length"):
-            tensor = getattr(self, name, None)
-            if tensor is not None and (
-                tensor.shape[0] > 0 or batch.forward_mode.is_idle()
-            ):
-                authoritative_candidates.append((name, tensor.shape[0]))
-
-        if authoritative_candidates:
-            sizes = {size for _, size in authoritative_candidates}
-            if len(sizes) != 1:
-                raise RuntimeError(
-                    "EAGLE3 draft input has inconsistent authoritative "
-                    f"batch sizes: {authoritative_candidates}."
-                )
-            return next(iter(sizes))
-
-        tensor_candidates = []
-        for name in ("topk_p", "topk_index", "hidden_states"):
-            tensor = getattr(self, name, None)
-            if tensor is not None and (
-                tensor.shape[0] > 0 or batch.forward_mode.is_idle()
-            ):
-                tensor_candidates.append((name, tensor.shape[0]))
-
-        if tensor_candidates:
-            sizes = {size for _, size in tensor_candidates}
-            if len(sizes) != 1:
-                raise RuntimeError(
-                    "EAGLE3 draft input has inconsistent tensor batch sizes: "
-                    f"{tensor_candidates}."
-                )
-            return next(iter(sizes))
-
         if batch.forward_mode.is_idle():
             return 0
-        return min(len(batch.seq_lens), batch.batch_size())
+
+        # The scheduler request list is the ownership ledger for live requests.
+        # Tensor fields can be padded by CUDA graph / MLP-sync paths and must not
+        # redefine the logical draft batch size.
+        real_bs = batch.batch_size()
+
+        request_level_candidates = []
+        for name in ("new_seq_lens", "accept_length"):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                request_level_candidates.append((name, tensor.shape[0]))
+
+        for name in ("topk_p", "topk_index", "hidden_states"):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                request_level_candidates.append((name, tensor.shape[0]))
+
+        undersized = [
+            (name, size) for name, size in request_level_candidates if size < real_bs
+        ]
+        if undersized:
+            raise RuntimeError(
+                "EAGLE3 draft input has fewer rows than live scheduler requests: "
+                f"{undersized}, len(reqs)={real_bs}."
+            )
+
+        return real_bs
 
     def _slice_v2_draft_tensor(
         self: EagleDraftInput,
@@ -155,13 +147,14 @@ class EagleDraftInputV2Mixin:
         real_bs = self._infer_v2_draft_batch_size(batch)
 
         # These tensors are produced by graph-enabled target/draft forwards and
-        # may carry padded rows. The request-state tensors below must not.
+        # may carry padded rows. Slice them back to the scheduler-owned request
+        # count before building draft attention metadata.
         self._slice_v2_draft_tensor("topk_p", real_bs)
         self._slice_v2_draft_tensor("topk_index", real_bs)
         self._slice_v2_draft_tensor("hidden_states", real_bs)
         self._slice_v2_draft_tensor("verified_id", real_bs)
-        self._slice_v2_draft_tensor("new_seq_lens", real_bs, exact=True)
-        self._slice_v2_draft_tensor("accept_length", real_bs, exact=True)
+        self._slice_v2_draft_tensor("new_seq_lens", real_bs)
+        self._slice_v2_draft_tensor("accept_length", real_bs)
 
         if self.topk_p is not None and self.topk_p.shape[1] != topk:
             raise RuntimeError(
@@ -352,6 +345,13 @@ class EagleDraftInputV2Mixin:
         batch.return_hidden_states_before_norm = not is_standalone
 
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        if forward_batch.batch_size != real_bs:
+            raise RuntimeError(
+                "EAGLE3 draft ForwardBatch was not normalized: "
+                f"forward_batch.batch_size={forward_batch.batch_size}, "
+                f"real_bs={real_bs}, len(seq_lens)={len(batch.seq_lens)}, "
+                f"len(reqs)={len(batch.reqs)}."
+            )
         if (
             draft_model_runner.is_draft_worker
             and draft_model_runner.tp_size == 1
