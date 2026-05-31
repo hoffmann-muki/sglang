@@ -57,6 +57,128 @@ if is_cuda():
     )
 
 logger = logging.getLogger(__name__)
+_LOGGED_DUPLICATE_COMPACTION_CONTEXTS: set[str] = set()
+
+
+def _log_duplicate_compaction_once(context: str, message: str) -> None:
+    if context in _LOGGED_DUPLICATE_COMPACTION_CONTEXTS:
+        return
+    _LOGGED_DUPLICATE_COMPACTION_CONTEXTS.add(context)
+    logger.warning(message)
+
+
+def _get_req_key(req: Any) -> Any:
+    return getattr(req, "rid", None) or id(req)
+
+
+def _unique_request_indices(batch: ScheduleBatch) -> list[int] | None:
+    seen = set()
+    keep_indices = []
+    for i, req in enumerate(batch.reqs):
+        key = _get_req_key(req)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep_indices.append(i)
+    return None if len(keep_indices) == len(batch.reqs) else keep_indices
+
+
+def _filter_list_if_batch_sized(
+    values: list[Any] | None, keep_indices: list[int], original_bs: int
+) -> list[Any] | None:
+    if values is None or len(values) != original_bs:
+        return values
+    return [values[i] for i in keep_indices]
+
+
+def _filter_tensor_if_batch_sized(
+    tensor: torch.Tensor | None,
+    keep_indices: list[int],
+    keep_indices_device: torch.Tensor,
+    original_bs: int,
+) -> torch.Tensor | None:
+    if tensor is None or tensor.shape[0] != original_bs:
+        return tensor
+    if tensor.device.type == "cpu":
+        return tensor[keep_indices]
+    return tensor[keep_indices_device]
+
+
+def _compact_duplicate_scheduler_requests(
+    batch: ScheduleBatch, *, context: str
+) -> tuple[list[int] | None, torch.Tensor | None]:
+    keep_indices = _unique_request_indices(batch)
+    if keep_indices is None:
+        return None, None
+
+    original_bs = len(batch.reqs)
+    keep_indices_device = torch.tensor(
+        keep_indices, dtype=torch.int64, device=batch.device
+    )
+    _log_duplicate_compaction_once(
+        context,
+        "EAGLE3 received duplicate scheduler request rows; compacting by "
+        f"request id before {context}. original_bs={original_bs}, "
+        f"compacted_bs={len(keep_indices)}, forward_mode={batch.forward_mode}.",
+    )
+
+    batch.reqs = [batch.reqs[i] for i in keep_indices]
+    batch.decoding_reqs = _filter_list_if_batch_sized(
+        getattr(batch, "decoding_reqs", None), keep_indices, original_bs
+    )
+    batch.multimodal_inputs = _filter_list_if_batch_sized(
+        getattr(batch, "multimodal_inputs", None), keep_indices, original_bs
+    )
+
+    batch.req_pool_indices = _filter_tensor_if_batch_sized(
+        batch.req_pool_indices, keep_indices, keep_indices_device, original_bs
+    )
+    batch.seq_lens = _filter_tensor_if_batch_sized(
+        batch.seq_lens, keep_indices, keep_indices_device, original_bs
+    )
+    if batch.seq_lens_cpu is not None and len(batch.seq_lens_cpu) == original_bs:
+        batch.seq_lens_cpu = batch.seq_lens_cpu[keep_indices]
+    batch.orig_seq_lens = _filter_tensor_if_batch_sized(
+        batch.orig_seq_lens, keep_indices, keep_indices_device, original_bs
+    )
+    batch.input_ids = _filter_tensor_if_batch_sized(
+        batch.input_ids, keep_indices, keep_indices_device, original_bs
+    )
+    batch.output_ids = _filter_tensor_if_batch_sized(
+        getattr(batch, "output_ids", None),
+        keep_indices,
+        keep_indices_device,
+        original_bs,
+    )
+
+    batch.top_logprobs_nums = _filter_list_if_batch_sized(
+        getattr(batch, "top_logprobs_nums", None), keep_indices, original_bs
+    )
+    batch.token_ids_logprobs = _filter_list_if_batch_sized(
+        getattr(batch, "token_ids_logprobs", None), keep_indices, original_bs
+    )
+
+    batch.has_stream = any(req.stream for req in batch.reqs)
+    batch.has_grammar = any(req.grammar for req in batch.reqs)
+    batch.return_logprob = any(req.return_logprob for req in batch.reqs)
+    if not batch.return_logprob:
+        batch.top_logprobs_nums = None
+        batch.token_ids_logprobs = None
+    if batch.seq_lens_cpu is not None:
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+    elif batch.seq_lens is not None:
+        batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+
+    if batch.sampling_info is not None:
+        sampling_bs = (
+            batch.sampling_info.temperatures.shape[0]
+            if batch.sampling_info.temperatures is not None
+            else original_bs
+        )
+        if sampling_bs == original_bs:
+            batch.sampling_info.filter_batch(keep_indices, keep_indices_device)
+
+    return keep_indices, keep_indices_device
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -144,6 +266,12 @@ class EagleDraftInputV2Mixin:
         self: EagleDraftInput, batch: ScheduleBatch, topk: int
     ) -> int:
         """Remove CUDA-graph padding before building EAGLE3 draft metadata."""
+        keep_indices, keep_indices_device = _compact_duplicate_scheduler_requests(
+            batch, context="draft metadata init"
+        )
+        if keep_indices_device is not None:
+            self.filter_batch(keep_indices_device, has_been_filtered=True)
+
         real_bs = self._infer_v2_draft_batch_size(batch)
 
         # These tensors are produced by graph-enabled target/draft forwards and
@@ -428,40 +556,11 @@ class EagleVerifyInputV2Mixin:
             real_bs, dtype=torch.int64, device=batch.device
         )
 
-        if len(batch.reqs) < real_bs:
+        if len(batch.reqs) != real_bs:
             raise RuntimeError(
-                "EAGLE3 target verify scheduler request count is smaller than "
+                "EAGLE3 target verify scheduler request count does not match "
                 f"draft tokens: len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
             )
-
-        if len(batch.reqs) > real_bs:
-            logger.warning(
-                "EAGLE3 target verify received padded scheduler requests; trimming "
-                "tail rows before metadata init. "
-                f"len(reqs)={len(batch.reqs)}, real_bs={real_bs}, "
-                f"forward_mode={batch.forward_mode}."
-            )
-            batch.reqs = batch.reqs[:real_bs]
-            if getattr(batch, "decoding_reqs", None) is not None:
-                batch.decoding_reqs = batch.decoding_reqs[:real_bs]
-            if batch.multimodal_inputs is not None:
-                batch.multimodal_inputs = batch.multimodal_inputs[:real_bs]
-
-            batch.has_stream = any(req.stream for req in batch.reqs)
-            batch.has_grammar = any(req.grammar for req in batch.reqs)
-            batch.return_logprob = any(req.return_logprob for req in batch.reqs)
-            if batch.return_logprob:
-                if batch.top_logprobs_nums is not None:
-                    batch.top_logprobs_nums = [
-                        batch.top_logprobs_nums[i] for i in keep_indices
-                    ]
-                if batch.token_ids_logprobs is not None:
-                    batch.token_ids_logprobs = [
-                        batch.token_ids_logprobs[i] for i in keep_indices
-                    ]
-            else:
-                batch.top_logprobs_nums = None
-                batch.token_ids_logprobs = None
 
         sampling_info = batch.sampling_info
         sampling_bs = (
@@ -496,6 +595,7 @@ class EagleVerifyInputV2Mixin:
             )
 
         real_bs = self.draft_token.numel() // self.draft_token_num
+        _compact_duplicate_scheduler_requests(batch, context="target verify")
         self._trim_v2_verify_scheduler_batch(batch, real_bs)
 
         if len(batch.seq_lens) < real_bs:

@@ -406,53 +406,13 @@ class EagleDraftWorker(BaseDraftWorker):
         logical_bs = batch.batch_size()
         capacity_bs = self.req_to_token_pool.size
         if logical_bs > capacity_bs:
-            logger.warning(
-                "EAGLE3 draft batch_size exceeds req-pool capacity; trimming tail as padding. "
+            raise RuntimeError(
+                "EAGLE3 draft batch_size exceeds req-pool capacity after "
+                "duplicate-request compaction. "
                 f"logical_bs={logical_bs}, capacity_bs={capacity_bs}, "
                 f"forward_mode={batch.forward_mode}, "
                 f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}"
             )
-            logical_bs = capacity_bs
-            keep_indices = list(range(logical_bs))
-            keep_indices_device = torch.arange(
-                logical_bs, dtype=torch.int64, device=batch.device
-            )
-            batch.reqs = batch.reqs[:logical_bs]
-            if getattr(batch, "decoding_reqs", None) is not None:
-                batch.decoding_reqs = batch.decoding_reqs[:logical_bs]
-            batch.has_stream = any(req.stream for req in batch.reqs)
-            batch.has_grammar = any(req.grammar for req in batch.reqs)
-            batch.return_logprob = any(req.return_logprob for req in batch.reqs)
-            if batch.return_logprob:
-                if batch.top_logprobs_nums is not None:
-                    batch.top_logprobs_nums = [
-                        batch.top_logprobs_nums[i] for i in keep_indices
-                    ]
-                if batch.token_ids_logprobs is not None:
-                    batch.token_ids_logprobs = [
-                        batch.token_ids_logprobs[i] for i in keep_indices
-                    ]
-            else:
-                batch.top_logprobs_nums = None
-                batch.token_ids_logprobs = None
-            if batch.sampling_info is not None:
-                batch.sampling_info.filter_batch(keep_indices, keep_indices_device)
-            if batch.seq_lens is not None and batch.seq_lens.shape[0] >= logical_bs:
-                batch.seq_lens = batch.seq_lens[:logical_bs]
-            if batch.seq_lens_cpu is not None and len(batch.seq_lens_cpu) >= logical_bs:
-                batch.seq_lens_cpu = batch.seq_lens_cpu[:logical_bs]
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-            elif batch.seq_lens is not None:
-                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
-            if (
-                batch.req_pool_indices is not None
-                and batch.req_pool_indices.shape[0] >= logical_bs
-            ):
-                batch.req_pool_indices = batch.req_pool_indices[:logical_bs]
-            if batch.orig_seq_lens is not None and batch.orig_seq_lens.shape[0] >= logical_bs:
-                batch.orig_seq_lens = batch.orig_seq_lens[:logical_bs]
-            if batch.input_ids is not None and batch.input_ids.shape[0] >= logical_bs:
-                batch.input_ids = batch.input_ids[:logical_bs]
 
         actual_bs = forward_batch.batch_size
 
