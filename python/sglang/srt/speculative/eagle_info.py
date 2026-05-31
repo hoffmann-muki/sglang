@@ -1036,20 +1036,55 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
-        if self.hidden_states is None:
-            self.hidden_states = spec_info.hidden_states
-            self.verified_id = spec_info.verified_id
-            self.topk_p = spec_info.topk_p
-            self.topk_index = spec_info.topk_index
-            return
-        if spec_info.hidden_states is None:
-            return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if spec_info is None:
+            raise RuntimeError("Cannot merge EAGLE draft state with None spec_info.")
+
+        def merge_optional_tensor(name: str):
+            lhs = getattr(self, name)
+            rhs = getattr(spec_info, name)
+            if lhs is None:
+                setattr(self, name, rhs)
+            elif rhs is not None:
+                setattr(self, name, torch.cat([lhs, rhs], dim=0))
+
+        def merge_optional_list(name: str):
+            lhs = getattr(self, name)
+            rhs = getattr(spec_info, name)
+            if lhs is None:
+                setattr(self, name, rhs)
+            elif rhs is not None:
+                setattr(self, name, lhs + rhs)
+
+        merge_optional_tensor("hidden_states")
+        merge_optional_tensor("verified_id")
+        merge_optional_tensor("topk_p")
+        merge_optional_tensor("topk_index")
+        merge_optional_tensor("accept_length")
+        merge_optional_list("accept_length_cpu")
+        merge_optional_tensor("seq_lens_for_draft_extend")
+        merge_optional_tensor("req_pool_indices_for_draft_extend")
+        merge_optional_tensor("new_seq_lens")
+
+        lhs_seq_lens_cpu = self.seq_lens_for_draft_extend_cpu
+        rhs_seq_lens_cpu = spec_info.seq_lens_for_draft_extend_cpu
+        if lhs_seq_lens_cpu is None:
+            self.seq_lens_for_draft_extend_cpu = rhs_seq_lens_cpu
+        elif rhs_seq_lens_cpu is not None:
+            if torch.is_tensor(lhs_seq_lens_cpu) and torch.is_tensor(rhs_seq_lens_cpu):
+                self.seq_lens_for_draft_extend_cpu = torch.cat(
+                    [lhs_seq_lens_cpu, rhs_seq_lens_cpu], dim=0
+                )
+            elif not torch.is_tensor(lhs_seq_lens_cpu) and not torch.is_tensor(
+                rhs_seq_lens_cpu
+            ):
+                self.seq_lens_for_draft_extend_cpu = (
+                    lhs_seq_lens_cpu + rhs_seq_lens_cpu
+                )
+            else:
+                raise RuntimeError(
+                    "Cannot merge EAGLE draft seq_lens_for_draft_extend_cpu "
+                    "with mixed tensor/list representations."
+                )
 
 
 @dataclass
