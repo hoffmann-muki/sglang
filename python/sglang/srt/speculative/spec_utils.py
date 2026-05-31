@@ -407,6 +407,7 @@ def generate_draft_decode_kv_indices(
 
     zid = bid * topk + topk_id
     if zid == 0:
+        tl.store(kv_indptr, 0)
         zid = num_seqs * topk
     positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
     base = tl.sum(positions)

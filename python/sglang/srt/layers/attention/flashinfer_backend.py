@@ -1655,17 +1655,30 @@ class FlashInferMultiStepDraftBackend:
 
         # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
+        bad_indptr = indptr_cpu_whole[:, 1:] < indptr_cpu_whole[:, :-1]
+        if torch.any(bad_indptr):
+            bad_step, bad_idx = torch.nonzero(bad_indptr, as_tuple=False)[0].tolist()
+            left = int(indptr_cpu_whole[bad_step, bad_idx].item())
+            right = int(indptr_cpu_whole[bad_step, bad_idx + 1].item())
+            raise RuntimeError(
+                "Invalid EAGLE draft FlashInfer KV indptr: "
+                f"step={bad_step}, index={bad_idx}, "
+                f"kv_indptr[index]={left}, kv_indptr[index + 1]={right}, "
+                f"batch_size={num_seqs}, topk={self.topk}, "
+                f"seq_lens_sum={seq_lens_sum}."
+            )
         global global_override_indptr_cpu
 
-        for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
-            ]
-            global_override_indptr_cpu = indptr_cpu_whole[i]
-            call_fn(i, forward_batch)
-
-        global_override_indptr_cpu = None
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+                forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                    : seq_lens_sum * self.topk + bs * (i + 1)
+                ]
+                global_override_indptr_cpu = indptr_cpu_whole[i]
+                call_fn(i, forward_batch)
+        finally:
+            global_override_indptr_cpu = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices = torch.empty(
