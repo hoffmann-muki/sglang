@@ -1634,9 +1634,23 @@ class FlashInferMultiStepDraftBackend:
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
     ):
+        capacity_num_seqs = (self.kv_indptr.shape[1] - 1) // self.topk
         num_seqs = forward_batch.batch_size
+        if num_seqs > capacity_num_seqs:
+            raise RuntimeError(
+                "EAGLE3 draft FlashInfer metadata received a padded batch. "
+                f"batch_size={num_seqs}, capacity_num_seqs={capacity_num_seqs}, "
+                f"topk={self.topk}. The draft input must be normalized before "
+                "attention metadata is initialized."
+            )
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
+        if forward_batch.positions.shape[0] < bs:
+            raise RuntimeError(
+                "EAGLE3 draft FlashInfer metadata has too few positions: "
+                f"positions.shape={tuple(forward_batch.positions.shape)}, "
+                f"expected_at_least={bs}, batch_size={num_seqs}, topk={self.topk}."
+            )
 
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)

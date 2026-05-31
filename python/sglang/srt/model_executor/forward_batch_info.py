@@ -1025,6 +1025,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
+            self.topk_p_backup = spec_info.topk_p
+            self.topk_index_backup = spec_info.topk_index
+            self.accept_length_backup = spec_info.accept_length
             self.hidden_states_backup = spec_info.hidden_states
             if spec_info.topk_p is not None:
                 spec_info.topk_p = self._pad_tensor_to_size(spec_info.topk_p, bs)
@@ -1091,6 +1094,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             if hasattr(self, "hidden_states_backup"):
                 self.spec_info.hidden_states = self.hidden_states_backup
+            if hasattr(self, "topk_p_backup"):
+                self.spec_info.topk_p = self.topk_p_backup
+            if hasattr(self, "topk_index_backup"):
+                self.spec_info.topk_index = self.topk_index_backup
+            if hasattr(self, "accept_length_backup"):
+                self.spec_info.accept_length = self.accept_length_backup
             if hasattr(self, "output_cache_loc_backup"):
                 self.out_cache_loc = self.output_cache_loc_backup
 

@@ -400,9 +400,11 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def _draft_single_rank(self, batch: ScheduleBatch):
+        draft_input: EagleDraftInput = batch.spec_info
+        draft_input.normalize_v2_draft_batch(batch, self.topk)
+
         if self._is_root_draft_rank:
             try:
-                draft_input: EagleDraftInput = batch.spec_info
                 forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
                     self.req_to_token_pool,
                     batch,

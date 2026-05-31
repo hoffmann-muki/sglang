@@ -87,6 +87,149 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+    def _infer_v2_draft_batch_size(self: EagleDraftInput, batch: ScheduleBatch) -> int:
+        """Return the real, unpadded request count for EAGLE3 draft decode."""
+        authoritative_candidates = []
+        for name in ("new_seq_lens", "accept_length"):
+            tensor = getattr(self, name, None)
+            if tensor is not None and (
+                tensor.shape[0] > 0 or batch.forward_mode.is_idle()
+            ):
+                authoritative_candidates.append((name, tensor.shape[0]))
+
+        if authoritative_candidates:
+            sizes = {size for _, size in authoritative_candidates}
+            if len(sizes) != 1:
+                raise RuntimeError(
+                    "EAGLE3 draft input has inconsistent authoritative "
+                    f"batch sizes: {authoritative_candidates}."
+                )
+            return next(iter(sizes))
+
+        tensor_candidates = []
+        for name in ("topk_p", "topk_index", "hidden_states"):
+            tensor = getattr(self, name, None)
+            if tensor is not None and (
+                tensor.shape[0] > 0 or batch.forward_mode.is_idle()
+            ):
+                tensor_candidates.append((name, tensor.shape[0]))
+
+        if tensor_candidates:
+            sizes = {size for _, size in tensor_candidates}
+            if len(sizes) != 1:
+                raise RuntimeError(
+                    "EAGLE3 draft input has inconsistent tensor batch sizes: "
+                    f"{tensor_candidates}."
+                )
+            return next(iter(sizes))
+
+        if batch.forward_mode.is_idle():
+            return 0
+        return min(len(batch.seq_lens), batch.batch_size())
+
+    def _slice_v2_draft_tensor(
+        self: EagleDraftInput,
+        name: str,
+        real_bs: int,
+        *,
+        exact: bool = False,
+    ) -> None:
+        tensor = getattr(self, name, None)
+        if tensor is None:
+            return
+
+        cur_bs = tensor.shape[0]
+        if cur_bs == real_bs:
+            return
+        if cur_bs < real_bs or exact:
+            raise RuntimeError(
+                "EAGLE3 draft input tensor has an invalid batch dimension: "
+                f"{name}.shape={tuple(tensor.shape)}, real_bs={real_bs}."
+            )
+        setattr(self, name, tensor[:real_bs])
+
+    def normalize_v2_draft_batch(
+        self: EagleDraftInput, batch: ScheduleBatch, topk: int
+    ) -> int:
+        """Remove CUDA-graph padding before building EAGLE3 draft metadata."""
+        real_bs = self._infer_v2_draft_batch_size(batch)
+
+        # These tensors are produced by graph-enabled target/draft forwards and
+        # may carry padded rows. The request-state tensors below must not.
+        self._slice_v2_draft_tensor("topk_p", real_bs)
+        self._slice_v2_draft_tensor("topk_index", real_bs)
+        self._slice_v2_draft_tensor("hidden_states", real_bs)
+        self._slice_v2_draft_tensor("verified_id", real_bs)
+        self._slice_v2_draft_tensor("new_seq_lens", real_bs, exact=True)
+        self._slice_v2_draft_tensor("accept_length", real_bs, exact=True)
+
+        if self.topk_p is not None and self.topk_p.shape[1] != topk:
+            raise RuntimeError(
+                "EAGLE3 draft top-k metadata mismatch: "
+                f"topk_p.shape={tuple(self.topk_p.shape)}, topk={topk}."
+            )
+        if self.topk_index is not None and self.topk_index.shape[1] != topk:
+            raise RuntimeError(
+                "EAGLE3 draft top-k metadata mismatch: "
+                f"topk_index.shape={tuple(self.topk_index.shape)}, topk={topk}."
+            )
+
+        if len(batch.reqs) < real_bs:
+            raise RuntimeError(
+                "EAGLE3 scheduler batch has fewer requests than draft state: "
+                f"len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
+            )
+        if len(batch.reqs) > real_bs:
+            batch.reqs = batch.reqs[:real_bs]
+
+        if len(batch.seq_lens) < real_bs:
+            raise RuntimeError(
+                "EAGLE3 scheduler batch has fewer seq_lens than draft state: "
+                f"len(seq_lens)={len(batch.seq_lens)}, real_bs={real_bs}."
+            )
+        if len(batch.seq_lens) > real_bs:
+            batch.seq_lens = batch.seq_lens[:real_bs]
+
+        if batch.seq_lens_cpu is not None:
+            if len(batch.seq_lens_cpu) < real_bs:
+                raise RuntimeError(
+                    "EAGLE3 scheduler batch has fewer CPU seq_lens than draft "
+                    f"state: len(seq_lens_cpu)={len(batch.seq_lens_cpu)}, "
+                    f"real_bs={real_bs}."
+                )
+            batch.seq_lens_cpu = batch.seq_lens_cpu[:real_bs]
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        else:
+            batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+
+        if batch.req_pool_indices.shape[0] < real_bs:
+            raise RuntimeError(
+                "EAGLE3 scheduler batch has fewer req_pool_indices than draft "
+                f"state: req_pool_indices.shape={tuple(batch.req_pool_indices.shape)}, "
+                f"real_bs={real_bs}."
+            )
+        batch.req_pool_indices = batch.req_pool_indices[:real_bs]
+
+        if batch.orig_seq_lens is not None:
+            if batch.orig_seq_lens.shape[0] < real_bs:
+                raise RuntimeError(
+                    "EAGLE3 scheduler batch has fewer orig_seq_lens than draft "
+                    f"state: orig_seq_lens.shape={tuple(batch.orig_seq_lens.shape)}, "
+                    f"real_bs={real_bs}."
+                )
+            batch.orig_seq_lens = batch.orig_seq_lens[:real_bs]
+
+        if batch.input_ids is not None and batch.forward_mode.is_decode_or_idle():
+            if batch.input_ids.shape[0] < real_bs:
+                raise RuntimeError(
+                    "EAGLE3 scheduler decode batch has fewer input_ids than "
+                    f"draft state: input_ids.shape={tuple(batch.input_ids.shape)}, "
+                    f"real_bs={real_bs}."
+                )
+            batch.input_ids = batch.input_ids[:real_bs]
+
+        return real_bs
+
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
 
@@ -177,23 +320,7 @@ class EagleDraftInputV2Mixin:
         topk: int,
         num_steps: int,
     ):
-        real_bs = batch.batch_size()
-        if len(batch.seq_lens) != real_bs:
-            if len(batch.seq_lens) < real_bs:
-                raise RuntimeError(
-                    "EAGLE3 draft metadata has fewer seq_lens than requests: "
-                    f"len(seq_lens)={len(batch.seq_lens)}, batch_size={real_bs}."
-                )
-
-            batch.seq_lens = batch.seq_lens[:real_bs]
-            if batch.seq_lens_cpu is not None:
-                batch.seq_lens_cpu = batch.seq_lens_cpu[:real_bs]
-                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-            else:
-                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
-            batch.req_pool_indices = batch.req_pool_indices[:real_bs]
-            if batch.input_ids is not None and batch.input_ids.shape[0] > real_bs:
-                batch.input_ids = batch.input_ids[:real_bs]
+        real_bs = self.normalize_v2_draft_batch(batch, topk)
 
         if not batch.forward_mode.is_idle():
             bs = real_bs
@@ -227,6 +354,18 @@ class EagleDraftInputV2Mixin:
         batch.return_hidden_states_before_norm = not is_standalone
 
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        if (
+            draft_model_runner.is_draft_worker
+            and draft_model_runner.tp_size == 1
+            and batch.global_num_tokens is not None
+        ):
+            # Single-rank draft execution is already local. Do not carry target
+            # TP/global-token padding into draft graph selection or metadata.
+            forward_batch.original_global_num_tokens_cpu = None
+            forward_batch.global_num_tokens_cpu = None
+            forward_batch.global_num_tokens_gpu = None
+            forward_batch.global_num_tokens_for_logprob_cpu = None
+            forward_batch.global_num_tokens_for_logprob_gpu = None
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
