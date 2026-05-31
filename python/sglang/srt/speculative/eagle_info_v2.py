@@ -174,13 +174,11 @@ class EagleDraftInputV2Mixin:
                 f"topk_index.shape={tuple(self.topk_index.shape)}, topk={topk}."
             )
 
-        if len(batch.reqs) < real_bs:
+        if len(batch.reqs) != real_bs:
             raise RuntimeError(
-                "EAGLE3 scheduler batch has fewer requests than draft state: "
+                "EAGLE3 scheduler request count does not match draft state: "
                 f"len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
             )
-        if len(batch.reqs) > real_bs:
-            batch.reqs = batch.reqs[:real_bs]
 
         if len(batch.seq_lens) < real_bs:
             raise RuntimeError(
@@ -436,13 +434,11 @@ class EagleVerifyInputV2Mixin:
             )
 
         real_bs = self.draft_token.numel() // self.draft_token_num
-        if len(batch.reqs) < real_bs:
+        if len(batch.reqs) != real_bs:
             raise RuntimeError(
-                "EAGLE3 target verify scheduler batch has fewer requests than "
+                "EAGLE3 target verify scheduler request count does not match "
                 f"draft tokens: len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
             )
-        if len(batch.reqs) > real_bs:
-            batch.reqs = batch.reqs[:real_bs]
 
         if len(batch.seq_lens) < real_bs:
             raise RuntimeError(
