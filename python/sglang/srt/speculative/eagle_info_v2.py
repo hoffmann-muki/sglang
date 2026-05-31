@@ -422,6 +422,67 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+    def _normalize_v2_verify_batch(self: EagleVerifyInput, batch: ScheduleBatch) -> int:
+        if self.draft_token_num <= 0:
+            raise RuntimeError(
+                "EAGLE3 target verify received invalid draft_token_num: "
+                f"{self.draft_token_num}."
+            )
+        if self.draft_token.numel() % self.draft_token_num != 0:
+            raise RuntimeError(
+                "EAGLE3 target verify draft tokens are not divisible by "
+                f"draft_token_num: draft_token.numel()={self.draft_token.numel()}, "
+                f"draft_token_num={self.draft_token_num}."
+            )
+
+        real_bs = self.draft_token.numel() // self.draft_token_num
+        if len(batch.reqs) < real_bs:
+            raise RuntimeError(
+                "EAGLE3 target verify scheduler batch has fewer requests than "
+                f"draft tokens: len(reqs)={len(batch.reqs)}, real_bs={real_bs}."
+            )
+        if len(batch.reqs) > real_bs:
+            batch.reqs = batch.reqs[:real_bs]
+
+        if len(batch.seq_lens) < real_bs:
+            raise RuntimeError(
+                "EAGLE3 target verify scheduler batch has fewer seq_lens than "
+                f"draft tokens: len(seq_lens)={len(batch.seq_lens)}, "
+                f"real_bs={real_bs}."
+            )
+        batch.seq_lens = batch.seq_lens[:real_bs]
+
+        if batch.seq_lens_cpu is not None:
+            if len(batch.seq_lens_cpu) < real_bs:
+                raise RuntimeError(
+                    "EAGLE3 target verify scheduler batch has fewer CPU seq_lens "
+                    f"than draft tokens: len(seq_lens_cpu)={len(batch.seq_lens_cpu)}, "
+                    f"real_bs={real_bs}."
+                )
+            batch.seq_lens_cpu = batch.seq_lens_cpu[:real_bs]
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
+        else:
+            batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+
+        if batch.req_pool_indices.shape[0] < real_bs:
+            raise RuntimeError(
+                "EAGLE3 target verify scheduler batch has fewer req_pool_indices "
+                f"than draft tokens: req_pool_indices.shape="
+                f"{tuple(batch.req_pool_indices.shape)}, real_bs={real_bs}."
+            )
+        batch.req_pool_indices = batch.req_pool_indices[:real_bs]
+
+        if batch.orig_seq_lens is not None:
+            if batch.orig_seq_lens.shape[0] < real_bs:
+                raise RuntimeError(
+                    "EAGLE3 target verify scheduler batch has fewer orig_seq_lens "
+                    f"than draft tokens: orig_seq_lens.shape="
+                    f"{tuple(batch.orig_seq_lens.shape)}, real_bs={real_bs}."
+                )
+            batch.orig_seq_lens = batch.orig_seq_lens[:real_bs]
+
+        return real_bs
+
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
@@ -430,7 +491,7 @@ class EagleVerifyInputV2Mixin:
     ):
         if not batch.forward_mode.is_idle():
             # Assign cache locations
-            bs = len(batch.req_pool_indices)
+            bs = self._normalize_v2_verify_batch(batch)
 
             batch.input_ids = self.draft_token
 
