@@ -402,7 +402,7 @@ class EagleDraftWorker(BaseDraftWorker):
     def _normalize_single_rank_draft_forward_batch(
         self, batch: ScheduleBatch, forward_batch: ForwardBatch
     ) -> None:
-        """Trim any leaked padding so draft attention always sees logical requests."""
+        """Remove CUDA graph padding from draft metadata before attention planning."""
         logical_bs = batch.batch_size()
         capacity_bs = self.req_to_token_pool.size
         if logical_bs > capacity_bs:
@@ -421,8 +421,7 @@ class EagleDraftWorker(BaseDraftWorker):
         if actual_bs < logical_bs:
             raise RuntimeError(
                 "EAGLE3 draft forward batch lost live requests before attention init: "
-                f"logical_bs={logical_bs}, actual_bs={actual_bs}. "
-                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                f"logical_bs={logical_bs}, actual_bs={actual_bs}."
             )
 
         spec_info = forward_batch.spec_info
@@ -437,15 +436,13 @@ class EagleDraftWorker(BaseDraftWorker):
             raise RuntimeError(
                 "EAGLE3 draft req_pool_indices is smaller than logical batch size: "
                 f"req_pool_indices.shape={tuple(forward_batch.req_pool_indices.shape)}, "
-                f"logical_bs={logical_bs}. "
-                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                f"logical_bs={logical_bs}."
             )
         if forward_batch.seq_lens.shape[0] < logical_bs:
             raise RuntimeError(
                 "EAGLE3 draft seq_lens is smaller than logical batch size: "
                 f"seq_lens.shape={tuple(forward_batch.seq_lens.shape)}, "
-                f"logical_bs={logical_bs}. "
-                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                f"logical_bs={logical_bs}."
             )
         if (
             forward_batch.positions is not None
@@ -455,8 +452,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 "EAGLE3 draft positions is smaller than expected token count: "
                 f"positions.shape={tuple(forward_batch.positions.shape)}, "
                 f"logical_num_tokens={logical_num_tokens}, "
-                f"logical_bs={logical_bs}, num_tokens_per_req={num_tokens_per_req}. "
-                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                f"logical_bs={logical_bs}, num_tokens_per_req={num_tokens_per_req}."
             )
 
         forward_batch.batch_size = logical_bs
@@ -479,8 +475,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     "EAGLE3 draft out_cache_loc is smaller than expected: "
                     f"out_cache_loc.shape={tuple(forward_batch.out_cache_loc.shape)}, "
                     f"logical_cache_tokens={logical_cache_tokens}, "
-                    f"logical_bs={logical_bs}, num_tokens_per_req={num_tokens_per_req}. "
-                    "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                    f"logical_bs={logical_bs}, num_tokens_per_req={num_tokens_per_req}."
                 )
             forward_batch.out_cache_loc = forward_batch.out_cache_loc[
                 :logical_cache_tokens
@@ -496,8 +491,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     raise RuntimeError(
                         "EAGLE3 draft hidden_states is smaller than logical batch size: "
                         f"hidden_states.shape={tuple(spec_info.hidden_states.shape)}, "
-                        f"logical_bs={logical_bs}. "
-                        "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                        f"logical_bs={logical_bs}."
                     )
                 spec_info.hidden_states = spec_info.hidden_states[:logical_bs]
 

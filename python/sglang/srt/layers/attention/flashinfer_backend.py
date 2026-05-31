@@ -474,13 +474,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
-            logger.warning(
-                "[FLASHINFER INIT_METADATA TARGET_VERIFY] "
-                "input_tokens=%s seq_lens=%s seq_lens_sum=%s",
-                forward_batch.input_ids.numel(),
-                forward_batch.seq_lens.detach().cpu().tolist(),
-                forward_batch.seq_lens_sum,
-            )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,

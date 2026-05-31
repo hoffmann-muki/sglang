@@ -57,14 +57,6 @@ if is_cuda():
     )
 
 logger = logging.getLogger(__name__)
-_LOGGED_DUPLICATE_COMPACTION_CONTEXTS: set[str] = set()
-
-
-def _log_duplicate_compaction_once(context: str, message: str) -> None:
-    if context in _LOGGED_DUPLICATE_COMPACTION_CONTEXTS:
-        return
-    _LOGGED_DUPLICATE_COMPACTION_CONTEXTS.add(context)
-    logger.warning(message)
 
 
 def _get_req_key(req: Any) -> Any:
@@ -115,8 +107,7 @@ def _compact_duplicate_scheduler_requests(
     keep_indices_device = torch.tensor(
         keep_indices, dtype=torch.int64, device=batch.device
     )
-    _log_duplicate_compaction_once(
-        context,
+    logger.debug(
         "EAGLE3 received duplicate scheduler request rows; compacting by "
         f"request id before {context}. original_bs={original_bs}, "
         f"compacted_bs={len(keep_indices)}, forward_mode={batch.forward_mode}.",
@@ -179,6 +170,7 @@ def _compact_duplicate_scheduler_requests(
             batch.sampling_info.filter_batch(keep_indices, keep_indices_device)
 
     return keep_indices, keep_indices_device
+
 
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
@@ -548,14 +540,9 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
-    def _trim_v2_verify_scheduler_batch(
+    def _normalize_v2_verify_scheduler_metadata(
         self: EagleVerifyInput, batch: ScheduleBatch, real_bs: int
     ) -> None:
-        keep_indices = list(range(real_bs))
-        keep_indices_device = torch.arange(
-            real_bs, dtype=torch.int64, device=batch.device
-        )
-
         if len(batch.reqs) != real_bs:
             raise RuntimeError(
                 "EAGLE3 target verify scheduler request count does not match "
@@ -574,10 +561,9 @@ class EagleVerifyInputV2Mixin:
                 f"tokens: sampling_bs={sampling_bs}, real_bs={real_bs}."
             )
         if sampling_bs > real_bs:
-            logger.warning(
-                "EAGLE3 target verify received padded sampling metadata; trimming "
-                f"tail rows before sampling. sampling_bs={sampling_bs}, "
-                f"real_bs={real_bs}."
+            keep_indices = list(range(real_bs))
+            keep_indices_device = torch.arange(
+                real_bs, dtype=torch.int64, device=batch.device
             )
             sampling_info.filter_batch(keep_indices, keep_indices_device)
 
@@ -596,7 +582,7 @@ class EagleVerifyInputV2Mixin:
 
         real_bs = self.draft_token.numel() // self.draft_token_num
         _compact_duplicate_scheduler_requests(batch, context="target verify")
-        self._trim_v2_verify_scheduler_batch(batch, real_bs)
+        self._normalize_v2_verify_scheduler_metadata(batch, real_bs)
 
         if len(batch.seq_lens) < real_bs:
             raise RuntimeError(
