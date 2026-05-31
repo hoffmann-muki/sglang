@@ -399,6 +399,98 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"{broadcasted.error}"
             )
 
+    def _normalize_single_rank_draft_forward_batch(
+        self, batch: ScheduleBatch, forward_batch: ForwardBatch
+    ) -> None:
+        """Trim any leaked padding so draft attention always sees logical requests."""
+        logical_bs = batch.batch_size()
+        actual_bs = forward_batch.batch_size
+
+        if actual_bs == logical_bs:
+            return
+        if actual_bs < logical_bs:
+            raise RuntimeError(
+                "EAGLE3 draft forward batch lost live requests before attention init: "
+                f"logical_bs={logical_bs}, actual_bs={actual_bs}. "
+                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+            )
+
+        spec_info = forward_batch.spec_info
+        num_tokens_per_req = (
+            getattr(spec_info, "num_tokens_per_req", 1) if spec_info is not None else 1
+        )
+        if num_tokens_per_req <= 0:
+            num_tokens_per_req = 1
+        logical_num_tokens = logical_bs * num_tokens_per_req
+
+        if forward_batch.req_pool_indices.shape[0] < logical_bs:
+            raise RuntimeError(
+                "EAGLE3 draft req_pool_indices is smaller than logical batch size: "
+                f"req_pool_indices.shape={tuple(forward_batch.req_pool_indices.shape)}, "
+                f"logical_bs={logical_bs}. "
+                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+            )
+        if forward_batch.seq_lens.shape[0] < logical_bs:
+            raise RuntimeError(
+                "EAGLE3 draft seq_lens is smaller than logical batch size: "
+                f"seq_lens.shape={tuple(forward_batch.seq_lens.shape)}, "
+                f"logical_bs={logical_bs}. "
+                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+            )
+        if (
+            forward_batch.positions is not None
+            and forward_batch.positions.shape[0] < logical_num_tokens
+        ):
+            raise RuntimeError(
+                "EAGLE3 draft positions is smaller than expected token count: "
+                f"positions.shape={tuple(forward_batch.positions.shape)}, "
+                f"logical_num_tokens={logical_num_tokens}, "
+                f"logical_bs={logical_bs}, num_tokens_per_req={num_tokens_per_req}. "
+                "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+            )
+
+        forward_batch.batch_size = logical_bs
+        forward_batch.req_pool_indices = forward_batch.req_pool_indices[:logical_bs]
+        forward_batch.seq_lens = forward_batch.seq_lens[:logical_bs]
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu[:logical_bs]
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum().item())
+        else:
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
+
+        if forward_batch.positions is not None:
+            forward_batch.positions = forward_batch.positions[:logical_num_tokens]
+
+        # Draft out-cache is [bs * topk * num_steps] in this path.
+        if forward_batch.out_cache_loc is not None:
+            logical_cache_tokens = logical_num_tokens * self.speculative_num_steps
+            if forward_batch.out_cache_loc.shape[0] < logical_cache_tokens:
+                raise RuntimeError(
+                    "EAGLE3 draft out_cache_loc is smaller than expected: "
+                    f"out_cache_loc.shape={tuple(forward_batch.out_cache_loc.shape)}, "
+                    f"logical_cache_tokens={logical_cache_tokens}, "
+                    f"logical_bs={logical_bs}, num_tokens_per_req={num_tokens_per_req}. "
+                    "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                )
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc[
+                :logical_cache_tokens
+            ]
+
+        if spec_info is not None:
+            for attr in ("topk_p", "topk_index", "accept_length", "new_seq_lens", "verified_id"):
+                tensor = getattr(spec_info, attr, None)
+                if tensor is not None and tensor.shape[0] >= logical_bs:
+                    setattr(spec_info, attr, tensor[:logical_bs])
+            if spec_info.hidden_states is not None:
+                if spec_info.hidden_states.shape[0] < logical_bs:
+                    raise RuntimeError(
+                        "EAGLE3 draft hidden_states is smaller than logical batch size: "
+                        f"hidden_states.shape={tuple(spec_info.hidden_states.shape)}, "
+                        f"logical_bs={logical_bs}. "
+                        "marker=EAGLE3_SINGLE_RANK_DRAFT_NORMALIZE_V20260531"
+                    )
+                spec_info.hidden_states = spec_info.hidden_states[:logical_bs]
+
     def _draft_single_rank(self, batch: ScheduleBatch):
         if self._is_root_draft_rank:
             try:
@@ -411,6 +503,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.topk,
                     self.speculative_num_steps,
                 )
+                self._normalize_single_rank_draft_forward_batch(batch, forward_batch)
 
                 if can_cuda_graph:
                     parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
