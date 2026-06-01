@@ -140,6 +140,16 @@ class TestStandaloneServerArgs(unittest.TestCase):
         )
         self.assertEqual(server_args.speculative_draft_tp_size, 1)
 
+    def test_standalone_asymmetric_draft_reserves_extra_memory(self):
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.speculative_algorithm = "STANDALONE"
+        server_args.speculative_draft_tp_size = 1
+        server_args.tp_size = 4
+        self.assertEqual(server_args._get_speculative_reserved_memory_mb(), 8 * 1024)
+
+        server_args.speculative_draft_tp_size = 4
+        self.assertEqual(server_args._get_speculative_reserved_memory_mb(), 6 * 1024)
+
     @patch(
         "sglang.srt.server_args._resolve_or_download",
         side_effect=lambda path, **kwargs: path,

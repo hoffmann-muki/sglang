@@ -1492,13 +1492,7 @@ class ServerArgs:
             if gpu_mem is not None and gpu_mem > 60 * 1024:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
-            if self.speculative_algorithm is not None:
-                if self.speculative_algorithm in ("STANDALONE", "TLI", "CO_DRAFT"):
-                    # standalone / TLI draft model and cuda graphs
-                    reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
-                    # eagle draft models and cuda graphs
-                    reserved_mem += 4 * 1024
+            reserved_mem += self._get_speculative_reserved_memory_mb()
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1519,6 +1513,25 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def _get_speculative_reserved_memory_mb(self):
+        if self.speculative_algorithm is None or self.speculative_algorithm == "NGRAM":
+            return 0
+
+        if self.speculative_algorithm in ("STANDALONE", "TLI", "CO_DRAFT"):
+            reserved_mem = 6 * 1024
+            if (
+                self.speculative_algorithm == "STANDALONE"
+                and self.speculative_draft_tp_size == 1
+                and self.tp_size > 1
+            ):
+                # The root TP rank hosts the full standalone draft model and a
+                # draft KV pool with target-aligned token indices.
+                reserved_mem += 2 * 1024
+            return reserved_mem
+
+        # eagle draft models and cuda graphs
+        return 4 * 1024
 
     def _generate_cuda_graph_batch_sizes(self):
         """
