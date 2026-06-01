@@ -754,11 +754,12 @@ class ModelRunnerKVCacheMixin:
         return config
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
-        else:
+        should_resolve_pool = not (
+            not self.spec_algorithm.is_none()
+            and self.is_draft_worker
+            and self.memory_pool_config is not None
+        )
+        if should_resolve_pool:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
             )

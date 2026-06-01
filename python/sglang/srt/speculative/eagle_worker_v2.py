@@ -148,11 +148,16 @@ class EagleDraftWorker(BaseDraftWorker):
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
+        # Share the request mapping with the target worker. Standalone draft
+        # uses a separately sized KV pool, but cache locations must stay in the
+        # same numeric space as the target scheduler.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        use_independent_standalone_draft_pool = (
+            self.speculative_algorithm.is_standalone()
+        )
+        self._has_independent_draft_pool = use_independent_standalone_draft_pool
 
         if self._single_rank_draft_mode:
             draft_args = copy.copy(server_args)
@@ -180,8 +185,16 @@ class EagleDraftWorker(BaseDraftWorker):
                         nccl_port=nccl_port,
                         is_draft_worker=True,
                         req_to_token_pool=self.req_to_token_pool,
-                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                        memory_pool_config=target_worker.model_runner.memory_pool_config,
+                        token_to_kv_pool_allocator=(
+                            None
+                            if use_independent_standalone_draft_pool
+                            else self.token_to_kv_pool_allocator
+                        ),
+                        memory_pool_config=(
+                            None
+                            if use_independent_standalone_draft_pool
+                            else target_worker.model_runner.memory_pool_config
+                        ),
                     )
                 self.draft_runner = self.draft_worker.model_runner
             else:
@@ -212,12 +225,36 @@ class EagleDraftWorker(BaseDraftWorker):
                     nccl_port=nccl_port,
                     is_draft_worker=True,
                     req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    memory_pool_config=target_worker.model_runner.memory_pool_config,
+                    token_to_kv_pool_allocator=(
+                        None
+                        if use_independent_standalone_draft_pool
+                        else self.token_to_kv_pool_allocator
+                    ),
+                    memory_pool_config=(
+                        None
+                        if use_independent_standalone_draft_pool
+                        else target_worker.model_runner.memory_pool_config
+                    ),
                 )
 
             # Alias for better readability
             self.draft_runner = self.draft_worker.model_runner
+        local_draft_max_tokens = (
+            self.draft_runner.max_token_pool_size
+            if self.draft_runner is not None
+            else None
+        )
+        if self._single_rank_draft_mode:
+            world_group = self.target_worker.world_group
+            payload = [local_draft_max_tokens] if self._is_root_draft_rank else []
+            self._draft_max_token_pool_size = broadcast_pyobj(
+                payload,
+                world_group.rank,
+                world_group.cpu_group,
+                src=world_group.first_rank,
+            )[0]
+        else:
+            self._draft_max_token_pool_size = local_draft_max_tokens
         self.eagle_use_aux_hidden_state = False
         if self.draft_runner is not None and self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -244,6 +281,14 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    @property
+    def has_independent_draft_pool(self) -> bool:
+        return self._has_independent_draft_pool
+
+    @property
+    def draft_max_token_pool_size(self) -> Optional[int]:
+        return self._draft_max_token_pool_size
 
     @contextmanager
     def draft_context(self):
@@ -1257,9 +1302,53 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def is_v2_draft_worker(self):
         return True
 
+    def get_worker_info(self):
+        info = list(self.target_worker.get_worker_info())
+        if self.draft_worker.has_independent_draft_pool:
+            draft_max_tokens = self.draft_worker.draft_max_token_pool_size
+            if draft_max_tokens is None:
+                return tuple(info)
+            self._cap_target_allocator_to_draft_pool(draft_max_tokens)
+            info[0] = min(info[0], draft_max_tokens)
+            info[4] = min(info[4], draft_max_tokens - 1)
+            info[5] = min(info[5], info[4] - 5)
+            info[11] = min(info[11], draft_max_tokens)
+        return tuple(info)
+
+    def _cap_target_allocator_to_draft_pool(self, draft_max_tokens: int):
+        allocator = self.token_to_kv_pool_allocator
+        page_size = allocator.page_size
+        capped_size = draft_max_tokens // page_size * page_size
+        if capped_size <= 0:
+            raise RuntimeError(
+                "Standalone draft KV pool is too small to serve any tokens: "
+                f"draft_max_tokens={draft_max_tokens}, page_size={page_size}."
+            )
+
+        current_limit = getattr(allocator, "_spec_draft_capacity_limit", None)
+        if current_limit == capped_size:
+            return
+
+        allocator.size = min(allocator.size, capped_size)
+        if hasattr(allocator, "num_pages"):
+            allocator.num_pages = allocator.size // page_size
+            max_free = allocator.num_pages
+        else:
+            max_free = allocator.size
+
+        allocator.free_pages = allocator.free_pages[allocator.free_pages <= max_free]
+        allocator.release_pages = allocator.release_pages[
+            allocator.release_pages <= max_free
+        ]
+        allocator._spec_draft_capacity_limit = capped_size
+
     def clear_cache_pool(self):
-        # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
-        pass
+        draft_runner = self.draft_runner
+        if (
+            draft_runner is not None
+            and self.draft_worker.has_independent_draft_pool
+        ):
+            draft_runner.token_to_kv_pool_allocator.clear()
 
     def forward_batch_generation(self, batch: ScheduleBatch):
         # EAGLE v2 keeps ScheduleBatch as the canonical mutable scheduler state.

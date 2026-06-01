@@ -703,6 +703,11 @@ class Scheduler(
             self.model_worker = self.draft_worker
 
         # Get token and memory info from the model worker
+        worker_info_provider = (
+            self.model_worker
+            if hasattr(self.model_worker, "get_worker_info")
+            else self.tp_worker
+        )
         (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
@@ -716,7 +721,7 @@ class Scheduler(
             _,
             _,
             _,
-        ) = self.tp_worker.get_worker_info()
+        ) = worker_info_provider.get_worker_info()
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.pp_size, 1
