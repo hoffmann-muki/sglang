@@ -20,6 +20,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_int_env_var,
     is_cuda,
     is_hip,
     is_musa,
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
+    _GRAPH_META_BUFFER_MIN_SIZE = 64 * 1024 * 1024
+    _GRAPH_META_BUFFER_MAX_SIZE = 256 * 1024 * 1024
+    _GRAPH_META_BUFFER_MULTIPLIER = 8
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
@@ -94,6 +98,7 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.full_nvlink = full_nvlink
+        self.graph_meta_buffer_size = self._resolve_graph_meta_buffer_size(max_size)
 
         if not _is_hip:
             # Buffers memory are owned by this Python class and passed to C++.
@@ -105,13 +110,11 @@ class CustomAllreduce:
             # This is a pre-registered IPC buffer. In eager mode, input tensors
             # are first copied into this buffer before allreduce is performed
             self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
-            # This is a buffer for storing the tuples of pointers pointing to
-            # IPC buffers from all ranks. Each registered tuple has size of
-            # 8*world_size bytes where world_size is at most 8. Allocating 8MB
-            # is enough for 131072 such tuples. The largest model I've seen only
-            # needs less than 10000 of registered tuples.
+            # This stores graph-registration metadata. Repeated CUDA graph
+            # recaptures can append many entries over a benchmark run, so keep
+            # it independent from the smaller eager payload threshold.
             self.rank_data = torch.empty(
-                max_size, dtype=torch.uint8, device=self.device
+                self.graph_meta_buffer_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta_ptrs, self.rank_data, rank, self.full_nvlink
@@ -128,7 +131,7 @@ class CustomAllreduce:
             )
             handles, offsets = self._gather_ipc_meta(shard_data)
             self.rank_data = torch.empty(
-                max_size, dtype=torch.uint8, device=self.device
+                self.graph_meta_buffer_size, dtype=torch.uint8, device=self.device
             )
             self._ptr = ops.init_custom_ar(
                 self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
@@ -138,6 +141,23 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+
+    @classmethod
+    def _resolve_graph_meta_buffer_size(cls, max_size: int) -> int:
+        """Resolve a larger metadata buffer for CUDA graph registration.
+
+        The payload buffer stays at the fast-path threshold (`max_size`),
+        but graph recapture accumulates metadata across capture variants.
+        """
+        override_mb = get_int_env_var("SGLANG_CUSTOM_AR_GRAPH_META_MB", 0)
+        if override_mb > 0:
+            return override_mb * 1024 * 1024
+
+        sized = max(
+            max_size * cls._GRAPH_META_BUFFER_MULTIPLIER,
+            cls._GRAPH_META_BUFFER_MIN_SIZE,
+        )
+        return min(sized, cls._GRAPH_META_BUFFER_MAX_SIZE)
 
     @staticmethod
     def create_shared_buffer(
