@@ -1,0 +1,81 @@
+"""Unit tests for CUDA graph replay gating."""
+
+from types import SimpleNamespace
+import unittest
+
+import torch
+
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from sglang.srt.speculative.standalone_worker import StandaloneWorker
+from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
+
+def _make_runner(spec_algorithm: SpeculativeAlgorithm) -> CudaGraphRunner:
+    runner = CudaGraphRunner.__new__(CudaGraphRunner)
+    runner.model_runner = SimpleNamespace(
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=False,
+        server_args=SimpleNamespace(),
+        model_config=SimpleNamespace(is_encoder_decoder=False, hf_config=SimpleNamespace()),
+    )
+    runner.require_mlp_tp_gather = False
+    runner.require_mlp_sync = False
+    runner.enable_two_batch_overlap = False
+    runner.disable_padding = False
+    runner.max_bs = 8
+    runner.graphs = {}
+    runner.is_encoder_decoder = False
+    runner.record_nolora_graph = False
+    runner.enable_pdmux = False
+    runner.capture_hidden_mode = CaptureHiddenMode.NULL
+    runner.num_tokens_per_bs = 1
+    runner.is_dllm = False
+    return runner
+
+
+def _make_batch(mode: ForwardMode):
+    return SimpleNamespace(
+        replace_embeds=None,
+        batch_size=1,
+        global_num_tokens_cpu=torch.tensor([1]),
+        forward_mode=mode,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        spec_info=None,
+        can_run_tbo=True,
+        can_run_dp_cuda_graph=True,
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        encoder_lens=torch.ones(1, dtype=torch.int64),
+    )
+
+
+class TestCudaGraphRunnerStandalone(unittest.TestCase):
+    def test_standalone_stays_eager_for_decode_and_verify(self):
+        runner = _make_runner(SpeculativeAlgorithm.STANDALONE)
+
+        self.assertFalse(runner.can_run(_make_batch(ForwardMode.DECODE)))
+        self.assertFalse(runner.can_run(_make_batch(ForwardMode.TARGET_VERIFY)))
+
+
+class TestStandaloneWorkerCudaGraphs(unittest.TestCase):
+    def test_standalone_workers_skip_graph_initialization(self):
+        for worker_cls in (StandaloneWorker, StandaloneWorkerV2):
+            worker = worker_cls.__new__(worker_cls)
+            worker.cuda_graph_runner = object()
+            worker.cuda_graph_runner_for_draft_extend = object()
+
+            worker.init_cuda_graphs()
+
+            self.assertIsNone(worker.cuda_graph_runner)
+            self.assertIsNone(worker.cuda_graph_runner_for_draft_extend)
+
+
+if __name__ == "__main__":
+    unittest.main()
