@@ -507,7 +507,7 @@ class ServerArgs:
     speculative_draft_tp_size: Optional[int] = None
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
-    disable_speculative_cuda_graph: bool = False
+    speculative_cuda_graph: str = "auto"
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -1292,12 +1292,21 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_speculative_cuda_graph(self):
-        if self.speculative_algorithm in (None, "NGRAM") or not self.disable_speculative_cuda_graph:
+        # `auto` disables CUDA graphs for speculative algorithms by default,
+        # but keeps them enabled for non-speculative server modes and the NGRAM
+        # special case.
+        if self.speculative_algorithm in (None, "NGRAM"):
             return
+
+        if self.speculative_cuda_graph == "enable":
+            return
+
+        if self.speculative_cuda_graph == "auto":
+            self.speculative_cuda_graph = "disable"
 
         if not self.disable_cuda_graph:
             logger.warning(
-                "CUDA graph is disabled because --disable-speculative-cuda-graph is set."
+                "CUDA graph is disabled because --speculative-cuda-graph=disable is set or auto-selected for speculative decoding."
             )
         self.disable_cuda_graph = True
         self.disable_piecewise_cuda_graph = True
@@ -5866,10 +5875,14 @@ class ServerArgs:
             "Use 'dummy' to initialize draft model weights with random values for profiling.",
         )
         parser.add_argument(
-            "--disable-speculative-cuda-graph",
-            action="store_true",
-            default=ServerArgs.disable_speculative_cuda_graph,
-            help="Disable CUDA graph capture and replay for speculative decoding.",
+            "--speculative-cuda-graph",
+            type=str,
+            choices=["auto", "enable", "disable"],
+            default=ServerArgs.speculative_cuda_graph,
+            help="Control CUDA graph capture and replay for speculative decoding. "
+            "'auto' disables graphs for speculative algorithms by default and "
+            "keeps them enabled for non-speculative server modes; 'enable' "
+            "forces replay on; 'disable' forces replay off.",
         )
         parser.add_argument(
             "--speculative-num-steps",

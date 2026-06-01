@@ -151,7 +151,7 @@ class TestStandaloneServerArgs(unittest.TestCase):
             is_multimodal=False,
         ),
     )
-    def test_disable_speculative_cuda_graph_flag(
+    def test_speculative_cuda_graph_defaults_auto_on_speculative_modes(
         self, _mock_model_config, _mock_resolve
     ):
         server_args = prepare_server_args(
@@ -170,23 +170,100 @@ class TestStandaloneServerArgs(unittest.TestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "5",
-                "--disable-speculative-cuda-graph",
+            ]
+        )
+        self.assertEqual(server_args.speculative_cuda_graph, "disable")
+        self.assertTrue(server_args.disable_cuda_graph)
+        self.assertTrue(server_args.disable_piecewise_cuda_graph)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch(
+        "sglang.srt.server_args.ServerArgs.get_model_config",
+        return_value=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        ),
+    )
+    def test_speculative_cuda_graph_disable_flag(
+        self, _mock_model_config, _mock_resolve
+    ):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "target-model",
+                "--speculative-algorithm",
+                "STANDALONE",
+                "--speculative-draft-model-path",
+                "draft-model",
+                "--speculative-draft-tp-size",
+                "1",
+                "--speculative-num-steps",
+                "4",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "5",
+                "--speculative-cuda-graph",
+                "disable",
             ]
         )
         self.assertTrue(server_args.disable_cuda_graph)
         self.assertTrue(server_args.disable_piecewise_cuda_graph)
 
-    def test_disable_speculative_cuda_graph_applies_to_speculative_modes(self):
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch(
+        "sglang.srt.server_args.ServerArgs.get_model_config",
+        return_value=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        ),
+    )
+    def test_speculative_cuda_graph_enable_flag(
+        self, _mock_model_config, _mock_resolve
+    ):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "target-model",
+                "--speculative-algorithm",
+                "STANDALONE",
+                "--speculative-draft-model-path",
+                "draft-model",
+                "--speculative-draft-tp-size",
+                "1",
+                "--speculative-num-steps",
+                "4",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "5",
+                "--speculative-cuda-graph",
+                "enable",
+            ]
+        )
+        self.assertFalse(server_args.disable_cuda_graph)
+        self.assertFalse(server_args.disable_piecewise_cuda_graph)
+        self.assertEqual(server_args.speculative_cuda_graph, "enable")
+
+    def test_speculative_cuda_graph_applies_to_speculative_modes(self):
         for speculative_algorithm in (
+            "DFLASH",
             "STANDALONE",
             "TLI",
             "EAGLE3",
             "FAST_DLLM_V2",
             "CO_DRAFT",
+            "EAGLE",
         ):
             server_args = ServerArgs.__new__(ServerArgs)
             server_args.speculative_algorithm = speculative_algorithm
-            server_args.disable_speculative_cuda_graph = True
+            server_args.speculative_cuda_graph = "auto"
             server_args.disable_cuda_graph = False
             server_args.disable_piecewise_cuda_graph = False
 
@@ -200,6 +277,19 @@ class TestStandaloneServerArgs(unittest.TestCase):
                 server_args.disable_piecewise_cuda_graph,
                 msg=f"expected piecewise CUDA graph to be disabled for {speculative_algorithm}",
             )
+
+    def test_speculative_cuda_graph_defaults_off_for_non_spec(self):
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.speculative_algorithm = None
+        server_args.speculative_cuda_graph = "auto"
+        server_args.disable_cuda_graph = False
+        server_args.disable_piecewise_cuda_graph = False
+
+        server_args._handle_speculative_cuda_graph()
+
+        self.assertEqual(server_args.speculative_cuda_graph, "auto")
+        self.assertFalse(server_args.disable_cuda_graph)
+        self.assertFalse(server_args.disable_piecewise_cuda_graph)
 
     def test_standalone_asymmetric_draft_reserves_extra_memory(self):
         server_args = ServerArgs.__new__(ServerArgs)
