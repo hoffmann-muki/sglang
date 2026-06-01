@@ -281,6 +281,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-draft-tp-size` | Colocated TLI/CO_DRAFT only. Tensor-parallel size for the local AR draft model. Use `1` for vLLM-style asymmetric colocated drafting, or omit/set to the target `--tp` size for symmetric colocated drafting. For disaggregated TLI, use `--remote-draft-tp-size`. | `None` | Type: int |
 | `--speculative-draft-model-revision` | The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version. | `None` | Type: str |
 | `--speculative-draft-load-format` | The format of the draft model weights to load. If not specified, will use the same format as --load-format. Use 'dummy' to initialize draft model weights with random values for profiling. | `None` | Same as --load-format options |
+| `--disable-speculative-cuda-graph` | Disable CUDA graph capture and replay for speculative decoding algorithms. This affects speculative modes such as STANDALONE, TLI, EAGLE3, FAST_DLLM_V2, and CO_DRAFT. | `False` | bool flag (set to enable) |
 | `--speculative-num-steps` | The number of steps sampled from draft model in Speculative Decoding. | `None` | Type: int |
 | `--speculative-eagle-topk` | The number of tokens sampled from the draft model in eagle2 each step. | `None` | Type: int |
 | `--speculative-num-draft-tokens` | The number of tokens sampled from the draft model in Speculative Decoding. | `None` | Type: int |

@@ -507,6 +507,7 @@ class ServerArgs:
     speculative_draft_tp_size: Optional[int] = None
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
+    disable_speculative_cuda_graph: bool = False
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -845,6 +846,10 @@ class ServerArgs:
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
+
+        # Allow speculative decoding to opt out of CUDA graphs without changing
+        # the behavior of non-speculative server modes.
+        self._handle_speculative_cuda_graph()
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
@@ -1286,6 +1291,17 @@ class ServerArgs:
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
 
+    def _handle_speculative_cuda_graph(self):
+        if self.speculative_algorithm in (None, "NGRAM") or not self.disable_speculative_cuda_graph:
+            return
+
+        if not self.disable_cuda_graph:
+            logger.warning(
+                "CUDA graph is disabled because --disable-speculative-cuda-graph is set."
+            )
+        self.disable_cuda_graph = True
+        self.disable_piecewise_cuda_graph = True
+
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
 
@@ -1466,11 +1482,12 @@ class ServerArgs:
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
-            reserved_mem += self.cuda_graph_max_bs * 2
+            if not self.disable_cuda_graph:
+                reserved_mem += self.cuda_graph_max_bs * 2
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
-            if self.enable_dp_attention:
+            if not self.disable_cuda_graph and self.enable_dp_attention:
                 # DP attention needs more padding for some operations
                 reserved_mem += self.cuda_graph_max_bs * self.dp_size * 3
 
@@ -1481,7 +1498,7 @@ class ServerArgs:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
-            if not self.disable_piecewise_cuda_graph:
+            if not self.disable_cuda_graph and not self.disable_piecewise_cuda_graph:
                 if not self.use_mla_backend():
                     # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
                     reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
@@ -5847,6 +5864,12 @@ class ServerArgs:
             help="The format of the draft model weights to load. "
             "If not specified, will use the same format as --load-format. "
             "Use 'dummy' to initialize draft model weights with random values for profiling.",
+        )
+        parser.add_argument(
+            "--disable-speculative-cuda-graph",
+            action="store_true",
+            default=ServerArgs.disable_speculative_cuda_graph,
+            help="Disable CUDA graph capture and replay for speculative decoding.",
         )
         parser.add_argument(
             "--speculative-num-steps",
