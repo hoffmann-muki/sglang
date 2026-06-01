@@ -1482,7 +1482,7 @@ class Scheduler(
 
             processed_last_result_before_schedule = False
             if (
-                self._needs_single_rank_eagle3_schedule_sync()
+                self._needs_single_rank_draft_schedule_sync()
                 and self.last_batch
                 and self.result_queue
             ):
@@ -1532,10 +1532,13 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
-    def _needs_single_rank_eagle3_schedule_sync(self) -> bool:
+    def _needs_single_rank_draft_schedule_sync(self) -> bool:
         return (
             self.enable_overlap
-            and self.spec_algorithm.is_eagle3()
+            and (
+                self.spec_algorithm.is_eagle3()
+                or self.spec_algorithm.is_standalone()
+            )
             and self.server_args.speculative_draft_tp_size == 1
             and self.tp_size > 1
         )

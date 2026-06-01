@@ -458,11 +458,8 @@ class EagleDraftInputV2Mixin:
         self.num_tokens_for_logprob_per_req = topk
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
 
-        is_standalone = draft_model_runner.spec_algorithm.is_standalone()
-        batch.capture_hidden_mode = (
-            CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.LAST
-        )
-        batch.return_hidden_states_before_norm = not is_standalone
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.return_hidden_states_before_norm = True
 
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         if forward_batch.batch_size != real_bs:
@@ -513,11 +510,8 @@ class EagleDraftInputV2Mixin:
                 f"extend_lens={batch.extend_lens}"
         )
 
-        is_standalone = draft_model_runner.spec_algorithm.is_standalone()
-        batch.capture_hidden_mode = (
-            CaptureHiddenMode.NULL if is_standalone else CaptureHiddenMode.FULL
-        )
-        batch.return_hidden_states_before_norm = not is_standalone
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.return_hidden_states_before_norm = True
 
         batch.forward_mode = (
             ForwardMode.IDLE

@@ -287,9 +287,12 @@ class EagleDraftWorker(BaseDraftWorker):
         if batch.input_ids is None or batch.input_ids.numel() == 0:
             return
 
-        if target_hidden_states.shape[0] != batch.input_ids.numel():
+        if (
+            target_hidden_states is not None
+            and target_hidden_states.shape[0] != batch.input_ids.numel()
+        ):
             raise RuntimeError(
-                "EAGLE3 draft prefill hidden-state row count does not match "
+                "Speculative draft prefill hidden-state row count does not match "
                 "the draft input token count. "
                 f"hidden_states.shape={tuple(target_hidden_states.shape)}, "
                 f"input_ids.shape={tuple(batch.input_ids.shape)}, "
@@ -395,7 +398,8 @@ class EagleDraftWorker(BaseDraftWorker):
         broadcasted = self._broadcast_draft_result(payload)
         if raise_on_error and not broadcasted.ok:
             raise RuntimeError(
-                f"EAGLE3 single-rank draft {phase} failed on root rank:\n"
+                f"{self.speculative_algorithm.name} single-rank draft {phase} "
+                "failed on root rank:\n"
                 f"{broadcasted.error}"
             )
 
@@ -578,7 +582,10 @@ class EagleDraftWorker(BaseDraftWorker):
                     )
                 ]
             except Exception:
-                logger.exception("EAGLE3 single-rank draft failed on root rank.")
+                logger.exception(
+                    "%s single-rank draft failed on root rank.",
+                    self.speculative_algorithm.name,
+                )
                 payload = [
                     _BroadcastedEagleDraftResult(
                         ok=False,
@@ -589,7 +596,8 @@ class EagleDraftWorker(BaseDraftWorker):
             broadcasted = self._broadcast_draft_result(payload)
             if not broadcasted.ok:
                 raise RuntimeError(
-                    "EAGLE3 single-rank draft failed on root rank:\n"
+                    f"{self.speculative_algorithm.name} single-rank draft "
+                    "failed on root rank:\n"
                     f"{broadcasted.error}"
                 )
             return self._deserialize_verify_input(broadcasted.payload)
@@ -597,7 +605,8 @@ class EagleDraftWorker(BaseDraftWorker):
         broadcasted = self._broadcast_draft_result([])
         if not broadcasted.ok:
             raise RuntimeError(
-                "EAGLE3 single-rank draft failed on root rank:\n"
+                f"{self.speculative_algorithm.name} single-rank draft failed "
+                "on root rank:\n"
                 f"{broadcasted.error}"
             )
         return self._deserialize_verify_input(broadcasted.payload)

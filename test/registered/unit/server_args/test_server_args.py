@@ -50,6 +50,90 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestStandaloneServerArgs(unittest.TestCase):
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch(
+        "sglang.srt.server_args.ServerArgs.get_model_config",
+        return_value=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        ),
+    )
+    def test_standalone_defaults_draft_tp_size_to_target_tp(
+        self, _mock_model_config, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="target-model",
+            speculative_algorithm="STANDALONE",
+            speculative_draft_model_path="draft-model",
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+        self.assertEqual(server_args.speculative_draft_tp_size, 4)
+        worker_cls = SpeculativeAlgorithm.STANDALONE.create_worker(server_args)
+        self.assertEqual(worker_cls.__name__, "StandaloneWorker")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch(
+        "sglang.srt.server_args.ServerArgs.get_model_config",
+        return_value=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        ),
+    )
+    def test_standalone_accepts_asymmetric_draft_tp_size_one(
+        self, _mock_model_config, _mock_resolve
+    ):
+        server_args = ServerArgs(
+            model_path="target-model",
+            speculative_algorithm="STANDALONE",
+            speculative_draft_model_path="draft-model",
+            speculative_draft_tp_size=1,
+            speculative_num_steps=4,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=5,
+            tp_size=4,
+        )
+        self.assertEqual(server_args.speculative_draft_tp_size, 1)
+        worker_cls = SpeculativeAlgorithm.STANDALONE.create_worker(server_args)
+        self.assertEqual(worker_cls.__name__, "StandaloneWorkerV2")
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch(
+        "sglang.srt.server_args.ServerArgs.get_model_config",
+        return_value=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        ),
+    )
+    def test_standalone_rejects_unsupported_draft_tp_size(
+        self, _mock_model_config, _mock_resolve
+    ):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="target-model",
+                speculative_algorithm="STANDALONE",
+                speculative_draft_model_path="draft-model",
+                speculative_draft_tp_size=2,
+                speculative_num_steps=4,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=5,
+                tp_size=4,
+            )
+        self.assertIn("speculative-draft-tp-size", str(context.exception))
+
+
 class TestTliServerArgs(unittest.TestCase):
     @patch(
         "sglang.srt.server_args._resolve_or_download",
