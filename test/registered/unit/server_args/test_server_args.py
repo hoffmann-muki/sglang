@@ -117,6 +117,40 @@ class TestStandaloneServerArgs(unittest.TestCase):
             is_multimodal=False,
         ),
     )
+    def test_standalone_accepts_draft_tp_size_from_cli(
+        self, _mock_model_config, _mock_resolve
+    ):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "target-model",
+                "--speculative-algorithm",
+                "STANDALONE",
+                "--speculative-draft-model-path",
+                "draft-model",
+                "--speculative-draft-tp-size",
+                "1",
+                "--speculative-num-steps",
+                "4",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "5",
+            ]
+        )
+        self.assertEqual(server_args.speculative_draft_tp_size, 1)
+
+    @patch(
+        "sglang.srt.server_args._resolve_or_download",
+        side_effect=lambda path, **kwargs: path,
+    )
+    @patch(
+        "sglang.srt.server_args.ServerArgs.get_model_config",
+        return_value=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            is_multimodal=False,
+        ),
+    )
     def test_standalone_rejects_unsupported_draft_tp_size(
         self, _mock_model_config, _mock_resolve
     ):

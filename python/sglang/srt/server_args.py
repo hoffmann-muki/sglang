@@ -3798,7 +3798,8 @@ class ServerArgs:
                         "1 or the target --tp size."
                     )
         elif (
-            self.speculative_algorithm not in ("FAST_DLLM_V2", "EAGLE3")
+            self.speculative_algorithm
+            not in ("STANDALONE", "FAST_DLLM_V2", "EAGLE3")
             and self.speculative_draft_tp_size is not None
         ):
             raise ValueError(
