@@ -10,8 +10,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from sglang.srt.speculative.standalone_worker import StandaloneWorker
-from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -57,24 +55,11 @@ def _make_batch(mode: ForwardMode):
 
 
 class TestCudaGraphRunnerStandalone(unittest.TestCase):
-    def test_standalone_stays_eager_for_decode_and_verify(self):
+    def test_standalone_can_run_cuda_graph_replay(self):
         runner = _make_runner(SpeculativeAlgorithm.STANDALONE)
 
-        self.assertFalse(runner.can_run(_make_batch(ForwardMode.DECODE)))
-        self.assertFalse(runner.can_run(_make_batch(ForwardMode.TARGET_VERIFY)))
-
-
-class TestStandaloneWorkerCudaGraphs(unittest.TestCase):
-    def test_standalone_workers_skip_graph_initialization(self):
-        for worker_cls in (StandaloneWorker, StandaloneWorkerV2):
-            worker = worker_cls.__new__(worker_cls)
-            worker.cuda_graph_runner = object()
-            worker.cuda_graph_runner_for_draft_extend = object()
-
-            worker.init_cuda_graphs()
-
-            self.assertIsNone(worker.cuda_graph_runner)
-            self.assertIsNone(worker.cuda_graph_runner_for_draft_extend)
+        self.assertTrue(runner.can_run(_make_batch(ForwardMode.TARGET_VERIFY)))
+        self.assertTrue(runner.can_run(_make_batch(ForwardMode.DECODE)))
 
 
 if __name__ == "__main__":

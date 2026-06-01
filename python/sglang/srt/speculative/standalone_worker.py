@@ -109,8 +109,3 @@ class StandaloneWorker(EAGLEWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-
-    def init_cuda_graphs(self):
-        """Keep standalone eager for now; replay will be re-enabled later."""
-        self.cuda_graph_runner = None
-        self.cuda_graph_runner_for_draft_extend = None
