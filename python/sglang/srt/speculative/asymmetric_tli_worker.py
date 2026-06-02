@@ -136,6 +136,17 @@ class AsymmetricTLIWorker(TLIWorker):
             return self.draft_model_runner
         return self.target_model_runner
 
+    def get_worker_info(self):
+        """Expose the target worker's scheduler contract.
+
+        The asymmetric colocated TLI wrapper does not own the scheduler-facing
+        sizing fields that ``TpModelWorker.get_worker_info()`` expects. The
+        target worker already owns the authoritative KV pool and stream state
+        for scheduling, so we forward its worker info directly.
+        """
+
+        return self.target_worker.get_worker_info()
+
     @contextmanager
     def _root_draft_context(self):
         with (

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.asymmetric_tli_worker import AsymmetricTLIWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -386,6 +387,14 @@ class TestTliServerArgs(unittest.TestCase):
         )
         worker_cls = SpeculativeAlgorithm.TLI.create_worker(server_args)
         self.assertEqual(worker_cls.__name__, "AsymmetricTLIWorker")
+
+    def test_asymmetric_tli_worker_forwards_scheduler_info(self):
+        worker = AsymmetricTLIWorker.__new__(AsymmetricTLIWorker)
+        worker.target_worker = MagicMock()
+        worker.target_worker.get_worker_info.return_value = tuple(range(12))
+
+        self.assertEqual(worker.get_worker_info(), tuple(range(12)))
+        worker.target_worker.get_worker_info.assert_called_once()
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
