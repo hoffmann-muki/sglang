@@ -101,6 +101,7 @@ class AsymmetricTLIWorker(TLIWorker):
         self.hot_token_id = None
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
+        self._draft_max_token_pool_size = None
 
         if self._is_draft_rank:
             self._init_root_draft_model(
@@ -117,6 +118,19 @@ class AsymmetricTLIWorker(TLIWorker):
                 "Asymmetric colocated TLI: target TP rank %s is a passive draft participant.",
                 tp_rank,
             )
+
+        world_group = self.target_worker.world_group
+        payload = (
+            [self._draft_model_runner.max_token_pool_size]
+            if self._is_draft_rank
+            else []
+        )
+        self._draft_max_token_pool_size = broadcast_pyobj(
+            payload,
+            world_group.rank,
+            world_group.cpu_group,
+            src=world_group.first_rank,
+        )[0]
 
     @property
     def target_model_runner(self):
@@ -137,15 +151,57 @@ class AsymmetricTLIWorker(TLIWorker):
         return self.target_model_runner
 
     def get_worker_info(self):
-        """Expose the target worker's scheduler contract.
+        """Expose the target worker's scheduler contract capped by draft KV.
 
         The asymmetric colocated TLI wrapper does not own the scheduler-facing
         sizing fields that ``TpModelWorker.get_worker_info()`` expects. The
-        target worker already owns the authoritative KV pool and stream state
-        for scheduling, so we forward its worker info directly.
+        target worker owns most scheduler state, but the root draft has a
+        separately profiled KV pool. Keep the scheduler-visible target capacity
+        within that draft capacity so cache locations remain valid for both.
         """
 
-        return self.target_worker.get_worker_info()
+        info = list(self.target_worker.get_worker_info())
+        draft_max_tokens = self._draft_max_token_pool_size
+        if draft_max_tokens is None:
+            return tuple(info)
+
+        self._cap_target_allocator_to_draft_pool(draft_max_tokens)
+        info[0] = min(info[0], draft_max_tokens)
+        info[4] = min(info[4], draft_max_tokens - 1)
+        info[5] = min(info[5], info[4] - 5)
+        info[11] = min(info[11], draft_max_tokens)
+        return tuple(info)
+
+    def _cap_target_allocator_to_draft_pool(self, draft_max_tokens: int):
+        allocator = self.token_to_kv_pool_allocator
+        page_size = allocator.page_size
+        capped_size = draft_max_tokens // page_size * page_size
+        if capped_size <= 0:
+            raise RuntimeError(
+                "Asymmetric TLI draft KV pool is too small to serve any tokens: "
+                f"draft_max_tokens={draft_max_tokens}, page_size={page_size}."
+            )
+
+        current_limit = getattr(allocator, "_spec_draft_capacity_limit", None)
+        if current_limit == capped_size:
+            return
+
+        allocator.size = min(allocator.size, capped_size)
+        if hasattr(allocator, "num_pages"):
+            allocator.num_pages = allocator.size // page_size
+            max_free = allocator.num_pages
+        else:
+            max_free = allocator.size
+
+        allocator.free_pages = allocator.free_pages[allocator.free_pages <= max_free]
+        allocator.release_pages = allocator.release_pages[
+            allocator.release_pages <= max_free
+        ]
+        allocator._spec_draft_capacity_limit = capped_size
+
+    def clear_cache_pool(self):
+        if self._is_draft_rank:
+            self.draft_model_runner.token_to_kv_pool_allocator.clear()
 
     @contextmanager
     def _root_draft_context(self):
@@ -171,6 +227,7 @@ class AsymmetricTLIWorker(TLIWorker):
         draft_args.tp_size = 1
         draft_args.ep_size = 1
         draft_args.enable_dp_attention = False
+        draft_args.speculative_draft_tp_size = 1
         draft_args.disable_cuda_graph = True
         draft_args.context_length = self.target_model_runner.model_config.context_len
 
@@ -198,8 +255,8 @@ class AsymmetricTLIWorker(TLIWorker):
                 server_args=draft_args,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=self.target_model_runner.memory_pool_config,
+                token_to_kv_pool_allocator=None,
+                memory_pool_config=None,
             )
             self.model_config = self._draft_model_runner.model_config
 

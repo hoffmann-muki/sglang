@@ -1,12 +1,15 @@
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.asymmetric_tli_worker import AsymmetricTLIWorker
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -392,9 +395,104 @@ class TestTliServerArgs(unittest.TestCase):
         worker = AsymmetricTLIWorker.__new__(AsymmetricTLIWorker)
         worker.target_worker = MagicMock()
         worker.target_worker.get_worker_info.return_value = tuple(range(12))
+        worker._draft_max_token_pool_size = None
 
         self.assertEqual(worker.get_worker_info(), tuple(range(12)))
         worker.target_worker.get_worker_info.assert_called_once()
+
+    def test_asymmetric_tli_worker_caps_scheduler_info_to_draft_pool(self):
+        worker = AsymmetricTLIWorker.__new__(AsymmetricTLIWorker)
+        worker.target_worker = MagicMock()
+        worker.target_worker.get_worker_info.return_value = (
+            100,
+            16,
+            8,
+            8,
+            99,
+            94,
+            0,
+            "cuda",
+            "stream",
+            8,
+            4096,
+            100,
+        )
+        worker._draft_max_token_pool_size = 60
+        worker.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            size=100,
+            free_pages=torch.arange(1, 101),
+            release_pages=torch.arange(1, 101),
+        )
+
+        info = worker.get_worker_info()
+
+        self.assertEqual(info[0], 60)
+        self.assertEqual(info[4], 59)
+        self.assertEqual(info[5], 54)
+        self.assertEqual(info[11], 60)
+        self.assertEqual(worker.token_to_kv_pool_allocator.size, 60)
+        self.assertLessEqual(
+            int(worker.token_to_kv_pool_allocator.free_pages.max()), 60
+        )
+
+    @patch("sglang.srt.speculative.asymmetric_tli_worker.get_tokenizer")
+    @patch("sglang.srt.speculative.asymmetric_tli_worker.ModelRunner")
+    @patch("sglang.srt.speculative.asymmetric_tli_worker.ModelConfig.from_server_args")
+    def test_asymmetric_tli_root_draft_uses_independent_memory_pool(
+        self, mock_model_config, mock_model_runner, _mock_get_tokenizer
+    ):
+        worker = AsymmetricTLIWorker.__new__(AsymmetricTLIWorker)
+        worker._target_model_runner = SimpleNamespace(
+            model_config=SimpleNamespace(context_len=4096, vocab_size=128),
+            memory_pool_config=object(),
+        )
+        worker.req_to_token_pool = object()
+        worker.token_to_kv_pool_allocator = object()
+        worker.device = "cpu"
+        worker._root_draft_context = MagicMock(return_value=nullcontext())
+        worker._create_vocab_mapping = MagicMock(return_value=object())
+        worker._try_prune_draft_lm_head = MagicMock()
+        worker.init_attention_backend = MagicMock()
+        mock_model_config.return_value = SimpleNamespace()
+        mock_model_runner.return_value = SimpleNamespace(
+            model_config=SimpleNamespace(vocab_size=64)
+        )
+        server_args = SimpleNamespace(
+            tp_size=4,
+            pp_size=1,
+            ep_size=4,
+            enable_dp_attention=True,
+            disable_cuda_graph=False,
+            context_length=None,
+            speculative_draft_model_path="draft-model",
+            speculative_draft_model_revision="main",
+            mem_fraction_static=0.5,
+            tokenizer_path="target-tokenizer",
+            tokenizer_mode="auto",
+            trust_remote_code=False,
+            revision=None,
+            tokenizer_backend="huggingface",
+            remote_draft_tokenizer_path="draft-tokenizer",
+        )
+
+        worker._init_root_draft_model(
+            server_args=server_args,
+            gpu_id=0,
+            dp_rank=None,
+            moe_ep_rank=0,
+            attn_cp_rank=0,
+            moe_dp_rank=0,
+            nccl_port=1234,
+        )
+
+        _, kwargs = mock_model_runner.call_args
+        self.assertIs(kwargs["req_to_token_pool"], worker.req_to_token_pool)
+        self.assertIsNone(kwargs["token_to_kv_pool_allocator"])
+        self.assertIsNone(kwargs["memory_pool_config"])
+        self.assertEqual(kwargs["server_args"].tp_size, 1)
+        self.assertEqual(kwargs["server_args"].speculative_draft_tp_size, 1)
+        self.assertTrue(kwargs["server_args"].disable_cuda_graph)
 
     @patch(
         "sglang.srt.server_args._resolve_or_download",
