@@ -62,5 +62,22 @@ class TestCudaGraphRunnerStandalone(unittest.TestCase):
         self.assertTrue(runner.can_run(_make_batch(ForwardMode.DECODE)))
 
 
+class TestCudaGraphRunnerTLI(unittest.TestCase):
+    def test_tli_target_verify_can_run_cuda_graph_replay(self):
+        runner = _make_runner(SpeculativeAlgorithm.TLI)
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch = _make_batch(ForwardMode.TARGET_VERIFY)
+        batch.spec_info = SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL)
+
+        self.assertTrue(runner.can_run(batch))
+
+    def test_tli_target_verify_requires_matching_hidden_capture_mode(self):
+        runner = _make_runner(SpeculativeAlgorithm.TLI)
+        batch = _make_batch(ForwardMode.TARGET_VERIFY)
+        batch.spec_info = SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL)
+
+        self.assertFalse(runner.can_run(batch))
+
+
 if __name__ == "__main__":
     unittest.main()
