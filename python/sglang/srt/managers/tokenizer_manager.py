@@ -2084,14 +2084,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ret.append(None)
         return ret
 
-    def _log_spec_metrics_debug(self, message: str, *args) -> None:
-        """Emit a bounded diagnostic log for speculative response metadata."""
-        count = getattr(self, "_spec_metrics_debug_log_count", 0)
-        if count >= 20:
-            return
-        self._spec_metrics_debug_log_count = count + 1
-        logger.warning("[SpecMetricsDebug] " + message, *args)
-
     def _calculate_spec_decoding_metrics(
         self,
         meta_info: Dict[str, Any],
@@ -2126,19 +2118,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else None
         )
 
-        self._log_spec_metrics_debug(
-            "tokenizer received spec counters index=%s verify_ct=%s "
-            "accepted_drafts=%s completion_tokens=%s draft_tokens=%s "
-            "verify_list_len=%s accepted_list_len=%s",
-            i,
-            verify_ct,
-            accepted_drafts,
-            completion_tokens,
-            self.server_args.speculative_num_draft_tokens,
-            len(spec_verify_ct) if spec_verify_ct is not None else None,
-            len(spec_accepted_drafts) if spec_accepted_drafts is not None else None,
-        )
-
         if verify_ct is not None and verify_ct > 0 and accepted_drafts is not None:
             # Total number of proposed draft tokens per request.
             all_drafts = verify_ct * (
@@ -2159,23 +2138,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accepted_drafts"] = accepted_drafts
                 meta_info["spec_proposed_drafts"] = all_drafts
                 meta_info["spec_verify_ct"] = verify_ct
-                self._log_spec_metrics_debug(
-                    "tokenizer emitted spec metrics verify_ct=%s "
-                    "accepted_drafts=%s proposed_drafts=%s accept_length=%s",
-                    verify_ct,
-                    accepted_drafts,
-                    all_drafts,
-                    meta_info["spec_accept_length"],
-                )
-            else:
-                self._log_spec_metrics_debug(
-                    "tokenizer skipped spec metrics because proposed drafts is %s",
-                    all_drafts,
-                )
-        else:
-            self._log_spec_metrics_debug(
-                "tokenizer skipped spec metrics because counters are missing or zero"
-            )
 
         # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
         if (

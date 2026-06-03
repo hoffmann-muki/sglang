@@ -3086,9 +3086,7 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if self.is_generation and not batch.spec_algorithm.is_none():
-            self._record_spec_acceptance_if_available(
-                result, batch, getattr(result, "can_run_cuda_graph", False)
-            )
+            self._record_spec_acceptance_if_available(result, batch)
 
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
