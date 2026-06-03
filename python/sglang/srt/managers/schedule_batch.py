@@ -2244,6 +2244,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    def _sync_spec_v2_decode_input_ids(self) -> None:
+        """Refresh decode input ids for spec-v2 batches.
+
+        Spec-v2 keeps the scheduler batch as the authoritative mutable state, so
+        decode still needs to source the next-step token buffer from the current
+        output_ids just like the non-speculative path. Without this sync, a
+        stale input_ids tensor from an earlier stage can reach the draft
+        normalizer and underflow the live request count.
+        """
+        if self.output_ids is not None:
+            logger.info(
+                "[SpecV2Trace] schedule_batch spec-v2 decode input sync: "
+                f"len(reqs)={len(self.reqs)}, "
+                f"input_ids_shape="
+                f"{tuple(self.input_ids.shape) if self.input_ids is not None else None}, "
+                f"output_ids_shape={tuple(self.output_ids.shape)}, "
+                f"seq_lens_shape={tuple(self.seq_lens.shape) if self.seq_lens is not None else None}"
+            )
+            self.input_ids = self.output_ids
+            logger.info(
+                "[SpecV2Trace] schedule_batch spec-v2 decode input synced: "
+                f"len(reqs)={len(self.reqs)}, "
+                f"input_ids_shape="
+                f"{tuple(self.input_ids.shape) if self.input_ids is not None else None}, "
+                f"output_ids_shape={tuple(self.output_ids.shape)}, "
+                f"seq_lens_shape={tuple(self.seq_lens.shape) if self.seq_lens is not None else None}"
+            )
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2257,6 +2285,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
+            self._sync_spec_v2_decode_input_ids()
             draft_input: EagleDraftInput = self.spec_info
             logger.info(
                 "[SpecV2Trace] schedule_batch.prepare_for_decode entry: "
