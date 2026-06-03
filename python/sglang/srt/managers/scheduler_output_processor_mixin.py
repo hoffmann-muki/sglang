@@ -415,6 +415,42 @@ class SchedulerOutputProcessorMixin:
             [req.spec_accepted_drafts for req in batch.reqs],
         )
 
+    def _record_spec_acceptance_if_available(
+        self: Scheduler,
+        result: GenerationBatchResult,
+        batch: ScheduleBatch,
+        can_run_cuda_graph: bool,
+    ) -> None:
+        if batch.spec_algorithm.is_none():
+            return
+
+        if (
+            not batch.is_spec_v2
+            and result.accept_lens is not None
+            and result.accept_length_per_req_cpu is None
+        ):
+            self._log_spec_metrics_debug(
+                "non-overlap spec result has accept_lens; algorithm=%s "
+                "forward_mode=%s can_run_cuda_graph=%s",
+                batch.spec_algorithm,
+                batch.forward_mode,
+                can_run_cuda_graph,
+            )
+            self._record_spec_acceptance_from_accept_lens(result, batch)
+            return
+
+        self._log_spec_metrics_debug(
+            "result accounting state; algorithm=%s forward_mode=%s "
+            "is_spec_v2=%s has_accept_lens=%s "
+            "has_accept_length_per_req_cpu=%s num_accepted_drafts=%s",
+            batch.spec_algorithm,
+            batch.forward_mode,
+            batch.is_spec_v2,
+            result.accept_lens is not None,
+            result.accept_length_per_req_cpu is not None,
+            result.num_accepted_drafts,
+        )
+
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -443,30 +479,6 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        if (
-            not batch.spec_algorithm.is_none()
-            and not batch.is_spec_v2
-            and result.accept_lens is not None
-            and result.accept_length_per_req_cpu is None
-        ):
-            self._log_spec_metrics_debug(
-                "non-overlap spec result has accept_lens; algorithm=%s "
-                "can_run_cuda_graph=%s",
-                batch.spec_algorithm,
-                can_run_cuda_graph,
-            )
-            self._record_spec_acceptance_from_accept_lens(result, batch)
-        elif not batch.spec_algorithm.is_none():
-            self._log_spec_metrics_debug(
-                "decode result accounting state; algorithm=%s is_spec_v2=%s "
-                "has_accept_lens=%s has_accept_length_per_req_cpu=%s "
-                "num_accepted_drafts=%s",
-                batch.spec_algorithm,
-                batch.is_spec_v2,
-                result.accept_lens is not None,
-                result.accept_length_per_req_cpu is not None,
-                result.num_accepted_drafts,
-            )
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
