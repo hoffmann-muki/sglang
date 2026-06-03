@@ -357,8 +357,7 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
-        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
+        self._record_spec_acceptance_from_accept_lens(result, batch, accept_lens)
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -369,13 +368,34 @@ class SchedulerOutputProcessorMixin:
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
-            req.spec_verify_ct += 1
-
-            accepted_draft_tokens = result.accept_length_per_req_cpu[i]
-            req.spec_accepted_drafts += accepted_draft_tokens
-            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
+
+    def _record_spec_acceptance_from_accept_lens(
+        self: Scheduler,
+        result: GenerationBatchResult,
+        batch: ScheduleBatch,
+        accept_lens: Optional[List[int]] = None,
+    ) -> None:
+        """Record per-request acceptance counters from accepted lengths with bonus.
+
+        V2-style workers report accepted lengths including the bonus token. The
+        request metadata exposed to users tracks drafts only, so subtract the
+        bonus before updating the counters.
+        """
+        if accept_lens is None:
+            assert result.accept_lens is not None
+            accept_lens = result.accept_lens.tolist()
+
+        result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
+        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
+
+        for req, accepted_draft_tokens in zip(
+            batch.reqs, result.accept_length_per_req_cpu, strict=True
+        ):
+            req.spec_verify_ct += 1
+            req.spec_accepted_drafts += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -405,6 +425,13 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        if (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and result.accept_lens is not None
+            and result.accept_length_per_req_cpu is None
+        ):
+            self._record_spec_acceptance_from_accept_lens(result, batch)
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:

@@ -22,7 +22,6 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
                 "spec_proposed_drafts": 10,
                 "cached_tokens": 3,
                 "cached_tokens_details": {"device": 2, "host": 1},
-                "decode_throughput": 20.0,
                 "latency_breakdown": {
                     "draft_proposal_time": 0.20,
                     "target_verification_time": 0.40,
@@ -41,7 +40,6 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
                     "storage": 4,
                     "storage_backend": "local",
                 },
-                "decode_throughput": 30.0,
                 "latency_breakdown": {
                     "draft_proposal_time": 0.30,
                     "target_verification_time": 0.50,
@@ -63,7 +61,6 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
         self.assertEqual(aggregated["cached_tokens_details"]["host"], 1)
         self.assertEqual(aggregated["cached_tokens_details"]["storage"], 4)
         self.assertEqual(aggregated["cached_tokens_details"]["storage_backend"], "local")
-        self.assertAlmostEqual(aggregated["decode_throughput"], 25.0)
         self.assertAlmostEqual(
             aggregated["latency_breakdown"]["draft_proposal_time"], 0.25
         )
@@ -117,7 +114,6 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
             },
             cached_tokens=256,
             cached_tokens_details={"device": 256},
-            decode_throughput=42.0,
         )
 
         with tempfile.NamedTemporaryFile() as fout:
@@ -132,7 +128,6 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
         self.assertEqual(payload["spec_verify_ct"], 2)
         self.assertEqual(payload["cached_tokens"], 256)
         self.assertEqual(payload["cached_tokens_details"], {"device": 256})
-        self.assertEqual(payload["decode_throughput"], 42.0)
         self.assertEqual(payload["latency_breakdown"]["draft_proposal_time"], 0.1)
 
 

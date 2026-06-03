@@ -227,7 +227,6 @@ def aggregate_sglang_meta_info(meta_infos: List[Dict[str, Any]]) -> Dict[str, An
         "latency_breakdown": _aggregate_latency_breakdown(meta_infos),
         "cached_tokens": _sum_int_meta(meta_infos, "cached_tokens"),
         "cached_tokens_details": _merge_cached_tokens_details(meta_infos),
-        "decode_throughput": _avg_numeric_meta(meta_infos, "decode_throughput"),
     }
 
 
@@ -491,7 +490,6 @@ class BenchOneCaseResult(BaseModel):
     latency_breakdown: Optional[Dict[str, float]] = None
     cached_tokens: Optional[int] = None
     cached_tokens_details: Optional[Dict[str, Any]] = None
-    decode_throughput: Optional[float] = None
     profile_link: Optional[str] = None
 
     def dump_to_jsonl(self, result_filename: str):
@@ -537,11 +535,6 @@ class BenchOneCaseResult(BaseModel):
                 "latency_breakdown": latency_breakdown,
                 "cached_tokens": self.cached_tokens,
                 "cached_tokens_details": self.cached_tokens_details,
-                "decode_throughput": (
-                    round(self.decode_throughput, 2)
-                    if self.decode_throughput is not None
-                    else None
-                ),
             }
             fout.write(json.dumps(res) + "\n")
 
@@ -942,8 +935,6 @@ def run_one_case(
         print(f"spec_accept_rate: {aggregated_meta_info['spec_accept_rate']:.4f}")
     if case_cache_hit_rate is not None:
         print(f"cache hit rate: {case_cache_hit_rate:.4f}")
-    if aggregated_meta_info.get("decode_throughput") is not None:
-        print(f"decode_throughput: {aggregated_meta_info['decode_throughput']:.2f} tok/s")
 
     # Dump results
     result = BenchOneCaseResult(
@@ -967,7 +958,6 @@ def run_one_case(
         latency_breakdown=aggregated_meta_info.get("latency_breakdown"),
         cached_tokens=aggregated_meta_info.get("cached_tokens"),
         cached_tokens_details=aggregated_meta_info.get("cached_tokens_details"),
-        decode_throughput=aggregated_meta_info.get("decode_throughput"),
         profile_link=profile_link,
     )
 
@@ -1086,7 +1076,6 @@ def get_report_summary(
         "proposed drafts",
         "verify ct",
         "ITL (ms)",
-        "decode throughput (tok/s)",
         "input cost ($/1M)",
         "output cost ($/1M)",
         "cache hit rate",
@@ -1122,7 +1111,6 @@ def get_report_summary(
             _fmt_optional_int(res.spec_proposed_drafts),
             _fmt_optional_int(res.spec_verify_ct),
             f"{itl_ms:.2f}",
-            _fmt_optional_float(res.decode_throughput, 2),
             f"{input_cost:.2f}",
             f"{output_cost:.2f}",
             cache_hit_rate,
