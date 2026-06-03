@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -1378,6 +1379,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
             # Draft prefill
+            draft_start_time = time.perf_counter()
             with self.draft_worker.draft_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
@@ -1387,9 +1389,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+            draft_proposal_time = time.perf_counter() - draft_start_time
+            for req in batch.reqs:
+                req.time_stats.observe_draft_rpc_timing(
+                    draft_proposal_time=draft_proposal_time
+                )
 
             return batch_output
-        
+
         else:
             if batch.spec_info is None:
                 capture_mode = (
@@ -1405,8 +1412,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                 )
 
+            set_time_batch(batch.reqs, "set_spec_draft_start_time")
             with self.draft_worker.draft_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+            set_time_batch(batch.reqs, "set_spec_draft_end_time")
 
             assert verify_input.is_verify_input()
 
@@ -1416,10 +1425,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             batch.spec_info = verify_input
 
+            set_time_batch(batch.reqs, "set_spec_verify_start_time")
             batch_output = self.verify(batch)
+            set_time_batch(batch.reqs, "set_spec_verify_end_time")
 
+            draft_extend_start_time = time.perf_counter()
+            set_time_batch(
+                batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
+            )
             with self.draft_worker.draft_context():
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            draft_extend_time = time.perf_counter() - draft_extend_start_time
+            for req in batch.reqs:
+                req.time_stats.observe_draft_rpc_timing(
+                    draft_proposal_time=draft_extend_time
+                )
+            set_time_batch(
+                batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
+            )
 
             return batch_output
 

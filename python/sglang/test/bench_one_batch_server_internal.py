@@ -8,7 +8,7 @@ import random
 import re
 import time
 from types import SimpleNamespace
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -82,6 +82,153 @@ def calculate_cache_hit_rate(
     if prompt_delta > 0:
         return cached_delta / prompt_delta
     return None
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_numeric_meta(meta_infos: List[Dict[str, Any]], key: str) -> Optional[float]:
+    total = 0.0
+    found = False
+    for meta_info in meta_infos:
+        value = _safe_float(meta_info.get(key))
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
+def _avg_numeric_meta(meta_infos: List[Dict[str, Any]], key: str) -> Optional[float]:
+    total = 0.0
+    count = 0
+    for meta_info in meta_infos:
+        value = _safe_float(meta_info.get(key))
+        if value is None:
+            continue
+        total += value
+        count += 1
+    return total / count if count > 0 else None
+
+
+def _sum_int_meta(meta_infos: List[Dict[str, Any]], key: str) -> Optional[int]:
+    total = 0
+    found = False
+    for meta_info in meta_infos:
+        value = _safe_int(meta_info.get(key))
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
+def _merge_cached_tokens_details(
+    meta_infos: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    merged: Dict[str, Any] = {}
+    storage_backends = set()
+
+    for meta_info in meta_infos:
+        details = meta_info.get("cached_tokens_details")
+        if not isinstance(details, dict):
+            continue
+
+        for key, value in details.items():
+            numeric = _safe_float(value)
+            if numeric is not None:
+                merged[key] = merged.get(key, 0.0) + numeric
+            elif key == "storage_backend" and value:
+                storage_backends.add(str(value))
+
+    if storage_backends:
+        merged["storage_backend"] = (
+            next(iter(storage_backends))
+            if len(storage_backends) == 1
+            else sorted(storage_backends)
+        )
+
+    for key, value in list(merged.items()):
+        if isinstance(value, float) and value.is_integer():
+            merged[key] = int(value)
+
+    return merged or None
+
+
+def _aggregate_latency_breakdown(
+    meta_infos: List[Dict[str, Any]],
+) -> Optional[Dict[str, float]]:
+    totals: Dict[str, float] = {}
+    count = 0
+    for meta_info in meta_infos:
+        breakdown = meta_info.get("latency_breakdown")
+        if not isinstance(breakdown, dict):
+            continue
+        count += 1
+        for key, value in breakdown.items():
+            numeric = _safe_float(value)
+            if numeric is not None:
+                totals[key] = totals.get(key, 0.0) + numeric
+
+    if not totals:
+        return None
+    return {key: value / count for key, value in totals.items()}
+
+
+def aggregate_sglang_meta_info(meta_infos: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate final per-request meta_info without relying on server globals."""
+
+    spec_verify_ct = _sum_int_meta(meta_infos, "spec_verify_ct")
+    spec_accepted_drafts = _sum_int_meta(meta_infos, "spec_accepted_drafts")
+    spec_proposed_drafts = _sum_int_meta(meta_infos, "spec_proposed_drafts")
+    completion_tokens = _sum_numeric_meta(meta_infos, "completion_tokens")
+
+    spec_accept_rate = None
+    if spec_accepted_drafts is not None and spec_proposed_drafts:
+        spec_accept_rate = spec_accepted_drafts / spec_proposed_drafts
+
+    spec_accept_length = None
+    if completion_tokens is not None and spec_verify_ct:
+        spec_accept_length = completion_tokens / spec_verify_ct
+    elif spec_verify_ct:
+        weighted = 0.0
+        weight = 0
+        for meta_info in meta_infos:
+            verify_ct = _safe_int(meta_info.get("spec_verify_ct"))
+            accept_length = _safe_float(meta_info.get("spec_accept_length"))
+            if verify_ct is None or accept_length is None:
+                continue
+            weighted += accept_length * verify_ct
+            weight += verify_ct
+        if weight > 0:
+            spec_accept_length = weighted / weight
+
+    return {
+        "spec_accept_length": spec_accept_length,
+        "spec_accept_rate": spec_accept_rate,
+        "spec_accepted_drafts": spec_accepted_drafts,
+        "spec_proposed_drafts": spec_proposed_drafts,
+        "spec_verify_ct": spec_verify_ct,
+        "latency_breakdown": _aggregate_latency_breakdown(meta_infos),
+        "cached_tokens": _sum_int_meta(meta_infos, "cached_tokens"),
+        "cached_tokens_details": _merge_cached_tokens_details(meta_infos),
+        "decode_throughput": _avg_numeric_meta(meta_infos, "decode_throughput"),
+    }
 
 
 @dataclasses.dataclass
@@ -336,10 +483,27 @@ class BenchOneCaseResult(BaseModel):
     last_gen_throughput: float
     acc_length: float
     cache_hit_rate: Optional[float] = None
+    spec_accept_length: Optional[float] = None
+    spec_accept_rate: Optional[float] = None
+    spec_accepted_drafts: Optional[int] = None
+    spec_proposed_drafts: Optional[int] = None
+    spec_verify_ct: Optional[int] = None
+    latency_breakdown: Optional[Dict[str, float]] = None
+    cached_tokens: Optional[int] = None
+    cached_tokens_details: Optional[Dict[str, Any]] = None
+    decode_throughput: Optional[float] = None
     profile_link: Optional[str] = None
 
     def dump_to_jsonl(self, result_filename: str):
         with open(result_filename, "a") as fout:
+            latency_breakdown = (
+                {
+                    key: round(value, 6)
+                    for key, value in self.latency_breakdown.items()
+                }
+                if self.latency_breakdown is not None
+                else None
+            )
             res = {
                 "run_name": self.run_name,
                 "batch_size": self.batch_size,
@@ -355,6 +519,27 @@ class BenchOneCaseResult(BaseModel):
                 "cache_hit_rate": (
                     round(self.cache_hit_rate, 4)
                     if self.cache_hit_rate is not None
+                    else None
+                ),
+                "spec_accept_length": (
+                    round(self.spec_accept_length, 4)
+                    if self.spec_accept_length is not None
+                    else None
+                ),
+                "spec_accept_rate": (
+                    round(self.spec_accept_rate, 4)
+                    if self.spec_accept_rate is not None
+                    else None
+                ),
+                "spec_accepted_drafts": self.spec_accepted_drafts,
+                "spec_proposed_drafts": self.spec_proposed_drafts,
+                "spec_verify_ct": self.spec_verify_ct,
+                "latency_breakdown": latency_breakdown,
+                "cached_tokens": self.cached_tokens,
+                "cached_tokens_details": self.cached_tokens_details,
+                "decode_throughput": (
+                    round(self.decode_throughput, 2)
+                    if self.decode_throughput is not None
                     else None
                 ),
             }
@@ -663,6 +848,7 @@ def run_one_case(
 
     # Get the TTFT of the last request in the batch
     last_ttft = 0.0
+    final_meta_infos: List[Dict[str, Any]] = []
     if backend == "vllm":
         # Parse OpenAI-compatible streaming format from vLLM
         first_token_indices = set()
@@ -697,6 +883,8 @@ def run_one_case(
                 )
                 if data["meta_info"]["completion_tokens"] == 1:
                     last_ttft = time.perf_counter() - tic
+                if data["meta_info"]["finish_reason"] is not None:
+                    final_meta_infos.append(data["meta_info"])
 
     # Compute metrics
     latency = time.perf_counter() - tic
@@ -708,17 +896,35 @@ def run_one_case(
         # vLLM does not expose these metrics via API
         last_gen_throughput = -1
         acc_length = -1
+        aggregated_meta_info = aggregate_sglang_meta_info([])
     else:
+        aggregated_meta_info = aggregate_sglang_meta_info(final_meta_infos)
         response = requests.get(url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
         internal_state = server_info.get("internal_states", [{}])
         last_gen_throughput = internal_state[0].get("last_gen_throughput", None) or -1
-        acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
+        acc_length = (
+            aggregated_meta_info.get("spec_accept_length")
+            or internal_state[0].get("avg_spec_accept_length", None)
+            or -1
+        )
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url) if enable_metrics else None
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
+    response_cached_tokens = aggregated_meta_info.get("cached_tokens")
+    response_prompt_tokens = _sum_numeric_meta(final_meta_infos, "prompt_tokens")
+    response_cache_hit_rate = (
+        response_cached_tokens / response_prompt_tokens
+        if response_cached_tokens is not None and response_prompt_tokens
+        else None
+    )
+    case_cache_hit_rate = (
+        metrics_cache_hit_rate
+        if metrics_cache_hit_rate is not None
+        else response_cache_hit_rate
+    )
 
     # Print results
     print(f"batch size: {batch_size}")
@@ -732,8 +938,12 @@ def run_one_case(
     print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
     if acc_length > 0:
         print(f"acc_length: {acc_length:.2f} ")
-    if metrics_cache_hit_rate is not None:
-        print(f"cache hit rate: {metrics_cache_hit_rate:.4f}")
+    if aggregated_meta_info.get("spec_accept_rate") is not None:
+        print(f"spec_accept_rate: {aggregated_meta_info['spec_accept_rate']:.4f}")
+    if case_cache_hit_rate is not None:
+        print(f"cache hit rate: {case_cache_hit_rate:.4f}")
+    if aggregated_meta_info.get("decode_throughput") is not None:
+        print(f"decode_throughput: {aggregated_meta_info['decode_throughput']:.2f} tok/s")
 
     # Dump results
     result = BenchOneCaseResult(
@@ -748,7 +958,16 @@ def run_one_case(
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
         acc_length=acc_length,
-        cache_hit_rate=metrics_cache_hit_rate,
+        cache_hit_rate=case_cache_hit_rate,
+        spec_accept_length=aggregated_meta_info.get("spec_accept_length"),
+        spec_accept_rate=aggregated_meta_info.get("spec_accept_rate"),
+        spec_accepted_drafts=aggregated_meta_info.get("spec_accepted_drafts"),
+        spec_proposed_drafts=aggregated_meta_info.get("spec_proposed_drafts"),
+        spec_verify_ct=aggregated_meta_info.get("spec_verify_ct"),
+        latency_breakdown=aggregated_meta_info.get("latency_breakdown"),
+        cached_tokens=aggregated_meta_info.get("cached_tokens"),
+        cached_tokens_details=aggregated_meta_info.get("cached_tokens_details"),
+        decode_throughput=aggregated_meta_info.get("decode_throughput"),
         profile_link=profile_link,
     )
 
@@ -785,6 +1004,57 @@ def should_skip_due_to_max_running_requests(
     return False
 
 
+def _fmt_optional_float(value: Optional[float], digits: int = 2) -> str:
+    return f"{value:.{digits}f}" if value is not None else "n/a"
+
+
+def _fmt_optional_int(value: Optional[int]) -> str:
+    return str(value) if value is not None else "n/a"
+
+
+def _fmt_latency_breakdown(breakdown: Optional[Dict[str, float]]) -> str:
+    if not breakdown:
+        return "n/a"
+
+    ordered_keys = (
+        "draft_proposal_time",
+        "target_verification_time",
+        "grpc_communication_time",
+        "draft_queue_scheduling_time",
+        "target_queue_scheduling_time",
+        "other_time",
+    )
+    short_names = {
+        "draft_proposal_time": "draft",
+        "target_verification_time": "verify",
+        "grpc_communication_time": "comm",
+        "draft_queue_scheduling_time": "draft_q",
+        "target_queue_scheduling_time": "target_q",
+        "other_time": "other",
+    }
+    parts = []
+    for key in ordered_keys:
+        value = breakdown.get(key)
+        if value is not None:
+            parts.append(f"{short_names[key]}={value:.4f}")
+    return ", ".join(parts) if parts else "n/a"
+
+
+def _fmt_cached_tokens_details(details: Optional[Dict[str, Any]]) -> str:
+    if not details:
+        return "n/a"
+
+    parts = []
+    for key in ("device", "host", "storage"):
+        value = details.get(key)
+        if value is not None:
+            parts.append(f"{key}={int(value)}")
+    storage_backend = details.get("storage_backend")
+    if storage_backend:
+        parts.append(f"backend={storage_backend}")
+    return ", ".join(parts) if parts else json.dumps(details, sort_keys=True)
+
+
 def get_report_summary(
     results: List[BenchOneCaseResult], bench_args: BenchArgs, server_args: ServerArgs
 ):
@@ -811,17 +1081,28 @@ def get_report_summary(
         "input throughput (tok/s)",
         "output throughput (tok/s)",
         "acc length",
+        "acc rate",
+        "accepted drafts",
+        "proposed drafts",
+        "verify ct",
         "ITL (ms)",
+        "decode throughput (tok/s)",
         "input cost ($/1M)",
         "output cost ($/1M)",
         "cache hit rate",
+        "cached tokens",
+        "cached token details",
+        "latency breakdown (s)",
     ]
     if bench_args.profile:
         headers.append("profile")
 
     for res in results:
         hourly_cost = hourly_cost_per_gpu * server_args.tp_size
-        accept_length = f"{res.acc_length:.2f}" if res.acc_length > 0 else "n/a"
+        spec_accept_length = res.spec_accept_length
+        if spec_accept_length is None and res.acc_length > 0:
+            spec_accept_length = res.acc_length
+        accept_length = _fmt_optional_float(spec_accept_length, 2)
         itl_ms = 1000 * res.batch_size / res.output_throughput
         input_cost = 1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost
         output_cost = 1e6 / res.output_throughput / 3600 * hourly_cost
@@ -836,10 +1117,18 @@ def get_report_summary(
             f"{res.input_throughput:.2f}",
             f"{res.output_throughput:.2f}",
             accept_length,
+            _fmt_optional_float(res.spec_accept_rate, 4),
+            _fmt_optional_int(res.spec_accepted_drafts),
+            _fmt_optional_int(res.spec_proposed_drafts),
+            _fmt_optional_int(res.spec_verify_ct),
             f"{itl_ms:.2f}",
+            _fmt_optional_float(res.decode_throughput, 2),
             f"{input_cost:.2f}",
             f"{output_cost:.2f}",
             cache_hit_rate,
+            _fmt_optional_int(res.cached_tokens),
+            _fmt_cached_tokens_details(res.cached_tokens_details),
+            _fmt_latency_breakdown(res.latency_breakdown),
         ]
         if bench_args.profile:
             if res.profile_link:

@@ -458,9 +458,7 @@ class AsymmetricTLIWorker(TLIWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-        set_time_batch(batch.reqs, "set_spec_draft_start_time")
         spec_info, draft_proposal_time = self._broadcast_draft(batch)
-        set_time_batch(batch.reqs, "set_spec_draft_end_time")
         self._record_draft_timing(
             batch.reqs,
             draft_proposal_time=draft_proposal_time,
