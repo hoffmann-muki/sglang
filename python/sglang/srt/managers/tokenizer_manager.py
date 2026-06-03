@@ -2084,6 +2084,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ret.append(None)
         return ret
 
+    def _log_spec_metrics_debug(self, message: str, *args) -> None:
+        """Emit a bounded diagnostic log for speculative response metadata."""
+        count = getattr(self, "_spec_metrics_debug_log_count", 0)
+        if count >= 20:
+            return
+        self._spec_metrics_debug_log_count = count + 1
+        logger.warning("[SpecMetricsDebug] " + message, *args)
+
     def _calculate_spec_decoding_metrics(
         self,
         meta_info: Dict[str, Any],
@@ -2095,17 +2103,47 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        if (
-            hasattr(recv_obj, "spec_verify_ct")
-            and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_drafts")
-            and len(recv_obj.spec_accepted_drafts) > i
-        ):
+        spec_verify_ct = getattr(recv_obj, "spec_verify_ct", None)
+        spec_accepted_drafts = getattr(recv_obj, "spec_accepted_drafts", None)
+        spec_acceptance_histogram = getattr(
+            recv_obj, "spec_acceptance_histogram", None
+        )
+
+        verify_ct = (
+            spec_verify_ct[i]
+            if spec_verify_ct is not None and len(spec_verify_ct) > i
+            else None
+        )
+        accepted_drafts = (
+            spec_accepted_drafts[i]
+            if spec_accepted_drafts is not None and len(spec_accepted_drafts) > i
+            else None
+        )
+        completion_tokens = (
+            recv_obj.completion_tokens[i]
+            if getattr(recv_obj, "completion_tokens", None) is not None
+            and len(recv_obj.completion_tokens) > i
+            else None
+        )
+
+        self._log_spec_metrics_debug(
+            "tokenizer received spec counters index=%s verify_ct=%s "
+            "accepted_drafts=%s completion_tokens=%s draft_tokens=%s "
+            "verify_list_len=%s accepted_list_len=%s",
+            i,
+            verify_ct,
+            accepted_drafts,
+            completion_tokens,
+            self.server_args.speculative_num_draft_tokens,
+            len(spec_verify_ct) if spec_verify_ct is not None else None,
+            len(spec_accepted_drafts) if spec_accepted_drafts is not None else None,
+        )
+
+        if verify_ct is not None and verify_ct > 0 and accepted_drafts is not None:
             # Total number of proposed draft tokens per request.
-            all_drafts = recv_obj.spec_verify_ct[i] * (
+            all_drafts = verify_ct * (
                 self.server_args.speculative_num_draft_tokens - 1
             )
-            accepted_drafts = recv_obj.spec_accepted_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
             if all_drafts > 0:
@@ -2113,22 +2151,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
                 # accept_length: accepted_drafts / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                    completion_tokens / verify_ct
+                    if completion_tokens is not None
+                    else None
                 )
 
                 meta_info["spec_accepted_drafts"] = accepted_drafts
                 meta_info["spec_proposed_drafts"] = all_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+                meta_info["spec_verify_ct"] = verify_ct
+                self._log_spec_metrics_debug(
+                    "tokenizer emitted spec metrics verify_ct=%s "
+                    "accepted_drafts=%s proposed_drafts=%s accept_length=%s",
+                    verify_ct,
+                    accepted_drafts,
+                    all_drafts,
+                    meta_info["spec_accept_length"],
+                )
+            else:
+                self._log_spec_metrics_debug(
+                    "tokenizer skipped spec metrics because proposed drafts is %s",
+                    all_drafts,
+                )
+        else:
+            self._log_spec_metrics_debug(
+                "tokenizer skipped spec metrics because counters are missing or zero"
+            )
 
-            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
-            if (
-                recv_obj.spec_acceptance_histogram
-                and len(recv_obj.spec_acceptance_histogram) > i
-                and recv_obj.spec_acceptance_histogram[i]
-            ):
-                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
-                    i
-                ]
+        # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
+        if (
+            spec_acceptance_histogram
+            and len(spec_acceptance_histogram) > i
+            and spec_acceptance_histogram[i]
+        ):
+            meta_info["spec_accept_histogram"] = spec_acceptance_histogram[i]
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (

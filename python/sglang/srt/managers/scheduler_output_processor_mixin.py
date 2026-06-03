@@ -85,6 +85,14 @@ class SchedulerOutputProcessorMixin:
 
         return None
 
+    def _log_spec_metrics_debug(self: Scheduler, message: str, *args) -> None:
+        """Emit a bounded diagnostic log for speculative metric plumbing."""
+        count = getattr(self, "_spec_metrics_debug_log_count", 0)
+        if count >= 20:
+            return
+        self._spec_metrics_debug_log_count = count + 1
+        logger.warning("[SpecMetricsDebug] " + message, *args)
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -397,6 +405,16 @@ class SchedulerOutputProcessorMixin:
             req.spec_accepted_drafts += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
+        self._log_spec_metrics_debug(
+            "recorded accept_lens=%s accept_length_per_req=%s "
+            "num_accepted_drafts=%s req_verify_ct=%s req_accepted_drafts=%s",
+            accept_lens,
+            result.accept_length_per_req_cpu,
+            result.num_accepted_drafts,
+            [req.spec_verify_ct for req in batch.reqs],
+            [req.spec_accepted_drafts for req in batch.reqs],
+        )
+
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -431,7 +449,24 @@ class SchedulerOutputProcessorMixin:
             and result.accept_lens is not None
             and result.accept_length_per_req_cpu is None
         ):
+            self._log_spec_metrics_debug(
+                "non-overlap spec result has accept_lens; algorithm=%s "
+                "can_run_cuda_graph=%s",
+                batch.spec_algorithm,
+                can_run_cuda_graph,
+            )
             self._record_spec_acceptance_from_accept_lens(result, batch)
+        elif not batch.spec_algorithm.is_none():
+            self._log_spec_metrics_debug(
+                "decode result accounting state; algorithm=%s is_spec_v2=%s "
+                "has_accept_lens=%s has_accept_length_per_req_cpu=%s "
+                "num_accepted_drafts=%s",
+                batch.spec_algorithm,
+                batch.is_spec_v2,
+                result.accept_lens is not None,
+                result.accept_length_per_req_cpu is not None,
+                result.num_accepted_drafts,
+            )
 
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
@@ -1101,6 +1136,16 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_drafts.append(req.spec_accepted_drafts)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    if req.finished():
+                        self._log_spec_metrics_debug(
+                            "streaming final spec counters rid=%s verify_ct=%s "
+                            "accepted_drafts=%s histogram=%s completion_tokens=%s",
+                            req.rid,
+                            req.spec_verify_ct,
+                            req.spec_accepted_drafts,
+                            req.spec_acceptance_histogram,
+                            len(output_ids_),
+                        )
 
                 if return_logprob:
                     if (
