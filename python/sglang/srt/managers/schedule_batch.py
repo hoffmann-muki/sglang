@@ -2244,10 +2244,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
-    def _sync_spec_v2_decode_input_ids(self) -> None:
-        """Refresh decode input ids for spec-v2 batches.
+    def _sync_spec_decode_input_ids(self) -> None:
+        """Refresh decode input ids for speculative batches.
 
-        Spec-v2 keeps the scheduler batch as the authoritative mutable state, so
+        The scheduler batch is the authoritative mutable state, and speculative
         decode still needs to source the next-step token buffer from the current
         output_ids just like the non-speculative path. Without this sync, a
         stale input_ids tensor from an earlier stage can reach the draft
@@ -2255,7 +2255,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """
         if self.output_ids is not None:
             logger.info(
-                "[SpecV2Trace] schedule_batch spec-v2 decode input sync: "
+                "[SpecV2Trace] schedule_batch spec decode input sync: "
                 f"len(reqs)={len(self.reqs)}, "
                 f"input_ids_shape="
                 f"{tuple(self.input_ids.shape) if self.input_ids is not None else None}, "
@@ -2264,7 +2264,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             self.input_ids = self.output_ids
             logger.info(
-                "[SpecV2Trace] schedule_batch spec-v2 decode input synced: "
+                "[SpecV2Trace] schedule_batch spec decode input synced: "
                 f"len(reqs)={len(self.reqs)}, "
                 f"input_ids_shape="
                 f"{tuple(self.input_ids.shape) if self.input_ids is not None else None}, "
@@ -2283,9 +2283,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        if not self.spec_algorithm.is_none():
+            self._sync_spec_decode_input_ids()
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
-            self._sync_spec_v2_decode_input_ids()
             draft_input: EagleDraftInput = self.spec_info
             logger.info(
                 "[SpecV2Trace] schedule_batch.prepare_for_decode entry: "
@@ -2301,7 +2303,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
-            # if spec decoding is used, the decode batch is prepared inside
+            # Speculative decoding prepares the decode batch inside
             # `forward_batch_speculative_generation` after running draft models.
             return
 
