@@ -549,6 +549,17 @@ class EagleDraftWorker(BaseDraftWorker):
         if self._is_root_draft_rank:
             try:
                 draft_input: EagleDraftInput = batch.spec_info
+                logger.info(
+                    "[SpecV2Trace] _draft_single_rank entry: "
+                    f"forward_mode={batch.forward_mode}, "
+                    f"len(reqs)={len(batch.reqs)}, "
+                    f"input_ids_shape="
+                    f"{tuple(batch.input_ids.shape) if batch.input_ids is not None else None}, "
+                    f"output_ids_shape="
+                    f"{tuple(batch.output_ids.shape) if batch.output_ids is not None else None}, "
+                    f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}, "
+                    f"spec_info={type(draft_input).__name__ if draft_input is not None else None}"
+                )
                 forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
                     self.req_to_token_pool,
                     batch,
@@ -557,7 +568,32 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.topk,
                     self.speculative_num_steps,
                 )
+                logger.info(
+                    "[SpecV2Trace] _draft_single_rank after prepare_for_v2_draft: "
+                    f"forward_batch.batch_size={forward_batch.batch_size}, "
+                    f"input_ids_shape="
+                    f"{tuple(forward_batch.input_ids.shape) if forward_batch.input_ids is not None else None}, "
+                    f"req_pool_indices_shape="
+                    f"{tuple(forward_batch.req_pool_indices.shape) if forward_batch.req_pool_indices is not None else None}, "
+                    f"seq_lens_shape={tuple(forward_batch.seq_lens.shape) if forward_batch.seq_lens is not None else None}, "
+                    f"positions_shape={tuple(forward_batch.positions.shape) if forward_batch.positions is not None else None}, "
+                    f"out_cache_loc_shape="
+                    f"{tuple(forward_batch.out_cache_loc.shape) if forward_batch.out_cache_loc is not None else None}, "
+                    f"can_cuda_graph={can_cuda_graph}"
+                )
                 self._normalize_single_rank_draft_forward_batch(batch, forward_batch)
+                logger.info(
+                    "[SpecV2Trace] _draft_single_rank after normalize_single_rank_forward_batch: "
+                    f"forward_batch.batch_size={forward_batch.batch_size}, "
+                    f"input_ids_shape="
+                    f"{tuple(forward_batch.input_ids.shape) if forward_batch.input_ids is not None else None}, "
+                    f"req_pool_indices_shape="
+                    f"{tuple(forward_batch.req_pool_indices.shape) if forward_batch.req_pool_indices is not None else None}, "
+                    f"seq_lens_shape={tuple(forward_batch.seq_lens.shape) if forward_batch.seq_lens is not None else None}, "
+                    f"positions_shape={tuple(forward_batch.positions.shape) if forward_batch.positions is not None else None}, "
+                    f"out_cache_loc_shape="
+                    f"{tuple(forward_batch.out_cache_loc.shape) if forward_batch.out_cache_loc is not None else None}"
+                )
 
                 if can_cuda_graph:
                     parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(

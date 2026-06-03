@@ -2963,6 +2963,17 @@ class Scheduler(
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
+                    logger.info(
+                        "[SpecV2Trace] scheduler pre-forward handoff: "
+                        f"forward_mode={batch.forward_mode}, "
+                        f"len(reqs)={len(batch.reqs)}, "
+                        f"input_ids_shape="
+                        f"{tuple(batch.input_ids.shape) if batch.input_ids is not None else None}, "
+                        f"output_ids_shape="
+                        f"{tuple(batch.output_ids.shape) if batch.output_ids is not None else None}, "
+                        f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}, "
+                        f"spec_info={type(batch.spec_info).__name__ if batch.spec_info is not None else None}"
+                    )
 
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
@@ -2984,6 +2995,18 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                if batch.is_spec_v2:
+                    logger.info(
+                        "[SpecV2Trace] scheduler pre-forward handoff: "
+                        f"forward_mode={batch.forward_mode}, "
+                        f"len(reqs)={len(batch.reqs)}, "
+                        f"input_ids_shape="
+                        f"{tuple(batch.input_ids.shape) if batch.input_ids is not None else None}, "
+                        f"output_ids_shape="
+                        f"{tuple(batch.output_ids.shape) if batch.output_ids is not None else None}, "
+                        f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}, "
+                        f"spec_info={type(batch.spec_info).__name__ if batch.spec_info is not None else None}"
+                    )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs

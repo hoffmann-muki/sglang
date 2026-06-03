@@ -265,6 +265,17 @@ class EagleDraftInputV2Mixin:
             self.filter_batch(keep_indices_device, has_been_filtered=True)
 
         real_bs = self._infer_v2_draft_batch_size(batch)
+        logger.info(
+            "[SpecV2Trace] normalize_v2_draft_batch entry: "
+            f"forward_mode={batch.forward_mode}, "
+            f"len(reqs)={len(batch.reqs)}, "
+            f"input_ids_shape="
+            f"{tuple(batch.input_ids.shape) if batch.input_ids is not None else None}, "
+            f"output_ids_shape="
+            f"{tuple(batch.output_ids.shape) if batch.output_ids is not None else None}, "
+            f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}, "
+            f"real_bs={real_bs}, topk={topk}"
+        )
 
         # These tensors are produced by graph-enabled target/draft forwards and
         # may carry padded rows. Slice them back to the scheduler-owned request
@@ -332,6 +343,16 @@ class EagleDraftInputV2Mixin:
 
         if batch.input_ids is not None and batch.forward_mode.is_decode_or_idle():
             if batch.input_ids.shape[0] < real_bs:
+                logger.error(
+                    "[SpecV2Trace] normalize_v2_draft_batch input_ids undersized: "
+                    f"forward_mode={batch.forward_mode}, "
+                    f"len(reqs)={len(batch.reqs)}, "
+                    f"input_ids_shape={tuple(batch.input_ids.shape)}, "
+                    f"output_ids_shape="
+                    f"{tuple(batch.output_ids.shape) if batch.output_ids is not None else None}, "
+                    f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}, "
+                    f"real_bs={real_bs}, topk={topk}"
+                )
                 raise RuntimeError(
                     "EAGLE3 scheduler decode batch has fewer input_ids than "
                     f"draft state: input_ids.shape={tuple(batch.input_ids.shape)}, "
@@ -342,6 +363,16 @@ class EagleDraftInputV2Mixin:
         return real_bs
 
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        logger.info(
+            "[SpecV2Trace] EagleDraftInput.prepare_for_decode entry: "
+            f"forward_mode={batch.forward_mode}, "
+            f"len(reqs)={len(batch.reqs)}, "
+            f"input_ids_shape="
+            f"{tuple(batch.input_ids.shape) if batch.input_ids is not None else None}, "
+            f"output_ids_shape="
+            f"{tuple(batch.output_ids.shape) if batch.output_ids is not None else None}, "
+            f"seq_lens_shape={tuple(batch.seq_lens.shape) if batch.seq_lens is not None else None}"
+        )
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func

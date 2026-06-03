@@ -158,7 +158,6 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
             overall_throughput=110.0,
             last_ttft=0.1,
             last_gen_throughput=9.0,
-            acc_length=4.5,
             cache_hit_rate=0.25,
             spec_accept_length=4.5,
             spec_accept_rate=0.875,
@@ -183,6 +182,7 @@ class TestBenchOneBatchServerMetrics(unittest.TestCase):
         self.assertEqual(payload["spec_accepted_drafts"], 7)
         self.assertEqual(payload["spec_proposed_drafts"], 8)
         self.assertEqual(payload["spec_verify_ct"], 2)
+        self.assertNotIn("acc_length", payload)
         self.assertEqual(payload["cached_tokens"], 256)
         self.assertEqual(payload["cached_tokens_details"], {"device": 256})
         self.assertEqual(payload["latency_breakdown"]["draft_proposal_time"], 0.1)

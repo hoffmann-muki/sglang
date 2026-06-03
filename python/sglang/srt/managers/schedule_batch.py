@@ -2258,6 +2258,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
+            logger.info(
+                "[SpecV2Trace] schedule_batch.prepare_for_decode entry: "
+                f"forward_mode={self.forward_mode}, "
+                f"len(reqs)={len(self.reqs)}, "
+                f"input_ids_shape="
+                f"{tuple(self.input_ids.shape) if self.input_ids is not None else None}, "
+                f"output_ids_shape="
+                f"{tuple(self.output_ids.shape) if self.output_ids is not None else None}, "
+                f"seq_lens_shape={tuple(self.seq_lens.shape) if self.seq_lens is not None else None}, "
+                f"spec_info={type(draft_input).__name__ if draft_input is not None else None}"
+            )
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():

@@ -513,7 +513,6 @@ class BenchOneCaseResult(BaseModel):
     overall_throughput: float
     last_ttft: float
     last_gen_throughput: float
-    acc_length: float
     cache_hit_rate: Optional[float] = None
     spec_accept_length: Optional[float] = None
     spec_accept_rate: Optional[float] = None
@@ -546,7 +545,6 @@ class BenchOneCaseResult(BaseModel):
                 "overall_throughput": round(self.overall_throughput, 2),
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
-                "acc_length": round(self.acc_length, 2),
                 "cache_hit_rate": (
                     round(self.cache_hit_rate, 4)
                     if self.cache_hit_rate is not None
@@ -930,7 +928,6 @@ def run_one_case(
     if backend == "vllm":
         # vLLM does not expose these metrics via API
         last_gen_throughput = -1
-        acc_length = -1
         aggregated_meta_info = aggregate_sglang_meta_info([])
     else:
         aggregated_meta_info = aggregate_sglang_meta_info(final_meta_infos)
@@ -939,11 +936,6 @@ def run_one_case(
         server_info = response.json()
         internal_state = server_info.get("internal_states", [{}])
         last_gen_throughput = internal_state[0].get("last_gen_throughput", None) or -1
-        acc_length = (
-            aggregated_meta_info.get("spec_accept_length")
-            or internal_state[0].get("avg_spec_accept_length", None)
-            or -1
-        )
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url) if enable_metrics else None
@@ -971,8 +963,6 @@ def run_one_case(
         print(f"output throughput: {output_throughput:.2f} tok/s")
     print(f"last_ttft: {last_ttft:.2f} s")
     print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
-    if acc_length > 0:
-        print(f"acc_length: {acc_length:.2f} ")
     if aggregated_meta_info.get("spec_accept_rate") is not None:
         print(f"spec_accept_rate: {aggregated_meta_info['spec_accept_rate']:.4f}")
     if case_cache_hit_rate is not None:
@@ -990,7 +980,6 @@ def run_one_case(
         overall_throughput=overall_throughput,
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
-        acc_length=acc_length,
         cache_hit_rate=case_cache_hit_rate,
         spec_accept_length=aggregated_meta_info.get("spec_accept_length"),
         spec_accept_rate=aggregated_meta_info.get("spec_accept_rate"),
@@ -1112,7 +1101,6 @@ def get_report_summary(
         "latency (s)",
         "input throughput (tok/s)",
         "output throughput (tok/s)",
-        "acc length",
         "acc rate",
         "accepted drafts",
         "proposed drafts",
@@ -1130,10 +1118,6 @@ def get_report_summary(
 
     for res in results:
         hourly_cost = hourly_cost_per_gpu * server_args.tp_size
-        spec_accept_length = res.spec_accept_length
-        if spec_accept_length is None and res.acc_length > 0:
-            spec_accept_length = res.acc_length
-        accept_length = _fmt_optional_float(spec_accept_length, 2)
         itl_ms = 1000 * res.batch_size / res.output_throughput
         input_cost = 1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost
         output_cost = 1e6 / res.output_throughput / 3600 * hourly_cost
@@ -1147,7 +1131,6 @@ def get_report_summary(
             f"{res.latency:.2f}",
             f"{res.input_throughput:.2f}",
             f"{res.output_throughput:.2f}",
-            accept_length,
             _fmt_optional_float(res.spec_accept_rate, 4),
             _fmt_optional_int(res.spec_accepted_drafts),
             _fmt_optional_int(res.spec_proposed_drafts),
