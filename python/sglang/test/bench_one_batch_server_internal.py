@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import hashlib
 import itertools
 import json
 import multiprocessing
@@ -26,6 +27,38 @@ from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 DEFAULT_TIMEOUT = 600
+
+
+def get_case_dataset_seed(
+    base_seed: int,
+    dataset_name: str,
+    batch_size: int,
+    input_len: int,
+    output_len: int,
+) -> int:
+    """Derive a stable RNG seed for a benchmark case independent of run order."""
+    payload = (
+        f"{base_seed}:{dataset_name}:{batch_size}:{input_len}:{output_len}".encode()
+    )
+    return int.from_bytes(hashlib.blake2s(payload, digest_size=4).digest(), "little")
+
+
+def get_dataset_for_case(
+    dataset_args: SimpleNamespace,
+    tokenizer: PreTrainedTokenizer | AutoProcessor,
+    model_id: Optional[str],
+    case_seed: int,
+):
+    """Build the dataset with a case-local RNG seed and restore outer RNG state."""
+    py_random_state = random.getstate()
+    np_random_state = np.random.get_state()
+    try:
+        random.seed(case_seed)
+        np.random.seed(case_seed)
+        return get_dataset(dataset_args, tokenizer, model_id=model_id)
+    finally:
+        random.setstate(py_random_state)
+        np.random.set_state(np_random_state)
 
 
 def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
@@ -676,6 +709,7 @@ def run_one_case(
     lora_request_distribution: str = BenchArgs.lora_request_distribution,
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
     enable_metrics: bool = True,
+    seed: int = BenchArgs.seed,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -694,6 +728,9 @@ def run_one_case(
         )
 
     actual_gsp_groups = min(gsp_num_groups, batch_size)
+    case_dataset_seed = get_case_dataset_seed(
+        seed, dataset_name, batch_size, input_len, output_len
+    )
     dataset_args = SimpleNamespace(
         dataset_name=dataset_name,
         num_prompts=batch_size,
@@ -703,7 +740,7 @@ def run_one_case(
         dataset_path=dataset_path,
         tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
         backend=backend,
-        seed=BenchArgs.seed,
+        seed=case_dataset_seed,
         gsp_num_groups=actual_gsp_groups,
         gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1) // actual_gsp_groups,
         gsp_system_prompt_len=gsp_system_prompt_len,
@@ -712,7 +749,12 @@ def run_one_case(
     )
     tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
     dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
-    input_requests = get_dataset(dataset_args, tokenizer, model_id=dataset_model_id)
+    input_requests = get_dataset_for_case(
+        dataset_args,
+        tokenizer,
+        model_id=dataset_model_id,
+        case_seed=case_dataset_seed,
+    )
 
     if dataset_name == "generated-shared-prefix":
         input_requests = input_requests[:batch_size]
@@ -1288,6 +1330,7 @@ def run_benchmark_internal(
                 lora_request_distribution=bench_args.lora_request_distribution,
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 enable_metrics=enable_metrics,
+                seed=bench_args.seed,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1332,6 +1375,7 @@ def run_benchmark_internal(
                     lora_request_distribution=bench_args.lora_request_distribution,
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     enable_metrics=enable_metrics,
+                    seed=bench_args.seed,
                     **gsp_kwargs,
                 )
             )
@@ -1387,6 +1431,7 @@ def run_benchmark_internal(
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             enable_metrics=enable_metrics,
+                            seed=bench_args.seed,
                             **gsp_kwargs,
                         )
                     )

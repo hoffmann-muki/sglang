@@ -1,10 +1,17 @@
 import json
+import random
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
 
 from sglang.test.bench_one_batch_server_internal import (
     BenchOneCaseResult,
     aggregate_sglang_meta_info,
+    get_case_dataset_seed,
+    get_dataset_for_case,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -13,6 +20,56 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestBenchOneBatchServerMetrics(unittest.TestCase):
+    def test_case_dataset_seed_is_stable_and_case_specific(self):
+        base_seed = 42
+        seed = get_case_dataset_seed(base_seed, "random", 1, 1024, 1024)
+
+        self.assertEqual(
+            seed, get_case_dataset_seed(base_seed, "random", 1, 1024, 1024)
+        )
+        self.assertNotEqual(
+            seed, get_case_dataset_seed(base_seed, "random", 8, 1024, 1024)
+        )
+        self.assertNotEqual(
+            seed, get_case_dataset_seed(base_seed, "random", 1, 2048, 1024)
+        )
+        self.assertNotEqual(
+            seed, get_case_dataset_seed(base_seed, "random", 1, 1024, 2048)
+        )
+        self.assertTrue(0 <= seed < 2**32)
+
+    def test_get_dataset_for_case_restores_rng_state(self):
+        def fake_get_dataset(dataset_args, tokenizer, model_id=None):
+            return [(random.random(), float(np.random.rand()))]
+
+        random.seed(123)
+        np.random.seed(123)
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        expected_next_py = random.random()
+        expected_next_np = float(np.random.rand())
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+
+        with patch(
+            "sglang.test.bench_one_batch_server_internal.get_dataset",
+            fake_get_dataset,
+        ):
+            first = get_dataset_for_case(
+                SimpleNamespace(), tokenizer=None, model_id="model", case_seed=999
+            )
+            second = get_dataset_for_case(
+                SimpleNamespace(), tokenizer=None, model_id="model", case_seed=999
+            )
+            third = get_dataset_for_case(
+                SimpleNamespace(), tokenizer=None, model_id="model", case_seed=1000
+            )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, third)
+        self.assertEqual(random.random(), expected_next_py)
+        self.assertAlmostEqual(float(np.random.rand()), expected_next_np)
+
     def test_aggregate_sglang_meta_info_uses_exact_spec_counters(self):
         meta_infos = [
             {
